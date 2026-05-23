@@ -4,6 +4,8 @@ cli-proxy-api
 
 # Configuration
 config.yaml
+claude-api-pool.yaml
+claude-api-pool.db*
 .env
 
 # Generated content

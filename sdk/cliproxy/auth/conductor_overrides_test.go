@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -567,6 +568,102 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride_On403(t *testing.
 
 	if count := reg.GetModelCount(model); count <= 0 {
 		t.Fatalf("expected model count > 0 when disable_cooling=true, got %d", count)
+	}
+}
+
+func TestManager_MarkResult_PoolAuth529UsesPoolCooldown(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	oldRouting := claudeapipool.CurrentRoutingConfig()
+	claudeapipool.SetRoutingConfig(claudeapipool.EffectiveRoutingConfig{
+		OverloadCooldownMS:      2500,
+		OverloadMaxCooldownMS:   2500,
+		RateLimitCooldownMS:     1000,
+		RateLimitMaxCooldownMS:  1000,
+		SameAccountRetryDelayMS: 1500,
+	})
+	t.Cleanup(func() { claudeapipool.SetRoutingConfig(oldRouting) })
+
+	auth := &Auth{
+		ID:       "pool-529",
+		Provider: "claude",
+		Attributes: map[string]string{
+			claudeapipool.AttrPool: "true",
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "claude-opus"
+	before := time.Now()
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "claude",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: claudeapipool.StatusOverloaded, Message: "overloaded_error"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if !state.Unavailable || state.NextRetryAfter.Before(before.Add(2*time.Second)) || state.NextRetryAfter.After(before.Add(4*time.Second)) {
+		t.Fatalf("pool 529 cooldown = %v, want about 2.5s after %v", state.NextRetryAfter, before)
+	}
+	routeStatus := claudeapipool.RouteStatusFor(auth.ID, model)
+	if !routeStatus.Cooling {
+		t.Fatalf("route status should be cooling: %#v", routeStatus)
+	}
+}
+
+func TestManager_MarkResult_PoolAuth429UsesPoolCooldown(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	oldRouting := claudeapipool.CurrentRoutingConfig()
+	claudeapipool.SetRoutingConfig(claudeapipool.EffectiveRoutingConfig{
+		RateLimitCooldownMS:     5000,
+		RateLimitMaxCooldownMS:  5000,
+		OverloadCooldownMS:      10000,
+		OverloadMaxCooldownMS:   10000,
+		SameAccountRetryDelayMS: 1500,
+	})
+	t.Cleanup(func() { claudeapipool.SetRoutingConfig(oldRouting) })
+
+	auth := &Auth{
+		ID:       "pool-429",
+		Provider: "claude",
+		Attributes: map[string]string{
+			claudeapipool.AttrPool: "true",
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "claude-opus"
+	before := time.Now()
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "claude",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate_limit_error"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if !state.Unavailable || state.NextRetryAfter.Before(before.Add(4*time.Second)) || state.NextRetryAfter.After(before.Add(6*time.Second)) {
+		t.Fatalf("pool 429 cooldown = %v, want about 5s after %v", state.NextRetryAfter, before)
 	}
 }
 

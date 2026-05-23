@@ -1,0 +1,72 @@
+# Progress
+
+## 2026-05-20
+- Confirmed both repositories are clean before edits.
+- Read backend config, config parser, watcher synthesizer, auth helper, and management route structure.
+- Read frontend route and provider-related entry points.
+- Added backend pool config, pool file model, runtime auth synthesis, management APIs, sync callback, pool model registration, Claude CCH signing support, pool-only Claude routing, and virtual cache usage rewrite.
+- Added targeted backend tests for pool file inheritance/overrides/hash/pagination/import, pool routing, and virtual cache ledger behavior.
+- Verified targeted backend tests and `go build -o test-output ./cmd/server && rm test-output`.
+- Finished Management Center route/sidebar wiring for the new table-based Claude API Pool page and added nav translations.
+- Added cleanup behavior for disabling the pool so runtime pool auths are disabled when `claude-api-pool.enabled` becomes false.
+- Added `config.example.yaml` pointer config for `claude-api-pool`.
+- Re-ran verification:
+  - `go test ./sdk/cliproxy -run 'TestSyncClaudeAPIPoolAuths|TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeState|TestForceHomeRuntimeConfigEnablesUsageStatistics|TestApplyHomeOverlayForcesUsageStatisticsEnabled'`
+  - `go test ./internal/claudeapipool ./sdk/cliproxy/auth ./internal/runtime/executor -run 'TestClaude|TestVirtual|TestManager_PickNext|TestManager_PickNextMixed_ClaudeAPIPool|TestConfigSynthesizer|TestClaudeAPIPool'`
+  - `go test ./internal/watcher/synthesizer ./internal/api/handlers/management`
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - Management Center `npm run type-check`
+  - Management Center `npm run build`
+- Also ran `go test ./...`; it still fails in existing unrelated areas:
+  - `internal/registry`: `TestCodexFreeModelsExcludeGPT55`
+  - `internal/runtime/executor`: Antigravity credit URL expectation tests
+
+## 2026-05-22
+- Compared the current Claude API Pool ledger against `kiro.rs`.
+- Confirmed current pool ledger only learns cacheable tokens from upstream `cache_creation_input_tokens` / `cache_read_input_tokens`, so it cannot simulate cache hits when upstream returns zero cache usage.
+- Found `kiro.rs` has a reusable local-accounting approach: estimate input/cacheable tokens locally, synthesize creation/read usage, respect 5m/1h TTL, and reset when context shrinks.
+- Added file-backed `virtual-cache` controls to `claude-api-pool.yaml`, runtime policy sync, local token estimation when upstream cache usage is zero, and Management Center controls for hit rate/caps/floors.
+- Verified:
+  - `go test ./internal/claudeapipool ./internal/api/handlers/management`
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - Management Center `npm run type-check`
+  - Management Center `npm run build`
+- Upgraded virtual cache again to be more Claude-like:
+  - ledger key remains provider/model/session, with 5m and 1h cache buckets
+  - growing cache-control prefixes keep reading prior cached tokens and write only delta creation tokens
+  - compressed/shrunk contexts reset when local prefix estimate falls below `context-shrink-reset-ratio`
+  - added Management Center controls for shrink reset ratio and min/max rolling creation tokens
+- Re-verified:
+  - `go test ./internal/claudeapipool ./internal/api/handlers/management`
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - Management Center `npm run type-check`
+  - Management Center `npm run build`
+- Compared Kiro user/session key behavior and updated Claude pool virtual cache scope:
+  - uses full `metadata.user_id` identity when present
+  - JSON `metadata.user_id` includes device/account/user/session dimensions
+  - explicit headers and `conversation_id` are still accepted
+  - no message-hash fallback for virtual cache ledger, preventing unrelated clients from sharing synthetic hits
+- Verified:
+  - `go test ./sdk/cliproxy/auth ./internal/claudeapipool ./internal/api/handlers/management`
+  - `go build -o test-output ./cmd/server && rm test-output`
+- Borrowed `kiro.rs` sliding-window target cache reuse tuning:
+  - added `target-cache-reuse-ratio` to `claude-api-pool.yaml`
+  - added recent 5-minute reuse samples and stats API payload
+  - future rewrites now bias effective cache read/write policy toward the configured target when enough samples exist
+  - Management Center exposes the target reuse control and recent actual reuse stats
+- Verified:
+  - `go test ./internal/claudeapipool ./internal/api/handlers/management ./sdk/cliproxy/auth`
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - Management Center `npm run type-check`
+  - Management Center `npm run build`
+- Migrated Claude API Pool account storage to SQLite primary storage:
+  - added fixed `claude-api-pool.db` store beside `config.yaml`
+  - first access imports existing `claude-api-pool.yaml` only when the SQLite store is empty
+  - management API and runtime auth synthesis now read/write SQLite through `LoadStore`/`SaveStore`
+  - YAML/JSON import/export remains supported
+  - Management Center now labels `claude-api-pool.db` as the primary store and `claude-api-pool.yaml` as import format
+- Verified:
+  - `go test ./internal/claudeapipool ./internal/api/handlers/management ./sdk/cliproxy/auth`
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - Management Center `npm run type-check`
+  - Management Center `npm run build`

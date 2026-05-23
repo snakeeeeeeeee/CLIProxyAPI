@@ -110,6 +110,7 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 						}
 						ctx := &synthesizer.SynthesisContext{
 							Config:      cfg,
+							ConfigPath:  w.configPath,
 							AuthDir:     resolvedAuthDir,
 							Now:         time.Now(),
 							IDGenerator: synthesizer.NewStableIDGenerator(),
@@ -217,6 +218,7 @@ func (w *Watcher) addOrUpdateClient(path string) {
 	// Build synthesized auth entries for this single file only.
 	sctx := &synthesizer.SynthesisContext{
 		Config:      w.config,
+		ConfigPath:  w.configPath,
 		AuthDir:     w.authDir,
 		Now:         time.Now(),
 		IDGenerator: synthesizer.NewStableIDGenerator(),

@@ -584,6 +584,81 @@ func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]a
 	return primary
 }
 
+// ExtractVirtualCacheSessionKey extracts an explicit user/session scope for
+// virtual usage accounting. Unlike ExtractSessionID, it intentionally avoids
+// message-hash fallback so unrelated clients cannot share a synthetic cache.
+func ExtractVirtualCacheSessionKey(headers http.Header, payload []byte, metadata map[string]any) string {
+	if len(payload) > 0 {
+		userID := strings.TrimSpace(gjson.GetBytes(payload, "metadata.user_id").String())
+		if userID != "" {
+			if key := metadataUserIDVirtualCacheKey(userID); key != "" {
+				return key
+			}
+		}
+	}
+	if headers != nil {
+		if sid := strings.TrimSpace(headers.Get("X-Session-ID")); sid != "" {
+			return "header:" + sid
+		}
+		if sid := strings.TrimSpace(headers.Get("Session_id")); sid != "" {
+			return "codex:" + sid
+		}
+		if tid := strings.TrimSpace(headers.Get("X-Amp-Thread-Id")); tid != "" {
+			return "amp:" + tid
+		}
+		if rid := strings.TrimSpace(headers.Get("X-Client-Request-Id")); rid != "" {
+			return "clientreq:" + rid
+		}
+	}
+	if len(payload) > 0 {
+		if convID := strings.TrimSpace(gjson.GetBytes(payload, "conversation_id").String()); convID != "" {
+			return "conv:" + convID
+		}
+	}
+	if metadata != nil {
+		if sessionID := strings.TrimSpace(metadataString(metadata, cliproxyexecutor.ExecutionSessionMetadataKey)); sessionID != "" {
+			return "execution:" + sessionID
+		}
+	}
+	return ""
+}
+
+func metadataUserIDVirtualCacheKey(userID string) string {
+	if gjson.Valid(userID) && gjson.Parse(userID).IsObject() {
+		parsed := gjson.Parse(userID)
+		deviceID := strings.TrimSpace(parsed.Get("device_id").String())
+		accountUUID := strings.TrimSpace(parsed.Get("account_uuid").String())
+		user := strings.TrimSpace(parsed.Get("user_id").String())
+		if user == "" {
+			user = strings.TrimSpace(parsed.Get("user").String())
+		}
+		sessionID := strings.TrimSpace(parsed.Get("session_id").String())
+		if deviceID != "" || accountUUID != "" || user != "" || sessionID != "" {
+			return "metadata:json:device=" + deviceID + ":account=" + accountUUID + ":user=" + user + ":session=" + sessionID
+		}
+		return ""
+	}
+	return "metadata:user:" + userID
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil || key == "" {
+		return ""
+	}
+	value, ok := metadata[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case fmt.Stringer:
+		return typed.String()
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
 // extractSessionIDs returns (primaryID, fallbackID) for session affinity.
 // primaryID: full hash including assistant response (stable after first turn)
 // fallbackID: short hash without assistant (used to inherit binding from first turn)

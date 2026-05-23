@@ -126,6 +126,14 @@ func WithPostAuthHook(hook auth.PostAuthHook) ServerOption {
 	}
 }
 
+// SetClaudeAPIPoolSync registers the runtime sync callback used by management handlers.
+func (s *Server) SetClaudeAPIPoolSync(sync func(context.Context) error) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.SetClaudeAPIPoolSync(sync)
+}
+
 // Server represents the main API server.
 // It encapsulates the Gin engine, HTTP server, handlers, and configuration.
 type Server struct {
@@ -663,6 +671,20 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
 		mgmt.PATCH("/claude-api-key", s.mgmt.PatchClaudeKey)
 		mgmt.DELETE("/claude-api-key", s.mgmt.DeleteClaudeKey)
+
+		mgmt.GET("/claude-api-pool/config", s.mgmt.GetClaudeAPIPoolConfig)
+		mgmt.PUT("/claude-api-pool/config", s.mgmt.PutClaudeAPIPoolConfig)
+		mgmt.PATCH("/claude-api-pool/config", s.mgmt.PutClaudeAPIPoolConfig)
+		mgmt.GET("/claude-api-pool/items", s.mgmt.GetClaudeAPIPoolItems)
+		mgmt.GET("/claude-api-pool/export", s.mgmt.ExportClaudeAPIPool)
+		mgmt.POST("/claude-api-pool/import", s.mgmt.ImportClaudeAPIPool)
+		mgmt.PATCH("/claude-api-pool/items", s.mgmt.PatchClaudeAPIPoolItemsBatch)
+		mgmt.POST("/claude-api-pool/items/:position/test", s.mgmt.TestClaudeAPIPoolItem)
+		mgmt.PATCH("/claude-api-pool/items/:position", s.mgmt.PatchClaudeAPIPoolItem)
+		mgmt.DELETE("/claude-api-pool/items/:position", s.mgmt.DeleteClaudeAPIPoolItem)
+		mgmt.POST("/claude-api-pool/items/:position/reset-cooling", s.mgmt.ResetClaudeAPIPoolCooling)
+		mgmt.POST("/claude-api-pool/reset-cooling", s.mgmt.ResetClaudeAPIPoolCooling)
+		mgmt.POST("/claude-api-pool/ledger/clear", s.mgmt.ClearClaudeAPIPoolLedger)
 
 		mgmt.GET("/codex-api-key", s.mgmt.GetCodexKeys)
 		mgmt.PUT("/codex-api-key", s.mgmt.PutCodexKeys)

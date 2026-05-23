@@ -3,6 +3,7 @@
 package management
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"net/http"
@@ -46,6 +47,7 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	claudeAPIPoolSync   func(context.Context) error
 }
 
 // NewHandler creates a new management handler instance.
@@ -140,6 +142,11 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetClaudeAPIPoolSync registers a callback that applies pool file changes to runtime auths.
+func (h *Handler) SetClaudeAPIPoolSync(sync func(context.Context) error) {
+	h.claudeAPIPoolSync = sync
 }
 
 // Middleware enforces access control for management endpoints.

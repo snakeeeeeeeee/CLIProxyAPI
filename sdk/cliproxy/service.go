@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -809,6 +810,9 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	if s.server != nil {
+		s.server.SetClaudeAPIPoolSync(s.SyncClaudeAPIPoolAuths)
+	}
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()
@@ -1121,7 +1125,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
-		if entry := s.resolveConfigClaudeKey(a); entry != nil {
+		if poolModels := claudeapipool.ModelsFromAttributes(a.Attributes); len(poolModels) > 0 {
+			models = buildConfigModels(poolModels, "anthropic", "claude")
+		} else if entry := s.resolveConfigClaudeKey(a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildClaudeConfigModels(entry)
 			}

@@ -80,9 +80,10 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 func (w *Watcher) refreshAuthState(force bool) {
 	w.clientsMutex.RLock()
 	cfg := w.config
+	configPath := w.configPath
 	authDir := w.authDir
 	w.clientsMutex.RUnlock()
-	auths := snapshotCoreAuthsFunc(cfg, authDir)
+	auths := snapshotCoreAuthsFunc(cfg, configPath, authDir)
 	w.clientsMutex.Lock()
 	if len(w.runtimeAuths) > 0 {
 		for _, a := range w.runtimeAuths {
@@ -255,9 +256,10 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 	return clone
 }
 
-func snapshotCoreAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
+func snapshotCoreAuths(cfg *config.Config, configPath string, authDir string) []*coreauth.Auth {
 	ctx := &synthesizer.SynthesisContext{
 		Config:      cfg,
+		ConfigPath:  configPath,
 		AuthDir:     authDir,
 		Now:         time.Now(),
 		IDGenerator: synthesizer.NewStableIDGenerator(),
@@ -267,6 +269,11 @@ func snapshotCoreAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
 
 	configSynth := synthesizer.NewConfigSynthesizer()
 	if auths, err := configSynth.Synthesize(ctx); err == nil {
+		out = append(out, auths...)
+	}
+
+	poolSynth := synthesizer.NewClaudeAPIPoolSynthesizer()
+	if auths, err := poolSynth.Synthesize(ctx); err == nil {
 		out = append(out, auths...)
 	}
 

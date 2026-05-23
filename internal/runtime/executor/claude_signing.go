@@ -3,9 +3,11 @@ package executor
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	xxHash64 "github.com/pierrec/xxHash/xxHash64"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
@@ -76,6 +78,11 @@ func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *c
 }
 
 func experimentalCCHSigningEnabled(cfg *config.Config, auth *cliproxyauth.Auth) bool {
+	if auth != nil && auth.Attributes != nil && claudeapipool.IsAttributesPoolAuth(auth.Attributes) {
+		raw := strings.TrimSpace(auth.Attributes[claudeapipool.AttrCCHSigning])
+		enabled, err := strconv.ParseBool(raw)
+		return err == nil && enabled
+	}
 	entry := resolveClaudeKeyConfig(cfg, auth)
 	return entry != nil && entry.ExperimentalCCHSigning
 }

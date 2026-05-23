@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -330,6 +332,88 @@ func TestManager_PickNextMixed_UsesWeightedProviderRotationBeforeCredentialRotat
 		if got.ID != wantIDs[index] {
 			t.Fatalf("pickNextMixed() #%d auth.ID = %q, want %q", index, got.ID, wantIDs[index])
 		}
+	}
+}
+
+func TestManager_PickNext_ClaudeAPIPoolFiltersNonPoolAuths(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{
+		ClaudeAPIPool: internalconfig.ClaudeAPIPoolConfig{Enabled: true},
+	})
+	manager.executors["claude"] = schedulerTestExecutor{}
+
+	legacy := &Auth{ID: "claude-legacy", Provider: "claude"}
+	pool := &Auth{
+		ID:       "claude-pool",
+		Provider: "claude",
+		Attributes: map[string]string{
+			claudeapipool.AttrPool: "true",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), legacy); errRegister != nil {
+		t.Fatalf("Register(legacy) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), pool); errRegister != nil {
+		t.Fatalf("Register(pool) error = %v", errRegister)
+	}
+
+	got, _, errPick := manager.pickNext(context.Background(), "claude", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickNext() error = %v", errPick)
+	}
+	if got == nil || got.ID != pool.ID {
+		t.Fatalf("pickNext() auth = %#v, want pool auth", got)
+	}
+}
+
+func TestManager_PickNextMixed_ClaudeAPIPoolFiltersNonPoolAuths(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{
+		ClaudeAPIPool: internalconfig.ClaudeAPIPoolConfig{Enabled: true},
+	})
+	manager.executors["claude"] = schedulerTestExecutor{}
+	manager.executors["gemini"] = schedulerTestExecutor{}
+
+	pool := &Auth{
+		ID:       "claude-pool",
+		Provider: "claude",
+		Attributes: map[string]string{
+			claudeapipool.AttrPool: "true",
+		},
+	}
+	for _, auth := range []*Auth{
+		{ID: "claude-legacy-a", Provider: "claude"},
+		{ID: "claude-legacy-b", Provider: "claude"},
+		pool,
+		{ID: "gemini-a", Provider: "gemini"},
+	} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	seenClaudePool := false
+	for i := 0; i < 8; i++ {
+		got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"claude", "gemini"}, "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickNextMixed() #%d error = %v", i, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickNextMixed() #%d auth = nil", i)
+		}
+		if provider == "claude" {
+			if got.ID != pool.ID {
+				t.Fatalf("pickNextMixed() picked non-pool Claude auth %q", got.ID)
+			}
+			seenClaudePool = true
+		}
+	}
+	if !seenClaudePool {
+		t.Fatal("pickNextMixed() never selected Claude pool auth")
 	}
 }
 

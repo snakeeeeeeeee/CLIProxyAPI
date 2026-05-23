@@ -95,6 +95,9 @@ type Config struct {
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
+	// ClaudeAPIPool controls the optional SQLite-backed Claude API account pool.
+	ClaudeAPIPool ClaudeAPIPoolConfig `yaml:"claude-api-pool" json:"claude-api-pool"`
+
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
 
@@ -238,6 +241,11 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+}
+
+// ClaudeAPIPoolConfig toggles the fixed Claude API pool store.
+type ClaudeAPIPoolConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -688,6 +696,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.RemoteManagement.PanelGitHubRepository == "" {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	}
+	cfg.SanitizeClaudeAPIPool()
 
 	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
 	if cfg.Pprof.Addr == "" {
@@ -769,6 +778,13 @@ func (cfg *Config) SanitizePayloadRules() {
 	}
 	cfg.Payload.DefaultRaw = sanitizePayloadRawRules(cfg.Payload.DefaultRaw, "default-raw")
 	cfg.Payload.OverrideRaw = sanitizePayloadRawRules(cfg.Payload.OverrideRaw, "override-raw")
+}
+
+// SanitizeClaudeAPIPool is kept for symmetry with other config sections.
+func (cfg *Config) SanitizeClaudeAPIPool() {
+	if cfg == nil {
+		return
+	}
 }
 
 func sanitizePayloadRawRules(rules []PayloadRule, section string) []PayloadRule {

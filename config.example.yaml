@@ -95,6 +95,13 @@ max-retry-interval: 30
 # When true, disable auth/model cooldown scheduling globally (prevents blackout windows after failure states).
 disable-cooling: false
 
+# Optional Claude API account pool. The SQLite store keeps defaults, shared models,
+# and per-account api-key/header overrides.
+# The database file is fixed: claude-api-pool.db in the project config directory.
+# claude-api-pool.yaml is only used as an import/export format and first-run migration source.
+claude-api-pool:
+  enabled: false
+
 # disable-image-generation supports: false (default), true, or "chat".
 # - true: disable image_generation everywhere (also returns 404 for /v1/images/generations and /v1/images/edits).
 # - "chat": disable image_generation injection on non-images endpoints, but keep /v1/images/generations and /v1/images/edits enabled.

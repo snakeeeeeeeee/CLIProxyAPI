@@ -515,6 +515,64 @@ func TestExtractSessionID(t *testing.T) {
 	}
 }
 
+func TestExtractVirtualCacheSessionKey(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		headers http.Header
+		payload string
+		want    string
+	}{
+		{
+			name:    "json_user_id_keeps_full_identity_scope",
+			payload: `{"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"account-a\",\"user_id\":\"user-a\",\"session_id\":\"session-a\"}"}}`,
+			want:    "metadata:json:device=device-a:account=account-a:user=user-a:session=session-a",
+		},
+		{
+			name:    "json_user_id_only_session_still_stable",
+			payload: `{"metadata":{"user_id":"{\"device_id\":\"\",\"account_uuid\":\"\",\"session_id\":\"session-a\"}"}}`,
+			want:    "metadata:json:device=:account=:user=:session=session-a",
+		},
+		{
+			name:    "json_user_id_empty_identity_is_not_reused",
+			payload: `{"metadata":{"user_id":"{\"device_id\":\"\",\"account_uuid\":\"\",\"session_id\":\"\",\"user\":\"\"}"}}`,
+			want:    "",
+		},
+		{
+			name:    "plain_user_id_keeps_full_value",
+			payload: `{"metadata":{"user_id":"user_device-a_account__session_session-a"}}`,
+			want:    "metadata:user:user_device-a_account__session_session-a",
+		},
+		{
+			name:    "conversation_id",
+			payload: `{"conversation_id":"conv-12345"}`,
+			want:    "conv:conv-12345",
+		},
+		{
+			name: "header",
+			headers: http.Header{
+				"X-Session-Id": []string{"explicit-session"},
+			},
+			want: "header:explicit-session",
+		},
+		{
+			name:    "message_hash_fallback_is_not_used",
+			payload: `{"messages":[{"role":"user","content":"Hello world"}]}`,
+			want:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractVirtualCacheSessionKey(tt.headers, []byte(tt.payload), nil)
+			if got != tt.want {
+				t.Errorf("ExtractVirtualCacheSessionKey() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSessionAffinitySelector_SameSessionSameAuth(t *testing.T) {
 	t.Parallel()
 

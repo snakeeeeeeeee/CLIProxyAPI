@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -126,5 +127,52 @@ func TestApplyHomeOverlayForcesUsageStatisticsEnabled(t *testing.T) {
 	}
 	if !service.cfg.Home.Enabled {
 		t.Fatal("expected home overlay to preserve local home settings")
+	}
+}
+
+func TestSyncClaudeAPIPoolAuths_DisabledPoolRemovesRuntimePoolAuths(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			ClaudeAPIPool: config.ClaudeAPIPoolConfig{Enabled: false},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	poolAuth := &coreauth.Auth{
+		ID:       "pool-auth",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			claudeapipool.AttrPool: "true",
+		},
+	}
+	legacyAuth := &coreauth.Auth{
+		ID:       "legacy-auth",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+	}
+	if _, err := service.coreManager.Register(context.Background(), poolAuth); err != nil {
+		t.Fatalf("register pool auth: %v", err)
+	}
+	if _, err := service.coreManager.Register(context.Background(), legacyAuth); err != nil {
+		t.Fatalf("register legacy auth: %v", err)
+	}
+
+	if err := service.SyncClaudeAPIPoolAuths(context.Background()); err != nil {
+		t.Fatalf("SyncClaudeAPIPoolAuths() error = %v", err)
+	}
+
+	gotPool, ok := service.coreManager.GetByID(poolAuth.ID)
+	if !ok || gotPool == nil {
+		t.Fatalf("expected pool auth to remain as disabled runtime entry")
+	}
+	if !gotPool.Disabled || gotPool.Status != coreauth.StatusDisabled {
+		t.Fatalf("expected pool auth disabled, got disabled=%v status=%s", gotPool.Disabled, gotPool.Status)
+	}
+	gotLegacy, ok := service.coreManager.GetByID(legacyAuth.ID)
+	if !ok || gotLegacy == nil {
+		t.Fatalf("expected legacy auth to remain")
+	}
+	if gotLegacy.Disabled || gotLegacy.Status == coreauth.StatusDisabled {
+		t.Fatalf("legacy auth should not be disabled, got disabled=%v status=%s", gotLegacy.Disabled, gotLegacy.Status)
 	}
 }

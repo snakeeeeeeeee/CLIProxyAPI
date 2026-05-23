@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -393,6 +394,36 @@ func (m *Manager) HomeEnabled() bool {
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	return cfg != nil && cfg.Home.Enabled
+}
+
+func (m *Manager) useClaudeAPIPoolForProvider(provider string) bool {
+	if m == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(provider), "claude") {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	return cfg != nil && cfg.ClaudeAPIPool.Enabled
+}
+
+func (m *Manager) useClaudeAPIPoolForProviders(providers []string) bool {
+	for _, provider := range providers {
+		if m.useClaudeAPIPoolForProvider(provider) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) authAllowedForProviderRoute(provider string, auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if m.useClaudeAPIPoolForProvider(provider) {
+		return claudeapipool.IsAttributesPoolAuth(auth.Attributes)
+	}
+	return true
 }
 
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
@@ -807,8 +838,17 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 }
 
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+	return m.wrapStreamResultWithLease(ctx, auth, provider, resultModel, headers, buffered, remaining, nil)
+}
+
+func (m *Manager) wrapStreamResultWithLease(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, lease *claudeapipool.RouteLease) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
+		defer func() {
+			if lease != nil {
+				lease.Release()
+			}
+		}()
 		defer close(out)
 		var failed bool
 		forward := true
@@ -863,10 +903,31 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	var lastErr error
 	for idx, execModel := range execModels {
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
+		lease, acquired := acquireClaudePoolRoute(auth, resultModel)
+		if !acquired {
+			lastErr = &Error{Code: "pool_route_limited", Message: "claude api pool account is locally rate limited", Retryable: true}
+			continue
+		}
 		execReq := req
 		execReq.Model = execModel
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
+		var streamResult *cliproxyexecutor.StreamResult
+		var errStream error
+		for sameAttempt := 0; ; sameAttempt++ {
+			streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, opts)
+			if !shouldRetrySameClaudePoolAuth(auth, errStream, sameAttempt) {
+				break
+			}
+			if errWait := waitForCooldown(ctx, sameClaudePoolRetryDelay(errStream)); errWait != nil {
+				if lease != nil {
+					lease.Release()
+				}
+				return nil, errWait
+			}
+		}
 		if errStream != nil {
+			if lease != nil {
+				lease.Release()
+			}
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
@@ -887,6 +948,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				if lease != nil {
+					lease.Release()
+				}
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCtx
 			}
@@ -898,6 +962,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
+				if lease != nil {
+					lease.Release()
+				}
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
 			}
@@ -909,6 +976,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
+				if lease != nil {
+					lease.Release()
+				}
 				discardStreamChunks(streamResult.Chunks)
 				lastErr = bootstrapErr
 				continue
@@ -920,6 +990,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
+			if lease != nil {
+				lease.Release()
+			}
 			discardStreamChunks(streamResult.Chunks)
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
@@ -929,8 +1002,14 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
 			m.MarkResult(ctx, result)
 			if idx < len(execModels)-1 {
+				if lease != nil {
+					lease.Release()
+				}
 				lastErr = emptyErr
 				continue
+			}
+			if lease != nil {
+				lease.Release()
 			}
 			return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
 		}
@@ -941,7 +1020,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResultWithLease(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, lease), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -991,7 +1070,9 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
 			}
 		case "claude":
-			if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
+			if models := claudeapipool.ModelsFromAttributes(auth.Attributes); len(models) > 0 {
+				compileAPIKeyModelAliasForModels(byAlias, models)
+			} else if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
 				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
 			}
 		case "codex":
@@ -1323,6 +1404,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	routeModel := req.Model
+	maxRetryCredentials = effectivePoolMaxRetryCredentials(maxRetryCredentials, providers)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
@@ -1364,13 +1446,34 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if len(models) == 0 {
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
 		var authErr error
 		for _, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
+			lease, acquired := acquireClaudePoolRoute(auth, resultModel)
+			if !acquired {
+				authErr = &Error{Code: "pool_route_limited", Message: "claude api pool account is locally rate limited", Retryable: true}
+				continue
+			}
+			attempted[auth.ID] = struct{}{}
 			execReq := req
 			execReq.Model = upstreamModel
-			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+			var resp cliproxyexecutor.Response
+			var errExec error
+			for sameAttempt := 0; ; sameAttempt++ {
+				resp, errExec = executor.Execute(execCtx, auth, execReq, opts)
+				if !shouldRetrySameClaudePoolAuth(auth, errExec, sameAttempt) {
+					break
+				}
+				if errWait := waitForCooldown(execCtx, sameClaudePoolRetryDelay(errExec)); errWait != nil {
+					if lease != nil {
+						lease.Release()
+					}
+					return cliproxyexecutor.Response{}, errWait
+				}
+			}
+			if lease != nil {
+				lease.Release()
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -1398,6 +1501,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
+			if errWait := waitForClaudePoolSwitchDelay(execCtx); errWait != nil {
+				return cliproxyexecutor.Response{}, errWait
+			}
 			if homeMode {
 				homeAuthCount++
 			}
@@ -1411,6 +1517,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	routeModel := req.Model
+	maxRetryCredentials = effectivePoolMaxRetryCredentials(maxRetryCredentials, providers)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
@@ -1452,13 +1559,34 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if len(models) == 0 {
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
 		var authErr error
 		for _, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
+			lease, acquired := acquireClaudePoolRoute(auth, resultModel)
+			if !acquired {
+				authErr = &Error{Code: "pool_route_limited", Message: "claude api pool account is locally rate limited", Retryable: true}
+				continue
+			}
+			attempted[auth.ID] = struct{}{}
 			execReq := req
 			execReq.Model = upstreamModel
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
+			var resp cliproxyexecutor.Response
+			var errExec error
+			for sameAttempt := 0; ; sameAttempt++ {
+				resp, errExec = executor.CountTokens(execCtx, auth, execReq, opts)
+				if !shouldRetrySameClaudePoolAuth(auth, errExec, sameAttempt) {
+					break
+				}
+				if errWait := waitForCooldown(execCtx, sameClaudePoolRetryDelay(errExec)); errWait != nil {
+					if lease != nil {
+						lease.Release()
+					}
+					return cliproxyexecutor.Response{}, errWait
+				}
+			}
+			if lease != nil {
+				lease.Release()
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -1486,6 +1614,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
+			if errWait := waitForClaudePoolSwitchDelay(execCtx); errWait != nil {
+				return cliproxyexecutor.Response{}, errWait
+			}
 			if homeMode {
 				homeAuthCount++
 			}
@@ -1499,6 +1630,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	routeModel := req.Model
+	maxRetryCredentials = effectivePoolMaxRetryCredentials(maxRetryCredentials, providers)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
@@ -1548,6 +1680,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, errStream
 			}
 			lastErr = errStream
+			if errWait := waitForClaudePoolSwitchDelay(execCtx); errWait != nil {
+				return nil, errWait
+			}
 			if homeMode {
 				homeAuthCount++
 			}
@@ -2012,6 +2147,9 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
+		if !m.authAllowedForProviderRoute(providerKey, auth) {
+			continue
+		}
 		effectiveRetry := defaultRetry
 		if override, ok := auth.RequestRetryOverride(); ok {
 			effectiveRetry = override
@@ -2070,6 +2208,9 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 		}
 		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
 		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+		if !m.authAllowedForProviderRoute(providerKey, auth) {
 			continue
 		}
 		effectiveRetry := defaultRetry
@@ -2132,6 +2273,56 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func effectivePoolMaxRetryCredentials(current int, providers []string) int {
+	hasClaude := false
+	for _, provider := range providers {
+		if strings.EqualFold(strings.TrimSpace(provider), "claude") {
+			hasClaude = true
+			break
+		}
+	}
+	if !hasClaude {
+		return current
+	}
+	poolAttempts := claudeapipool.CrossAccountAttempts()
+	if poolAttempts <= 0 {
+		return current
+	}
+	if current <= 0 || poolAttempts < current {
+		return poolAttempts
+	}
+	return current
+}
+
+func acquireClaudePoolRoute(auth *Auth, model string) (*claudeapipool.RouteLease, bool) {
+	if auth == nil || !claudeapipool.IsAttributesPoolAuth(auth.Attributes) {
+		return nil, true
+	}
+	return claudeapipool.TryAcquireRoute(auth.ID, model)
+}
+
+func shouldRetrySameClaudePoolAuth(auth *Auth, err error, attempt int) bool {
+	if auth == nil || !claudeapipool.IsAttributesPoolAuth(auth.Attributes) || err == nil || attempt < 0 {
+		return false
+	}
+	status := statusCodeFromError(err)
+	maxAttempts, _ := claudeapipool.SameAccountRetry(status)
+	return maxAttempts > 0 && attempt < maxAttempts
+}
+
+func sameClaudePoolRetryDelay(err error) time.Duration {
+	status := statusCodeFromError(err)
+	_, delay := claudeapipool.SameAccountRetry(status)
+	if retryAfter := retryAfterFromError(err); retryAfter != nil && *retryAfter > delay {
+		return *retryAfter
+	}
+	return delay
+}
+
+func waitForClaudePoolSwitchDelay(ctx context.Context) error {
+	return waitForCooldown(ctx, claudeapipool.SwitchDelay())
 }
 
 // MarkResult records an execution result and notifies hooks.
@@ -2229,6 +2420,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if !disableCooling {
 								if result.RetryAfter != nil {
 									next = now.Add(*result.RetryAfter)
+								} else if claudeapipool.IsAttributesPoolAuth(auth.Attributes) {
+									cooldown, nextLevel, okCooldown := claudeapipool.CooldownForStatus(statusCode, backoffLevel, nil)
+									if okCooldown && cooldown > 0 {
+										next = now.Add(cooldown)
+									}
+									backoffLevel = nextLevel
 								} else {
 									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
 									if cooldown > 0 {
@@ -2248,6 +2445,34 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								suspendReason = "quota"
 								shouldSuspendModel = true
 								setModelQuota = true
+							}
+						case claudeapipool.StatusOverloaded:
+							if claudeapipool.IsAttributesPoolAuth(auth.Attributes) {
+								var next time.Time
+								backoffLevel := state.Quota.BackoffLevel
+								if !disableCooling {
+									cooldown, nextLevel, okCooldown := claudeapipool.CooldownForStatus(statusCode, backoffLevel, result.RetryAfter)
+									if okCooldown && cooldown > 0 {
+										next = now.Add(cooldown)
+									}
+									backoffLevel = nextLevel
+								}
+								state.NextRetryAfter = next
+								state.Quota = QuotaState{
+									Exceeded:      !disableCooling,
+									Reason:        "overloaded",
+									NextRecoverAt: next,
+									BackoffLevel:  backoffLevel,
+								}
+								if !disableCooling {
+									suspendReason = "overloaded"
+									shouldSuspendModel = true
+								}
+							} else if disableCooling {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(1 * time.Minute)
+								state.NextRetryAfter = next
 							}
 						case 408, 500, 502, 503, 504:
 							if disableCooling {
@@ -2274,6 +2499,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		authSnapshot = auth.Clone()
 	}
 	m.mu.Unlock()
+	if authSnapshot != nil && claudeapipool.IsAttributesPoolAuth(authSnapshot.Attributes) {
+		if result.Error != nil {
+			claudeapipool.NoteRouteResult(result.AuthID, result.Model, statusCodeFromResult(result.Error), result.RetryAfter)
+		} else if result.Success {
+			claudeapipool.NoteRouteResult(result.AuthID, result.Model, http.StatusOK, nil)
+		}
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
@@ -2886,6 +3118,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if candidate.Provider != provider || candidate.Disabled {
 			continue
 		}
+		if !m.authAllowedForProviderRoute(provider, candidate) {
+			continue
+		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
@@ -2946,6 +3181,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			if candidate == nil || candidate.Provider != provider || candidate.Disabled {
 				continue
 			}
+			if !m.authAllowedForProviderRoute(provider, candidate) {
+				continue
+			}
 			if _, used := tried[candidate.ID]; used {
 				continue
 			}
@@ -2972,6 +3210,13 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		}
 		if selected == nil {
 			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if !m.authAllowedForProviderRoute(provider, selected) {
+			if tried == nil {
+				tried = make(map[string]struct{})
+			}
+			tried[selected.ID] = struct{}{}
+			continue
 		}
 		if disallowFreeAuth && isFreeCodexAuth(selected) {
 			if tried == nil {
@@ -3039,6 +3284,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+		if !m.authAllowedForProviderRoute(providerKey, candidate) {
 			continue
 		}
 		if _, used := tried[candidate.ID]; used {
@@ -3127,7 +3375,11 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			if candidate == nil || candidate.Disabled {
 				continue
 			}
-			if _, ok := providerSet[strings.TrimSpace(strings.ToLower(candidate.Provider))]; !ok {
+			providerKey := strings.TrimSpace(strings.ToLower(candidate.Provider))
+			if _, ok := providerSet[providerKey]; !ok {
+				continue
+			}
+			if !m.authAllowedForProviderRoute(providerKey, candidate) {
 				continue
 			}
 			if _, used := tried[candidate.ID]; used {
@@ -3153,6 +3405,13 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		if selected == nil {
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if !m.authAllowedForProviderRoute(providerKey, selected) {
+			if tried == nil {
+				tried = make(map[string]struct{})
+			}
+			tried[selected.ID] = struct{}{}
+			continue
 		}
 		if disallowFreeAuth && isFreeCodexAuth(selected) {
 			if tried == nil {

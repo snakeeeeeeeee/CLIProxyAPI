@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -200,6 +201,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
+	virtualCache := beginClaudePoolVirtualCache(auth, opts, baseModel, bodyForTranslation)
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
@@ -291,6 +293,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	} else {
 		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
 	}
+	data = rewriteClaudeUsageForVirtualCache(virtualCache, data, stream)
 	data = restoreClaudeOAuthToolNamesFromResponse(data, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 	var param any
 	out := sdktranslator.TranslateNonStream(
@@ -374,6 +377,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
+	virtualCache := beginClaudePoolVirtualCache(auth, opts, baseModel, bodyForTranslation)
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
@@ -459,6 +463,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 					reporter.Publish(ctx, detail)
 				}
+				line = rewriteClaudeStreamUsageForVirtualCache(virtualCache, line)
 				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				// Forward the line as-is to preserve SSE format
 				cloned := make([]byte, len(line)+1)
@@ -491,6 +496,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 			}
+			line = rewriteClaudeStreamUsageForVirtualCache(virtualCache, line)
 			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			chunks := sdktranslator.TranslateStream(
 				ctx,
@@ -520,6 +526,52 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func beginClaudePoolVirtualCache(auth *cliproxyauth.Auth, opts cliproxyexecutor.Options, model string, body []byte) *claudeapipool.VirtualCacheTransaction {
+	if auth == nil || !claudeapipool.IsAttributesPoolAuth(auth.Attributes) {
+		return nil
+	}
+	sessionKey := cliproxyauth.ExtractVirtualCacheSessionKey(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if strings.TrimSpace(sessionKey) == "" {
+		sessionKey = cliproxyauth.ExtractVirtualCacheSessionKey(opts.Headers, body, opts.Metadata)
+	}
+	return claudeapipool.BeginVirtualCache("claude", model, sessionKey, body)
+}
+
+func rewriteClaudeUsageForVirtualCache(tx *claudeapipool.VirtualCacheTransaction, data []byte, stream bool) []byte {
+	if tx == nil {
+		return data
+	}
+	defer tx.Commit()
+	if !stream {
+		return tx.RewriteClaudeResponseUsage(data)
+	}
+	lines := bytes.SplitAfter(data, []byte("\n"))
+	changed := false
+	out := make([]byte, 0, len(data))
+	for _, line := range lines {
+		rewritten := tx.RewriteClaudeStreamLine(line)
+		if !bytes.Equal(rewritten, line) {
+			changed = true
+		}
+		out = append(out, rewritten...)
+	}
+	if !changed {
+		return data
+	}
+	return out
+}
+
+func rewriteClaudeStreamUsageForVirtualCache(tx *claudeapipool.VirtualCacheTransaction, line []byte) []byte {
+	if tx == nil {
+		return line
+	}
+	rewritten := tx.RewriteClaudeStreamLine(line)
+	if bytes.Contains(rewritten, []byte(`"type":"message_stop"`)) || bytes.Contains(rewritten, []byte(`"type": "message_stop"`)) {
+		tx.Commit()
+	}
+	return rewritten
 }
 
 func validateClaudeStreamingResponse(data []byte) error {

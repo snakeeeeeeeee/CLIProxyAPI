@@ -10,6 +10,8 @@ import (
 type SynthesisContext struct {
 	// Config is the current configuration
 	Config *config.Config
+	// ConfigPath is the source YAML path used for resolving relative sidecar files.
+	ConfigPath string
 	// AuthDir is the directory containing auth files
 	AuthDir string
 	// Now is the current time for timestamps

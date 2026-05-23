@@ -1,0 +1,94 @@
+# Claude API Pool example.
+# This is the YAML import/export format. The runtime stores pool data in
+# claude-api-pool.db. If claude-api-pool.db is empty, an existing
+# claude-api-pool.yaml in the project config directory is imported once.
+# Enable it in config.yaml:
+#
+# claude-api-pool:
+#   enabled: true
+#
+# Item IDs are not configured by hand. The UI shows #1, #2, ... by file order.
+
+version: 1
+
+# Virtual cache controls downstream usage rewriting for this pool only.
+# enabled: false disables local virtual cache accounting entirely.
+# hit-rate: 0.9 means about 90% of the cache-control prefix is reported as cached.
+# target-cache-reuse-ratio: 0 disables dynamic target tuning. Set 0.9 to bias the recent
+# 5-minute window toward about 90% cache_read_input_tokens.
+# max-cache-tokens: 0 means no cap. Set a positive number to limit reported cached tokens per request.
+# uncached-input-tokens: 0 means no floor. Set a positive number to keep at least that many input_tokens.
+# context-shrink-reset-ratio: 0.7 resets the local ledger when the observed cache prefix shrinks below 70%.
+# min/max-creation-tokens cap the newly written cache tokens after a rolling cache hit. 0 means no extra cap.
+virtual-cache:
+  enabled: true
+  hit-rate: 0.9
+  target-cache-reuse-ratio: 0
+  min-cache-tokens: 0
+  max-cache-tokens: 0
+  uncached-input-tokens: 0
+  context-shrink-reset-ratio: 0.7
+  min-creation-tokens: 0
+  max-creation-tokens: 0
+
+# Pool routing controls only apply to Claude API Pool accounts.
+# per-account-rpm: 0 disables local RPM protection. Set it to the real safe RPM of one account.
+# per-account-concurrency: 0 disables local concurrency protection. Low-quota trial accounts often use 1.
+# max-switches: 0 uses global max-retry-credentials. Set 3 to try the first account plus up to 3 account switches.
+# switch-delay-ms: optional delay before switching accounts after an upstream failure. 0 means no delay.
+# 429 uses rate-limit cooldown; 529 uses overload cooldown. Both are scoped to auth + model.
+# same-account-retry-429/529 retries the same account before switching; keep small for low-RPM accounts.
+routing:
+  per-account-rpm: 0
+  per-account-concurrency: 0
+  max-switches: 0
+  switch-delay-ms: 0
+  rate-limit-cooldown-ms: 1000
+  rate-limit-max-cooldown-ms: 1800000
+  overload-cooldown-ms: 10000
+  overload-max-cooldown-ms: 60000
+  same-account-retry-429: 0
+  same-account-retry-529: 0
+  same-account-retry-delay-ms: 1500
+
+# Defaults are inherited by every item unless the item overrides the field.
+defaults:
+  base-url: https://aws-external-anthropic.us-east-1.api.aws
+  proxy-url: ""
+  priority: 0
+  disable-cooling: false
+  headers:
+    anthropic-version: 2023-06-01
+
+# Shared model list. Items can override this with their own models block.
+models:
+  - name: claude-opus-4-7
+    alias: ""
+  - name: claude-sonnet-4-6
+    alias: ""
+  - name: claude-opus-4-6
+    alias: ""
+  - name: claude-haiku-4-5-20251001
+    alias: ""
+
+# Keep each item short. Only put fields that differ from defaults here.
+items:
+  - api-key: key-1
+    headers:
+      x-custom-a: value-a
+
+  - api-key: key-2
+    headers:
+      x-custom-b: value-b
+
+  # Per-account overrides are optional.
+  - api-key: key-3
+    base-url: https://another-anthropic-compatible.example.com
+    proxy-url: ""
+    priority: 10
+    disable-cooling: false
+    headers:
+      x-custom-c: value-c
+    models:
+      - name: claude-sonnet-4-6
+        alias: sonnet
