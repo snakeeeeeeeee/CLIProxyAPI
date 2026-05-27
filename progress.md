@@ -71,6 +71,15 @@
 - Verified:
   - `go test ./internal/claudeapipool`
   - `go build -o test-output ./cmd/server && rm test-output`
+- Superseded the pure local-total virtual cache rewrite with upstream-total anchoring:
+  - rewritten total input usage now preserves real Claude upstream total when present, so audit multiplier stays near 1 instead of shrinking to the local estimate
+  - local ledger still owns the split: first local request creates the cache budget; later requests read from prior local cache and create the remaining budget
+  - upstream `input_tokens` is preserved when upstream already reports cache fields, avoiding warm rounds rewritten to local delta or zero
+  - local request delta remains the fallback visible input only when upstream has no cache split
+  - added a cctest-like multi-round unit test that simulates 92% target reuse and asserts anchored totals, preserved input/output tokens, and warm-round read ratios near 92%
+- Verified:
+  - `go test ./internal/claudeapipool`
+  - `go build -o test-output ./cmd/server && rm test-output`
 - Migrated Claude API Pool account storage to SQLite primary storage:
   - added fixed `claude-api-pool.db` store beside `config.yaml`
   - first access imports existing `claude-api-pool.yaml` only when the SQLite store is empty

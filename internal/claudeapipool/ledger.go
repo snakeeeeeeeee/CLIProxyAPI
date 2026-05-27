@@ -547,10 +547,10 @@ func (tx *VirtualCacheTransaction) rewriteUsageAtPath(payload []byte, path strin
 	cacheCreationTokens := usage.Get("cache_creation_input_tokens").Int()
 	cacheReadTokens := usage.Get("cache_read_input_tokens").Int()
 	reportedTotalInputTokens := inputTokens + cacheCreationTokens + cacheReadTokens
-	localTotalInputTokens := tx.localTotalInputTokens()
-	if localTotalInputTokens <= 0 {
+	totalInputTokens := tx.anchorTotalInputTokens(reportedTotalInputTokens)
+	if totalInputTokens <= 0 {
 		DebugLogf(
-			"claude api pool virtual cache rewrite skip reason=zero_local_total mode=local path=%s upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d estimate=%d delta=%d hit_rate=%.3f",
+			"claude api pool virtual cache rewrite skip reason=zero_total mode=anchored path=%s upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d estimate=%d delta=%d hit_rate=%.3f",
 			path,
 			inputTokens,
 			cacheCreationTokens,
@@ -562,31 +562,31 @@ func (tx *VirtualCacheTransaction) rewriteUsageAtPath(payload []byte, path strin
 		)
 		return payload
 	}
-	tx.observedTokens = maxInt64(tx.observedTokens, localTotalInputTokens)
-	return tx.rewriteLocalLedgerUsageAtPath(payload, path, usage, localTotalInputTokens, reportedTotalInputTokens, outputTokens)
+	tx.observedTokens = maxInt64(tx.observedTokens, totalInputTokens)
+	return tx.rewriteLocalLedgerUsageAtPath(payload, path, usage, totalInputTokens, reportedTotalInputTokens, outputTokens)
 }
 
-func (tx *VirtualCacheTransaction) rewriteLocalLedgerUsageAtPath(payload []byte, path string, usage gjson.Result, localTotalInputTokens, reportedTotalInputTokens, outputTokens int64) []byte {
-	if tx == nil || localTotalInputTokens <= 0 {
+func (tx *VirtualCacheTransaction) rewriteLocalLedgerUsageAtPath(payload []byte, path string, usage gjson.Result, totalInputTokens, reportedTotalInputTokens, outputTokens int64) []byte {
+	if tx == nil || totalInputTokens <= 0 {
 		return payload
 	}
 
-	inputTokens := usage.Get("input_tokens").Int()
+	upstreamInputTokens := usage.Get("input_tokens").Int()
 	upstreamCreationTokens := usage.Get("cache_creation_input_tokens").Int()
 	upstreamReadTokens := usage.Get("cache_read_input_tokens").Int()
 
 	var virtualReadTokens int64
 	var virtualCreationTokens int64
-	rewrittenInputTokens := tx.requestInputTokens(localTotalInputTokens)
+	rewrittenInputTokens := tx.anchoredInputTokens(totalInputTokens, upstreamInputTokens, upstreamCreationTokens, upstreamReadTokens)
 	availableHitTokens := tx.availableHitTokens()
 	first := availableHitTokens <= 0
 	if rewrittenInputTokens < 0 {
 		rewrittenInputTokens = 0
 	}
-	if rewrittenInputTokens > localTotalInputTokens {
-		rewrittenInputTokens = localTotalInputTokens
+	if rewrittenInputTokens > totalInputTokens {
+		rewrittenInputTokens = totalInputTokens
 	}
-	cacheableBudget := localTotalInputTokens - rewrittenInputTokens
+	cacheableBudget := totalInputTokens - rewrittenInputTokens
 	tx.cacheableBudgetTokens = maxInt64(tx.cacheableBudgetTokens, cacheableBudget)
 	if first {
 		virtualCreationTokens = cacheableBudget
@@ -594,8 +594,8 @@ func (tx *VirtualCacheTransaction) rewriteLocalLedgerUsageAtPath(payload []byte,
 		virtualReadTokens = tx.localReadTokens(cacheableBudget)
 		virtualCreationTokens = cacheableBudget - virtualReadTokens
 	}
-	if virtualReadTokens+virtualCreationTokens > localTotalInputTokens {
-		virtualCreationTokens = localTotalInputTokens - virtualReadTokens
+	if virtualReadTokens+virtualCreationTokens > totalInputTokens {
+		virtualCreationTokens = totalInputTokens - virtualReadTokens
 	}
 	if virtualCreationTokens < 0 {
 		virtualCreationTokens = 0
@@ -603,11 +603,11 @@ func (tx *VirtualCacheTransaction) rewriteLocalLedgerUsageAtPath(payload []byte,
 	if rewrittenInputTokens < 0 {
 		rewrittenInputTokens = 0
 	}
-	if maxInput := localTotalInputTokens - virtualReadTokens - virtualCreationTokens; rewrittenInputTokens > maxInput {
+	if maxInput := totalInputTokens - virtualReadTokens - virtualCreationTokens; rewrittenInputTokens > maxInput {
 		rewrittenInputTokens = maxInt64(0, maxInput)
 	}
 
-	tx.observedTokens = maxInt64(tx.observedTokens, localTotalInputTokens)
+	tx.observedTokens = maxInt64(tx.observedTokens, totalInputTokens)
 	tx.hitTokens = virtualReadTokens
 	tx.creationTokens = maxInt64(tx.creationTokens, virtualCreationTokens)
 	tx.rememberUsage(rewrittenInputTokens, virtualReadTokens, virtualCreationTokens)
@@ -623,15 +623,15 @@ func (tx *VirtualCacheTransaction) rewriteLocalLedgerUsageAtPath(payload []byte,
 		out, _ = sjson.SetBytes(out, path+".output_tokens", outputTokens)
 	}
 	DebugLogf(
-		"claude api pool virtual cache rewrite mode=local path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d local_total=%d local_input=%d cacheable_budget=%d rewritten_creation=%d rewritten_read=%d output=%d target_reuse=%.3f hit_rate=%.3f available_hit=%d prior_observed=%d estimate=%d delta=%d",
+		"claude api pool virtual cache rewrite mode=anchored path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d anchored_total=%d rewritten_input=%d cacheable_budget=%d rewritten_creation=%d rewritten_read=%d output=%d target_reuse=%.3f hit_rate=%.3f available_hit=%d prior_observed=%d estimate=%d delta=%d total_multiplier=%.3f",
 		path,
 		first,
 		tx.resetLedger,
-		inputTokens,
+		upstreamInputTokens,
 		upstreamCreationTokens,
 		upstreamReadTokens,
 		reportedTotalInputTokens,
-		localTotalInputTokens,
+		totalInputTokens,
 		rewrittenInputTokens,
 		cacheableBudget,
 		virtualCreationTokens,
@@ -643,6 +643,7 @@ func (tx *VirtualCacheTransaction) rewriteLocalLedgerUsageAtPath(payload []byte,
 		tx.priorObserved,
 		tx.estimateTokens,
 		tx.deltaTokens,
+		tokenTotalMultiplier(totalInputTokens, reportedTotalInputTokens),
 	)
 	return out
 }
@@ -680,6 +681,39 @@ func (tx *VirtualCacheTransaction) localTotalInputTokens() int64 {
 		inputTokens = 0
 	}
 	return inputTokens + tx.localCacheableBudgetTokens()
+}
+
+func (tx *VirtualCacheTransaction) anchorTotalInputTokens(reportedTotalInputTokens int64) int64 {
+	if reportedTotalInputTokens > 0 {
+		return reportedTotalInputTokens
+	}
+	if tx == nil {
+		return 0
+	}
+	return tx.localTotalInputTokens()
+}
+
+func (tx *VirtualCacheTransaction) anchoredInputTokens(totalInputTokens, upstreamInputTokens, upstreamCreationTokens, upstreamReadTokens int64) int64 {
+	if tx == nil || totalInputTokens <= 0 {
+		return 0
+	}
+	inputTokens := tx.deltaTokens
+	if upstreamCreationTokens > 0 || upstreamReadTokens > 0 {
+		inputTokens = upstreamInputTokens
+	}
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	if floor := tx.policy.UncachedInputTokens; floor > 0 && totalInputTokens > floor && inputTokens < floor {
+		inputTokens = floor
+	}
+	if maxCacheTokens := tx.policy.MaxCacheTokens; maxCacheTokens > 0 && totalInputTokens-inputTokens > maxCacheTokens {
+		inputTokens = totalInputTokens - maxCacheTokens
+	}
+	if inputTokens > totalInputTokens {
+		inputTokens = totalInputTokens
+	}
+	return inputTokens
 }
 
 func (tx *VirtualCacheTransaction) localReadTokens(cacheableBudget int64) int64 {
@@ -724,18 +758,11 @@ func (tx *VirtualCacheTransaction) rewrittenInputTokens() int64 {
 	return 0
 }
 
-func (tx *VirtualCacheTransaction) requestInputTokens(totalInputTokens int64) int64 {
-	if tx == nil || totalInputTokens <= 0 {
+func tokenTotalMultiplier(rewrittenTotalInputTokens, reportedTotalInputTokens int64) float64 {
+	if reportedTotalInputTokens <= 0 {
 		return 0
 	}
-	inputTokens := tx.deltaTokens
-	if inputTokens < 0 {
-		inputTokens = 0
-	}
-	if inputTokens > totalInputTokens {
-		inputTokens = totalInputTokens
-	}
-	return inputTokens
+	return float64(rewrittenTotalInputTokens) / float64(reportedTotalInputTokens)
 }
 
 func (tx *VirtualCacheTransaction) setCacheCreationTTLBreakdown(payload []byte, path string, tokens int64) []byte {

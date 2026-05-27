@@ -13,7 +13,8 @@ Implement `claude-api-pool` as a separate file-backed Claude API account pool wi
 7. Claude-like virtual cache ledger upgrade - complete
 8. Sliding-window target cache reuse tuning - superseded
 9. SQLite primary store migration - complete
-10. Local-ledger-only virtual cache rewrite - complete
+10. Local-ledger-only virtual cache rewrite - superseded
+11. Upstream-total-anchored virtual cache rewrite - complete
 
 ## Decisions
 - Main config only stores `claude-api-pool.enabled` and `claude-api-pool.path`.
@@ -21,9 +22,9 @@ Implement `claude-api-pool` as a separate file-backed Claude API account pool wi
 - Runtime auth IDs are stable hashes of `api-key + base-url`.
 - First UI version is a dense table with pagination, filters, import/export, and drawer-style row editing.
 - Virtual cache ledger now models rolling Claude cache behavior with 5m/1h buckets, cache-read plus delta cache-write on growing contexts, and context-shrink reset.
-- `target-cache-reuse-ratio` now splits only the locally estimated cacheable prefix budget; cache reads are capped by cache tokens previously created in the local ledger.
+- `target-cache-reuse-ratio` now splits the anchored cacheable input budget; cache reads are capped by cache tokens previously created in the local ledger.
 - Claude API Pool now uses fixed SQLite primary storage at `claude-api-pool.db`; `claude-api-pool.yaml` remains the import/export format and first-run migration source.
-- Virtual cache usage rewrite no longer passes through or derives cache read/create values from real Claude upstream usage fields. It preserves a locally estimated per-request delta as `input_tokens`, creates local cache from the cache-control prefix on first use, and reads only previously created local cache on later requests.
+- Virtual cache usage rewrite anchors `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` to the real Claude upstream total when present. The local ledger only splits that total into input/create/read, preserving upstream `input_tokens` when upstream cache fields exist and using local request delta only when upstream reports no cache split.
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
