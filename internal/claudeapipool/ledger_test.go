@@ -11,6 +11,10 @@ import (
 
 func TestVirtualCacheLedgerRewritesClaudeUsageOnSecondRequest(t *testing.T) {
 	ledger := newVirtualCacheLedger(100)
+	old := CurrentVirtualCacheConfig()
+	SetVirtualCacheConfig(EffectiveVirtualCacheConfig{Enabled: true, HitRate: 0.90})
+	t.Cleanup(func() { SetVirtualCacheConfig(old) })
+
 	request := []byte(`{
 		"system": [{"type":"text","text":"stable system","cache_control":{"type":"ephemeral","ttl":"1h"}}],
 		"messages": [{"role":"user","content":[{"type":"text","text":"hi"}]}]
@@ -49,6 +53,10 @@ func TestVirtualCacheLedgerRewritesClaudeUsageOnSecondRequest(t *testing.T) {
 
 func TestVirtualCacheLedgerRewritesClaudeStreamUsage(t *testing.T) {
 	ledger := newVirtualCacheLedger(100)
+	old := CurrentVirtualCacheConfig()
+	SetVirtualCacheConfig(EffectiveVirtualCacheConfig{Enabled: true, HitRate: 0.90})
+	t.Cleanup(func() { SetVirtualCacheConfig(old) })
+
 	request := []byte(`{
 		"messages": [{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]
 	}`)
@@ -93,7 +101,11 @@ func TestVirtualCacheLedgerTTLExpires(t *testing.T) {
 func TestVirtualCacheLedgerEstimatesWhenUpstreamCacheUsageIsZero(t *testing.T) {
 	ledger := newVirtualCacheLedger(100)
 	old := CurrentVirtualCacheConfig()
-	SetVirtualCacheConfig(EffectiveVirtualCacheConfig{Enabled: true, HitRate: 0.90})
+	SetVirtualCacheConfig(EffectiveVirtualCacheConfig{
+		Enabled:               true,
+		HitRate:               0.90,
+		TargetCacheReuseRatio: 0.90,
+	})
 	t.Cleanup(func() { SetVirtualCacheConfig(old) })
 
 	prefix := strings.Repeat("stable prompt cache prefix ", 200)
@@ -116,6 +128,12 @@ func TestVirtualCacheLedgerEstimatesWhenUpstreamCacheUsageIsZero(t *testing.T) {
 	if got := gjson.GetBytes(out, "usage.cache_creation.ephemeral_1h_input_tokens").Int(); got != created {
 		t.Fatalf("ephemeral_1h_input_tokens = %d, want %d; out=%s", got, created, out)
 	}
+	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 0 {
+		t.Fatalf("first cache_read_input_tokens = %d, want 0; out=%s", got, out)
+	}
+	if sum := rewrittenUsageTotal(out); sum != 1500 {
+		t.Fatalf("first rewritten total = %d, want 1500; out=%s", sum, out)
+	}
 
 	second := ledger.begin("claude", "claude-opus", "session-1", request, time.Now())
 	if second == nil {
@@ -123,11 +141,17 @@ func TestVirtualCacheLedgerEstimatesWhenUpstreamCacheUsageIsZero(t *testing.T) {
 	}
 	out = second.RewriteClaudeResponseUsage(upstream)
 	second.Commit()
-	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != created {
-		t.Fatalf("second cache_read_input_tokens = %d, want %d; out=%s", got, created, out)
+	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 1350 {
+		t.Fatalf("second cache_read_input_tokens = %d, want 1350; out=%s", got, out)
 	}
 	if got := gjson.GetBytes(out, "usage.cache_creation_input_tokens").Int(); got != 0 {
 		t.Fatalf("second cache_creation_input_tokens = %d, want 0; out=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != 150 {
+		t.Fatalf("second input_tokens = %d, want 150; out=%s", got, out)
+	}
+	if sum := rewrittenUsageTotal(out); sum != 1500 {
+		t.Fatalf("second rewritten total = %d, want 1500; out=%s", sum, out)
 	}
 }
 
@@ -169,6 +193,7 @@ func TestVirtualCacheLedgerKeepsClaudeLikeRollingCacheAcrossPrefixGrowth(t *test
 	SetVirtualCacheConfig(EffectiveVirtualCacheConfig{
 		Enabled:                 true,
 		HitRate:                 0.90,
+		TargetCacheReuseRatio:   0.90,
 		ContextShrinkResetRatio: 0.70,
 		MinCreationTokens:       0,
 		MaxCreationTokens:       400,
@@ -194,11 +219,14 @@ func TestVirtualCacheLedgerKeepsClaudeLikeRollingCacheAcrossPrefixGrowth(t *test
 	}
 	secondOut := second.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":1800,"output_tokens":1}}`))
 	second.Commit()
-	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != created {
-		t.Fatalf("second cache_read_input_tokens = %d, want prior creation %d; out=%s", got, created, secondOut)
+	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != 1620 {
+		t.Fatalf("second cache_read_input_tokens = %d, want 1620; out=%s", got, secondOut)
 	}
 	if got := gjson.GetBytes(secondOut, "usage.cache_creation_input_tokens").Int(); got <= 0 {
 		t.Fatalf("second cache_creation_input_tokens = %d, want rolling delta creation; out=%s", got, secondOut)
+	}
+	if sum := rewrittenUsageTotal(secondOut); sum != 1800 {
+		t.Fatalf("second rewritten total = %d, want 1800; out=%s", sum, secondOut)
 	}
 }
 
@@ -354,8 +382,14 @@ func TestVirtualCacheTargetReuseRatioRewritesTowardConfiguredRatio(t *testing.T)
 	first := ledger.begin("claude", "claude-opus", "session-force-target", request, time.Now())
 	firstOut := first.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2000,"output_tokens":1}}`))
 	first.Commit()
-	if created := gjson.GetBytes(firstOut, "usage.cache_creation_input_tokens").Int(); created <= 0 {
-		t.Fatalf("first creation = %d, want > 0; out=%s", created, firstOut)
+	if created := gjson.GetBytes(firstOut, "usage.cache_creation_input_tokens").Int(); created != 1000 {
+		t.Fatalf("first creation = %d, want 1000; out=%s", created, firstOut)
+	}
+	if read := gjson.GetBytes(firstOut, "usage.cache_read_input_tokens").Int(); read != 0 {
+		t.Fatalf("first cache_read_input_tokens = %d, want 0; out=%s", read, firstOut)
+	}
+	if got := gjson.GetBytes(firstOut, "usage.input_tokens").Int(); got != 1000 {
+		t.Fatalf("first input_tokens = %d, want 1000; out=%s", got, firstOut)
 	}
 
 	second := ledger.begin("claude", "claude-opus", "session-force-target", request, time.Now())
@@ -367,4 +401,57 @@ func TestVirtualCacheTargetReuseRatioRewritesTowardConfiguredRatio(t *testing.T)
 	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got != 100 {
 		t.Fatalf("input_tokens = %d, want 100; out=%s", got, secondOut)
 	}
+	if sum := rewrittenUsageTotal(secondOut); sum != 2000 {
+		t.Fatalf("second rewritten total = %d, want 2000; out=%s", sum, secondOut)
+	}
+}
+
+func TestVirtualCacheTargetReuseRatioRewritesStreamUsage(t *testing.T) {
+	ledger := newVirtualCacheLedger(100)
+	old := CurrentVirtualCacheConfig()
+	SetVirtualCacheConfig(EffectiveVirtualCacheConfig{
+		Enabled:                 true,
+		HitRate:                 0.50,
+		TargetCacheReuseRatio:   0.90,
+		ContextShrinkResetRatio: 0.70,
+	})
+	t.Cleanup(func() { SetVirtualCacheConfig(old) })
+
+	request := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":` + strconv.Quote(strings.Repeat("stream cache prefix ", 300)) + `,"cache_control":{"type":"ephemeral"}}]}]}`)
+	line := []byte(`data: {"type":"message_delta","usage":{"input_tokens":1000,"output_tokens":3}}`)
+
+	first := ledger.begin("claude", "claude-sonnet", "session-stream-target", request, time.Now())
+	firstOut := first.RewriteClaudeStreamLine(line)
+	first.Commit()
+	firstPayload := gjson.Parse(strings.TrimSpace(strings.TrimPrefix(string(firstOut), "data:")))
+	if got := firstPayload.Get("usage.cache_read_input_tokens").Int(); got != 0 {
+		t.Fatalf("first stream cache_read_input_tokens = %d, want 0; out=%s", got, firstOut)
+	}
+	if got := firstPayload.Get("usage.cache_creation_input_tokens").Int(); got != 500 {
+		t.Fatalf("first stream cache_creation_input_tokens = %d, want 500; out=%s", got, firstOut)
+	}
+	if got := firstPayload.Get("usage.input_tokens").Int(); got != 500 {
+		t.Fatalf("first stream input_tokens = %d, want 500; out=%s", got, firstOut)
+	}
+
+	second := ledger.begin("claude", "claude-sonnet", "session-stream-target", request, time.Now())
+	secondOut := second.RewriteClaudeStreamLine(line)
+	second.Commit()
+	secondPayload := gjson.Parse(strings.TrimSpace(strings.TrimPrefix(string(secondOut), "data:")))
+	if got := secondPayload.Get("usage.cache_read_input_tokens").Int(); got != 900 {
+		t.Fatalf("second stream cache_read_input_tokens = %d, want 900; out=%s", got, secondOut)
+	}
+	if got := secondPayload.Get("usage.cache_creation_input_tokens").Int(); got != 0 {
+		t.Fatalf("second stream cache_creation_input_tokens = %d, want 0; out=%s", got, secondOut)
+	}
+	if got := secondPayload.Get("usage.input_tokens").Int(); got != 100 {
+		t.Fatalf("second stream input_tokens = %d, want 100; out=%s", got, secondOut)
+	}
+}
+
+func rewrittenUsageTotal(payload []byte) int64 {
+	usage := gjson.GetBytes(payload, "usage")
+	return usage.Get("input_tokens").Int() +
+		usage.Get("cache_creation_input_tokens").Int() +
+		usage.Get("cache_read_input_tokens").Int()
 }

@@ -470,6 +470,15 @@ func (tx *VirtualCacheTransaction) rewriteUsageAtPath(payload []byte, path strin
 	if reportedTotalInputTokens > tx.observedTokens {
 		tx.observedTokens = reportedTotalInputTokens
 	}
+	if tx.policy.TargetCacheReuseRatio > 0 {
+		return tx.rewriteTargetRatioUsageAtPath(
+			payload,
+			path,
+			usage,
+			reportedTotalInputTokens,
+			outputTokens,
+		)
+	}
 	if tx.hitTokens <= 0 {
 		if cacheableTokens > 0 {
 			tx.rememberUsage(inputTokens, cacheReadTokens, cacheCreationTokens)
@@ -545,6 +554,48 @@ func (tx *VirtualCacheTransaction) rewriteUsageAtPath(payload []byte, path strin
 	return out
 }
 
+func (tx *VirtualCacheTransaction) rewriteTargetRatioUsageAtPath(payload []byte, path string, usage gjson.Result, totalInputTokens, outputTokens int64) []byte {
+	if tx == nil || totalInputTokens <= 0 {
+		return payload
+	}
+
+	var virtualReadTokens int64
+	var virtualCreationTokens int64
+	if tx.hitTokens <= 0 {
+		virtualCreationTokens = tx.configuredTargetInitialCreationTokens(totalInputTokens)
+	} else {
+		virtualReadTokens = tx.configuredTargetReadTokens(totalInputTokens)
+		virtualCreationTokens = tx.configuredTargetDeltaCreationTokens(totalInputTokens, virtualReadTokens)
+	}
+	if virtualReadTokens+virtualCreationTokens > totalInputTokens {
+		virtualCreationTokens = totalInputTokens - virtualReadTokens
+	}
+	if virtualCreationTokens < 0 {
+		virtualCreationTokens = 0
+	}
+	rewrittenInputTokens := totalInputTokens - virtualReadTokens - virtualCreationTokens
+	if rewrittenInputTokens < 0 {
+		rewrittenInputTokens = 0
+	}
+
+	tx.observedTokens = maxInt64(tx.observedTokens, totalInputTokens)
+	tx.hitTokens = virtualReadTokens
+	tx.creationTokens = maxInt64(tx.creationTokens, virtualCreationTokens)
+	tx.rememberUsage(rewrittenInputTokens, virtualReadTokens, virtualCreationTokens)
+
+	out := payload
+	out, _ = sjson.SetBytes(out, path+".input_tokens", rewrittenInputTokens)
+	out, _ = sjson.SetBytes(out, path+".cache_read_input_tokens", virtualReadTokens)
+	out, _ = sjson.SetBytes(out, path+".cache_creation_input_tokens", virtualCreationTokens)
+	if usage.Get("cache_creation").Exists() || virtualCreationTokens > 0 {
+		out = tx.setCacheCreationTTLBreakdown(out, path, virtualCreationTokens)
+	}
+	if outputTokens > 0 && !usage.Get("output_tokens").Exists() {
+		out, _ = sjson.SetBytes(out, path+".output_tokens", outputTokens)
+	}
+	return out
+}
+
 func (tx *VirtualCacheTransaction) rememberUsage(inputTokens, cacheReadTokens, cacheCreationTokens int64) {
 	if tx == nil {
 		return
@@ -602,6 +653,67 @@ func (tx *VirtualCacheTransaction) configuredDeltaCreationTokens(totalInputToken
 	return creationTokens
 }
 
+func (tx *VirtualCacheTransaction) configuredTargetInitialCreationTokens(totalInputTokens int64) int64 {
+	if tx == nil || totalInputTokens <= 0 || !tx.policy.Enabled || tx.policy.HitRate <= 0 {
+		return 0
+	}
+	if tx.policy.MinCacheTokens > 0 && totalInputTokens < tx.policy.MinCacheTokens {
+		return 0
+	}
+	creationTokens := int64(math.Round(float64(totalInputTokens) * tx.policy.HitRate))
+	if tx.policy.MaxCacheTokens > 0 && creationTokens > tx.policy.MaxCacheTokens {
+		creationTokens = tx.policy.MaxCacheTokens
+	}
+	if floor := tx.policy.UncachedInputTokens; floor > 0 {
+		maxCreation := totalInputTokens - floor
+		if maxCreation < 0 {
+			maxCreation = 0
+		}
+		if creationTokens > maxCreation {
+			creationTokens = maxCreation
+		}
+	}
+	if creationTokens < 0 {
+		return 0
+	}
+	return creationTokens
+}
+
+func (tx *VirtualCacheTransaction) configuredTargetDeltaCreationTokens(totalInputTokens, readTokens int64) int64 {
+	if tx == nil || totalInputTokens <= 0 || readTokens <= 0 || tx.policy.HitRate <= 0 || tx.policy.MaxCreationTokens <= 0 {
+		return 0
+	}
+	deltaBase := tx.priorObserved
+	if deltaBase <= 0 {
+		deltaBase = tx.observedTokens
+	}
+	delta := totalInputTokens - deltaBase
+	if delta <= 0 {
+		return 0
+	}
+	creationTokens := int64(math.Round(float64(delta) * tx.policy.HitRate))
+	if tx.policy.MinCreationTokens > 0 && creationTokens < tx.policy.MinCreationTokens {
+		creationTokens = tx.policy.MinCreationTokens
+	}
+	if creationTokens > tx.policy.MaxCreationTokens {
+		creationTokens = tx.policy.MaxCreationTokens
+	}
+	maxCreation := totalInputTokens - readTokens
+	if floor := tx.policy.UncachedInputTokens; floor > 0 {
+		maxCreation = totalInputTokens - readTokens - floor
+	}
+	if maxCreation < 0 {
+		maxCreation = 0
+	}
+	if creationTokens > maxCreation {
+		creationTokens = maxCreation
+	}
+	if creationTokens < 0 {
+		return 0
+	}
+	return creationTokens
+}
+
 func (tx *VirtualCacheTransaction) configuredReadTokens(tokens int64) int64 {
 	if tx == nil || tokens <= 0 {
 		return 0
@@ -619,15 +731,38 @@ func (tx *VirtualCacheTransaction) configuredReadTokens(tokens int64) int64 {
 	return readTokens
 }
 
+func (tx *VirtualCacheTransaction) configuredTargetReadTokens(totalInputTokens int64) int64 {
+	if tx == nil || totalInputTokens <= 0 || tx.policy.TargetCacheReuseRatio <= 0 {
+		return 0
+	}
+	readTokens := int64(math.Round(float64(totalInputTokens) * tx.policy.TargetCacheReuseRatio))
+	if tx.policy.MaxCacheTokens > 0 && readTokens > tx.policy.MaxCacheTokens {
+		readTokens = tx.policy.MaxCacheTokens
+	}
+	if floor := tx.policy.UncachedInputTokens; floor > 0 && totalInputTokens > floor && totalInputTokens-readTokens < floor {
+		readTokens = totalInputTokens - floor
+	}
+	if readTokens > totalInputTokens {
+		readTokens = totalInputTokens
+	}
+	if readTokens < 0 {
+		return 0
+	}
+	return readTokens
+}
+
 func (tx *VirtualCacheTransaction) targetReadTokens(totalInputTokens, currentReadTokens int64) int64 {
 	if tx == nil || totalInputTokens <= 0 || currentReadTokens <= 0 || tx.policy.TargetCacheReuseRatio <= 0 {
 		return currentReadTokens
 	}
 	targetReadTokens := int64(math.Round(float64(totalInputTokens) * tx.policy.TargetCacheReuseRatio))
-	if targetReadTokens > currentReadTokens {
-		currentReadTokens = targetReadTokens
+	if targetReadTokens < 0 {
+		return 0
 	}
-	return currentReadTokens
+	if targetReadTokens > totalInputTokens {
+		return totalInputTokens
+	}
+	return targetReadTokens
 }
 
 func (tx *VirtualCacheTransaction) setCacheCreationTTLBreakdown(payload []byte, path string, tokens int64) []byte {
