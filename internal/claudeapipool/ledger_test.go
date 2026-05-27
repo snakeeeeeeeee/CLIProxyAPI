@@ -635,6 +635,99 @@ func TestVirtualCacheLedgerAnchorsCCTestLikeMultiRoundAudit(t *testing.T) {
 	}
 }
 
+func TestVirtualCacheLedgerForcedModeTargetsWarmRoundReuse(t *testing.T) {
+	ledger := newVirtualCacheLedger(100)
+	old := CurrentVirtualCacheConfig()
+	SetVirtualCacheConfig(EffectiveVirtualCacheConfig{
+		Enabled:                 true,
+		Mode:                    VirtualCacheModeForced,
+		HitRate:                 0.90,
+		TargetCacheReuseRatio:   0.999,
+		ContextShrinkResetRatio: 0.70,
+	})
+	t.Cleanup(func() { SetVirtualCacheConfig(old) })
+
+	request := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"stable cache prefix","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
+	upstream := []byte(`{"usage":{"input_tokens":1,"cache_creation_input_tokens":1000,"cache_read_input_tokens":9000,"output_tokens":12}}`)
+
+	first := ledger.begin("claude", "claude-opus", "session-forced", request, time.Now())
+	if first == nil {
+		t.Fatal("first transaction is nil")
+	}
+	firstOut := first.RewriteClaudeResponseUsage(upstream)
+	first.Commit()
+	if got := gjson.GetBytes(firstOut, "usage.cache_read_input_tokens").Int(); got != 0 {
+		t.Fatalf("first read = %d, want cold-start 0; out=%s", got, firstOut)
+	}
+	if got := rewrittenUsageTotal(firstOut); got != 10001 {
+		t.Fatalf("first total = %d, want anchored total 10001; out=%s", got, firstOut)
+	}
+
+	second := ledger.begin("claude", "claude-opus", "session-forced", request, time.Now().Add(time.Second))
+	if second == nil {
+		t.Fatal("second transaction is nil")
+	}
+	secondOut := second.RewriteClaudeResponseUsage(upstream)
+	second.Commit()
+
+	cacheBudget := int64(10000)
+	wantRead := int64(9990)
+	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got != 1 {
+		t.Fatalf("second input = %d, want anchored upstream input 1; out=%s", got, secondOut)
+	}
+	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != wantRead {
+		t.Fatalf("second read = %d, want forced target read %d; out=%s", got, wantRead, secondOut)
+	}
+	if got := gjson.GetBytes(secondOut, "usage.cache_creation_input_tokens").Int(); got != cacheBudget-wantRead {
+		t.Fatalf("second creation = %d, want forced remainder %d; out=%s", got, cacheBudget-wantRead, secondOut)
+	}
+	if got := rewrittenUsageTotal(secondOut); got != 10001 {
+		t.Fatalf("second total = %d, want anchored total 10001; out=%s", got, secondOut)
+	}
+}
+
+func TestVirtualCacheLedgerForcedModeKeepsMinimumCreation(t *testing.T) {
+	ledger := newVirtualCacheLedger(100)
+	old := CurrentVirtualCacheConfig()
+	SetVirtualCacheConfig(EffectiveVirtualCacheConfig{
+		Enabled:               true,
+		Mode:                  VirtualCacheModeForced,
+		HitRate:               0.90,
+		TargetCacheReuseRatio: 1,
+	})
+	t.Cleanup(func() { SetVirtualCacheConfig(old) })
+
+	request := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"stable cache prefix","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
+	upstream := []byte(`{"usage":{"input_tokens":0,"cache_creation_input_tokens":100,"cache_read_input_tokens":0,"output_tokens":1}}`)
+
+	first := ledger.begin("claude", "claude-opus", "session-forced-min", request, time.Now())
+	if first == nil {
+		t.Fatal("first transaction is nil")
+	}
+	_ = first.RewriteClaudeResponseUsage(upstream)
+	first.Commit()
+
+	second := ledger.begin("claude", "claude-opus", "session-forced-min", request, time.Now().Add(time.Second))
+	if second == nil {
+		t.Fatal("second transaction is nil")
+	}
+	secondOut := second.RewriteClaudeResponseUsage(upstream)
+	second.Commit()
+
+	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got != 1 {
+		t.Fatalf("forced input = %d, want minimum 1; out=%s", got, secondOut)
+	}
+	if got := gjson.GetBytes(secondOut, "usage.cache_creation_input_tokens").Int(); got != 1 {
+		t.Fatalf("forced creation = %d, want minimum 1; out=%s", got, secondOut)
+	}
+	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != 98 {
+		t.Fatalf("forced read = %d, want remaining read 98; out=%s", got, secondOut)
+	}
+	if got := rewrittenUsageTotal(secondOut); got != 100 {
+		t.Fatalf("forced total = %d, want anchored total 100; out=%s", got, secondOut)
+	}
+}
+
 func rewrittenUsageTotal(payload []byte) int64 {
 	usage := gjson.GetBytes(payload, "usage")
 	return rewrittenUsageTotalFromResult(usage)

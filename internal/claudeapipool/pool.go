@@ -23,7 +23,9 @@ const (
 	// DefaultFileName is the fixed YAML import/export filename.
 	DefaultFileName = "claude-api-pool.yaml"
 	// DefaultDBFileName is the fixed SQLite-backed pool filename.
-	DefaultDBFileName = "claude-api-pool.db"
+	DefaultDBFileName       = "claude-api-pool.db"
+	VirtualCacheModeNatural = "natural"
+	VirtualCacheModeForced  = "forced"
 	// SimpleImportWorkspaceHeader is populated by apiKey-----workspaceId imports.
 	SimpleImportWorkspaceHeader = "workspaceId"
 
@@ -51,6 +53,7 @@ type File struct {
 // VirtualCacheConfig controls downstream virtual prompt-cache usage rewriting.
 type VirtualCacheConfig struct {
 	Enabled                 *bool    `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Mode                    string   `yaml:"mode,omitempty" json:"mode,omitempty"`
 	HitRate                 *float64 `yaml:"hit-rate,omitempty" json:"hit-rate,omitempty"`
 	TargetCacheReuseRatio   *float64 `yaml:"target-cache-reuse-ratio,omitempty" json:"target-cache-reuse-ratio,omitempty"`
 	MinCacheTokens          int64    `yaml:"min-cache-tokens,omitempty" json:"min-cache-tokens,omitempty"`
@@ -64,6 +67,7 @@ type VirtualCacheConfig struct {
 // EffectiveVirtualCacheConfig is the fully-defaulted runtime virtual-cache policy.
 type EffectiveVirtualCacheConfig struct {
 	Enabled                 bool    `json:"enabled"`
+	Mode                    string  `json:"mode"`
 	HitRate                 float64 `json:"hit_rate"`
 	TargetCacheReuseRatio   float64 `json:"target_cache_reuse_ratio"`
 	ReadScale               float64 `json:"-"`
@@ -308,6 +312,7 @@ func Normalize(doc *File) {
 
 // NormalizeVirtualCacheConfig clamps file-backed virtual-cache settings.
 func NormalizeVirtualCacheConfig(cfg VirtualCacheConfig) VirtualCacheConfig {
+	cfg.Mode = normalizeVirtualCacheMode(cfg.Mode)
 	if cfg.HitRate != nil {
 		rate := *cfg.HitRate
 		if rate > 1 {
@@ -363,6 +368,17 @@ func NormalizeVirtualCacheConfig(cfg VirtualCacheConfig) VirtualCacheConfig {
 		cfg.MaxCreationTokens = 0
 	}
 	return cfg
+}
+
+func normalizeVirtualCacheMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", VirtualCacheModeNatural:
+		return VirtualCacheModeNatural
+	case VirtualCacheModeForced:
+		return VirtualCacheModeForced
+	default:
+		return VirtualCacheModeNatural
+	}
 }
 
 // NormalizeRoutingConfig clamps file-backed pool routing settings.
@@ -485,6 +501,7 @@ func EffectiveVirtualCache(cfg VirtualCacheConfig) EffectiveVirtualCacheConfig {
 	}
 	return EffectiveVirtualCacheConfig{
 		Enabled:                 enabled,
+		Mode:                    cfg.Mode,
 		HitRate:                 hitRate,
 		TargetCacheReuseRatio:   targetCacheReuseRatio,
 		MinCacheTokens:          cfg.MinCacheTokens,
@@ -504,6 +521,7 @@ func VirtualCacheConfigFromEffective(cfg EffectiveVirtualCacheConfig) VirtualCac
 	contextShrinkResetRatio := cfg.ContextShrinkResetRatio
 	return NormalizeVirtualCacheConfig(VirtualCacheConfig{
 		Enabled:                 &enabled,
+		Mode:                    cfg.Mode,
 		HitRate:                 &hitRate,
 		TargetCacheReuseRatio:   &targetCacheReuseRatio,
 		MinCacheTokens:          cfg.MinCacheTokens,
@@ -738,6 +756,7 @@ func importHasPoolConfig(doc *File) bool {
 		return false
 	}
 	if doc.VirtualCache.Enabled != nil ||
+		(doc.VirtualCache.Mode != "" && doc.VirtualCache.Mode != VirtualCacheModeNatural) ||
 		doc.VirtualCache.HitRate != nil ||
 		doc.VirtualCache.TargetCacheReuseRatio != nil ||
 		doc.VirtualCache.MinCacheTokens != 0 ||

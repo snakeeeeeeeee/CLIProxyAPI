@@ -83,11 +83,15 @@ func TestEffectiveVirtualCacheDefaultsAndNormalization(t *testing.T) {
 	if !got.Enabled || got.HitRate != 0.9 {
 		t.Fatalf("default virtual cache = %#v, want enabled with 0.9 hit rate", got)
 	}
+	if got.Mode != VirtualCacheModeNatural {
+		t.Fatalf("Mode = %q, want %q", got.Mode, VirtualCacheModeNatural)
+	}
 
 	enabled := true
 	hitRate := 95.0
 	got = EffectiveVirtualCache(VirtualCacheConfig{
 		Enabled:               &enabled,
+		Mode:                  VirtualCacheModeForced,
 		HitRate:               &hitRate,
 		TargetCacheReuseRatio: &hitRate,
 		MinCacheTokens:        -1,
@@ -99,6 +103,9 @@ func TestEffectiveVirtualCacheDefaultsAndNormalization(t *testing.T) {
 	}
 	if got.TargetCacheReuseRatio != 0.95 {
 		t.Fatalf("TargetCacheReuseRatio = %v, want 0.95", got.TargetCacheReuseRatio)
+	}
+	if got.Mode != VirtualCacheModeForced {
+		t.Fatalf("Mode = %q, want %q", got.Mode, VirtualCacheModeForced)
 	}
 	if got.MinCacheTokens != 0 || got.MaxCacheTokens != 200 || got.UncachedInputTokens != 8 {
 		t.Fatalf("normalized tokens = %#v", got)
@@ -152,6 +159,7 @@ func TestEffectiveRoutingDefaultsAndNormalization(t *testing.T) {
 func TestVirtualCacheConfigFromEffective(t *testing.T) {
 	got := VirtualCacheConfigFromEffective(EffectiveVirtualCacheConfig{
 		Enabled:                 false,
+		Mode:                    VirtualCacheModeForced,
 		HitRate:                 0.85,
 		TargetCacheReuseRatio:   0.9,
 		MinCacheTokens:          100,
@@ -163,6 +171,9 @@ func TestVirtualCacheConfigFromEffective(t *testing.T) {
 	})
 	if got.Enabled == nil || *got.Enabled {
 		t.Fatalf("Enabled = %#v, want false pointer", got.Enabled)
+	}
+	if got.Mode != VirtualCacheModeForced {
+		t.Fatalf("Mode = %q, want %q", got.Mode, VirtualCacheModeForced)
 	}
 	if got.HitRate == nil || *got.HitRate != 0.85 {
 		t.Fatalf("HitRate = %#v, want 0.85 pointer", got.HitRate)

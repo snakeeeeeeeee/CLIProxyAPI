@@ -106,8 +106,9 @@ func SetVirtualCacheConfig(cfg EffectiveVirtualCacheConfig) {
 	defer virtualCachePolicyMu.Unlock()
 	defaultVirtualCachePolicy = normalizeEffectiveVirtualCacheConfig(cfg)
 	DebugLogf(
-		"claude api pool virtual cache config enabled=%t hit_rate=%.3f target_reuse=%.3f min_cache=%d max_cache=%d shrink_reset=%.3f",
+		"claude api pool virtual cache config enabled=%t mode=%s hit_rate=%.3f target_reuse=%.3f min_cache=%d max_cache=%d shrink_reset=%.3f",
 		defaultVirtualCachePolicy.Enabled,
+		defaultVirtualCachePolicy.Mode,
 		defaultVirtualCachePolicy.HitRate,
 		defaultVirtualCachePolicy.TargetCacheReuseRatio,
 		defaultVirtualCachePolicy.MinCacheTokens,
@@ -701,6 +702,9 @@ func (tx *VirtualCacheTransaction) anchoredInputTokens(totalInputTokens, upstrea
 	if upstreamCreationTokens > 0 || upstreamReadTokens > 0 {
 		inputTokens = upstreamInputTokens
 	}
+	if tx.policy.Mode == VirtualCacheModeForced && totalInputTokens > 0 && inputTokens < 1 {
+		inputTokens = 1
+	}
 	if inputTokens < 0 {
 		inputTokens = 0
 	}
@@ -720,12 +724,34 @@ func (tx *VirtualCacheTransaction) localReadTokens(cacheableBudget int64) int64 
 	if tx == nil || cacheableBudget <= 0 {
 		return 0
 	}
+	if tx.policy.Mode == VirtualCacheModeForced && tx.policy.TargetCacheReuseRatio > 0 {
+		return tx.forcedReadTokens(cacheableBudget)
+	}
 	readTokens := minInt64(tx.availableHitTokens(), cacheableBudget)
 	if readTokens > cacheableBudget {
 		readTokens = cacheableBudget
 	}
 	if readTokens < 0 {
 		return 0
+	}
+	return readTokens
+}
+
+func (tx *VirtualCacheTransaction) forcedReadTokens(cacheableBudget int64) int64 {
+	if tx == nil || cacheableBudget <= 0 {
+		return 0
+	}
+	ratio := clampRatio(tx.policy.TargetCacheReuseRatio)
+	readTokens := int64(math.Round(float64(cacheableBudget) * ratio))
+	maxReadTokens := cacheableBudget
+	if cacheableBudget > 1 {
+		maxReadTokens = cacheableBudget - 1
+	}
+	if readTokens < 0 {
+		return 0
+	}
+	if readTokens > maxReadTokens {
+		return maxReadTokens
 	}
 	return readTokens
 }
@@ -968,6 +994,7 @@ func parseCacheControlTTL(cc gjson.Result) time.Duration {
 }
 
 func normalizeEffectiveVirtualCacheConfig(cfg EffectiveVirtualCacheConfig) EffectiveVirtualCacheConfig {
+	cfg.Mode = normalizeVirtualCacheMode(cfg.Mode)
 	if cfg.HitRate > 1 {
 		cfg.HitRate = cfg.HitRate / 100
 	}

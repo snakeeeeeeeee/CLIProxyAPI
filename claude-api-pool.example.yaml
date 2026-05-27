@@ -13,12 +13,15 @@ version: 1
 
 # Virtual cache controls downstream usage rewriting for this pool only.
 # enabled: false disables local virtual cache accounting entirely.
+# mode: natural uses a local growth ledger. mode: forced keeps the first request cold
+# and forces follow-up requests toward target-cache-reuse-ratio.
 # hit-rate: 0.9 means about 90% of the cache-control prefix is reported as cached.
 # target-cache-reuse-ratio: 0 disables stable reuse rewriting. Set 0.9 to make
 # follow-up requests report about 90% cache_read_input_tokens.
 # context-shrink-reset-ratio: 0.7 resets the local ledger when the observed cache prefix shrinks below 70%.
 virtual-cache:
   enabled: true
+  mode: natural
   hit-rate: 0.9
   target-cache-reuse-ratio: 0
   context-shrink-reset-ratio: 0.7
