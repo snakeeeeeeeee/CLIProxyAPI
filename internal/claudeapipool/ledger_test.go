@@ -616,11 +616,17 @@ func TestVirtualCacheLedgerAnchorsCCTestLikeMultiRoundAudit(t *testing.T) {
 		read := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int()
 		creation := gjson.GetBytes(out, "usage.cache_creation_input_tokens").Int()
 		if idx == 0 {
-			if read != 0 {
-				t.Fatalf("%s read = %d, want 0 on first local ledger request; out=%s", tc.name, read, out)
+			upstream := gjson.Get(tc.upstream, "usage")
+			wantRead := upstream.Get("cache_read_input_tokens").Int()
+			wantCreation := upstream.Get("cache_creation_input_tokens").Int()
+			if read != wantRead {
+				t.Fatalf("%s read = %d, want preserved upstream read %d; out=%s", tc.name, read, wantRead, out)
 			}
-			if creation != cacheBudget {
-				t.Fatalf("%s creation = %d, want full cache budget %d; out=%s", tc.name, creation, cacheBudget, out)
+			if creation != wantCreation {
+				t.Fatalf("%s creation = %d, want preserved upstream creation %d; out=%s", tc.name, creation, wantCreation, out)
+			}
+			if read+creation != cacheBudget {
+				t.Fatalf("%s preserved cache split = %d, want full cache budget %d; out=%s", tc.name, read+creation, cacheBudget, out)
 			}
 		} else {
 			wantRead := minInt64(previousCached, cacheBudget)

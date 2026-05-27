@@ -80,6 +80,7 @@ type VirtualCacheTransaction struct {
 	observedTokens        int64
 	inputTokens           int64
 	creationTokens        int64
+	storedCacheTokens     int64
 	cacheableBudgetTokens int64
 	resetLedger           bool
 	now                   time.Time
@@ -282,12 +283,16 @@ func (l *virtualCacheLedger) commit(tx *VirtualCacheTransaction) {
 	if entry.lastObservedInputTokens <= 0 {
 		entry.lastObservedInputTokens = tx.estimateTokens
 	}
-	if tx.creationTokens > 0 {
+	storedCacheTokens := tx.storedCacheTokens
+	if storedCacheTokens <= 0 {
+		storedCacheTokens = tx.creationTokens
+	}
+	if storedCacheTokens > 0 {
 		if tx.ttl == time.Hour {
-			entry.cached1hTokens += tx.creationTokens
+			entry.cached1hTokens += storedCacheTokens
 			entry.cached1hExpiresAt = expiresAt
 		} else {
-			entry.cached5mTokens += tx.creationTokens
+			entry.cached5mTokens += storedCacheTokens
 			entry.cached5mExpiresAt = expiresAt
 		}
 	} else if tx.hitTokens > 0 {
@@ -589,7 +594,10 @@ func (tx *VirtualCacheTransaction) rewriteLocalLedgerUsageAtPath(payload []byte,
 	}
 	cacheableBudget := totalInputTokens - rewrittenInputTokens
 	tx.cacheableBudgetTokens = maxInt64(tx.cacheableBudgetTokens, cacheableBudget)
-	if first {
+	if first && tx.shouldPreserveFirstUpstreamCacheSplit(upstreamCreationTokens, upstreamReadTokens) {
+		virtualReadTokens = upstreamReadTokens
+		virtualCreationTokens = upstreamCreationTokens
+	} else if first {
 		virtualCreationTokens = cacheableBudget
 	} else {
 		virtualReadTokens = tx.localReadTokens(cacheableBudget)
@@ -611,6 +619,11 @@ func (tx *VirtualCacheTransaction) rewriteLocalLedgerUsageAtPath(payload []byte,
 	tx.observedTokens = maxInt64(tx.observedTokens, totalInputTokens)
 	tx.hitTokens = virtualReadTokens
 	tx.creationTokens = maxInt64(tx.creationTokens, virtualCreationTokens)
+	if first && tx.shouldPreserveFirstUpstreamCacheSplit(upstreamCreationTokens, upstreamReadTokens) {
+		tx.storedCacheTokens = maxInt64(tx.storedCacheTokens, cacheableBudget)
+	} else {
+		tx.storedCacheTokens = maxInt64(tx.storedCacheTokens, virtualCreationTokens)
+	}
 	tx.rememberUsage(rewrittenInputTokens, virtualReadTokens, virtualCreationTokens)
 
 	out := payload
@@ -647,6 +660,13 @@ func (tx *VirtualCacheTransaction) rewriteLocalLedgerUsageAtPath(payload []byte,
 		tokenTotalMultiplier(totalInputTokens, reportedTotalInputTokens),
 	)
 	return out
+}
+
+func (tx *VirtualCacheTransaction) shouldPreserveFirstUpstreamCacheSplit(upstreamCreationTokens, upstreamReadTokens int64) bool {
+	if tx == nil || tx.policy.Mode != VirtualCacheModeNatural {
+		return false
+	}
+	return upstreamCreationTokens > 0 || upstreamReadTokens > 0
 }
 
 func (tx *VirtualCacheTransaction) availableHitTokens() int64 {
