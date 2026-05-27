@@ -195,8 +195,6 @@ func TestVirtualCacheLedgerKeepsClaudeLikeRollingCacheAcrossPrefixGrowth(t *test
 		HitRate:                 0.90,
 		TargetCacheReuseRatio:   0.90,
 		ContextShrinkResetRatio: 0.70,
-		MinCreationTokens:       0,
-		MaxCreationTokens:       400,
 	})
 	t.Cleanup(func() { SetVirtualCacheConfig(old) })
 
@@ -327,9 +325,6 @@ func TestVirtualCacheTargetReuseRatioBiasesFutureRewritesTowardTarget(t *testing
 		HitRate:                 0.50,
 		TargetCacheReuseRatio:   0.90,
 		ContextShrinkResetRatio: 0.70,
-		UncachedInputTokens:     100,
-		MinCreationTokens:       0,
-		MaxCreationTokens:       1200,
 	})
 	t.Cleanup(func() { SetVirtualCacheConfig(old) })
 
@@ -350,8 +345,8 @@ func TestVirtualCacheTargetReuseRatioBiasesFutureRewritesTowardTarget(t *testing
 	firstOut := first.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2000,"output_tokens":1}}`))
 	first.Commit()
 	firstCreated := gjson.GetBytes(firstOut, "usage.cache_creation_input_tokens").Int()
-	if firstCreated <= 0 {
-		t.Fatalf("first creation = %d, want > 0; out=%s", firstCreated, firstOut)
+	if firstCreated != 1000 {
+		t.Fatalf("first creation = %d, want configured 50%% hit-rate creation; out=%s", firstCreated, firstOut)
 	}
 
 	second := ledger.begin("claude", "claude-opus", "session-target", request, now.Add(4*time.Second))
@@ -359,11 +354,11 @@ func TestVirtualCacheTargetReuseRatioBiasesFutureRewritesTowardTarget(t *testing
 		t.Fatal("second transaction is nil")
 	}
 	secondOut := second.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2000,"output_tokens":1}}`))
-	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got <= firstCreated {
-		t.Fatalf("cache_read_input_tokens = %d, want > baseline creation %d; out=%s", got, firstCreated, secondOut)
+	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != 1800 {
+		t.Fatalf("cache_read_input_tokens = %d, want target read 1800; out=%s", got, secondOut)
 	}
-	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got >= 2000-firstCreated {
-		t.Fatalf("input_tokens = %d, want lower than baseline %d; out=%s", got, 2000-firstCreated, secondOut)
+	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got != 200 {
+		t.Fatalf("input_tokens = %d, want remaining input 200; out=%s", got, secondOut)
 	}
 }
 
@@ -446,6 +441,46 @@ func TestVirtualCacheTargetReuseRatioRewritesStreamUsage(t *testing.T) {
 	}
 	if got := secondPayload.Get("usage.input_tokens").Int(); got != 100 {
 		t.Fatalf("second stream input_tokens = %d, want 100; out=%s", got, secondOut)
+	}
+}
+
+func TestVirtualCacheTargetReuseRatioAutoCreatesDeltaWithoutAdvancedCaps(t *testing.T) {
+	ledger := newVirtualCacheLedger(100)
+	old := CurrentVirtualCacheConfig()
+	SetVirtualCacheConfig(EffectiveVirtualCacheConfig{
+		Enabled:                 true,
+		HitRate:                 0.90,
+		TargetCacheReuseRatio:   0.90,
+		ContextShrinkResetRatio: 0.70,
+	})
+	t.Cleanup(func() { SetVirtualCacheConfig(old) })
+
+	firstPrefix := strings.Repeat("stable target cache prefix ", 200)
+	secondPrefix := firstPrefix + strings.Repeat("new user turn ", 100)
+	firstRequest := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":` + strconv.Quote(firstPrefix) + `,"cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
+	secondRequest := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":` + strconv.Quote(secondPrefix) + `,"cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
+
+	first := ledger.begin("claude", "claude-opus", "session-auto-delta", firstRequest, time.Now())
+	firstOut := first.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2000,"output_tokens":1}}`))
+	first.Commit()
+	if got := gjson.GetBytes(firstOut, "usage.cache_creation_input_tokens").Int(); got != 1800 {
+		t.Fatalf("first creation = %d, want 1800; out=%s", got, firstOut)
+	}
+
+	second := ledger.begin("claude", "claude-opus", "session-auto-delta", secondRequest, time.Now())
+	secondOut := second.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2300,"output_tokens":1}}`))
+	second.Commit()
+	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != 2070 {
+		t.Fatalf("second read = %d, want 2070; out=%s", got, secondOut)
+	}
+	if got := gjson.GetBytes(secondOut, "usage.cache_creation_input_tokens").Int(); got <= 0 {
+		t.Fatalf("second creation = %d, want auto delta creation; out=%s", got, secondOut)
+	}
+	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got < targetAutoUncachedInputMinTokens {
+		t.Fatalf("second input = %d, want automatic input floor; out=%s", got, secondOut)
+	}
+	if sum := rewrittenUsageTotal(secondOut); sum != 2300 {
+		t.Fatalf("second total = %d, want 2300; out=%s", sum, secondOut)
 	}
 }
 

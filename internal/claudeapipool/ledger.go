@@ -16,15 +16,14 @@ import (
 )
 
 const (
-	defaultCacheTTL                = 5 * time.Minute
-	maxCacheTTL                    = time.Hour
-	virtualLedgerMaxKeys           = 100000
-	cacheReuseWindow               = 5 * time.Minute
-	cacheReuseMinSamples           = 3
-	cacheReuseTuningDeadband       = 0.02
-	cacheReuseTuningMaxStep        = 0.25
-	cacheReuseTunedHitRateMax      = 0.99
-	cacheReuseTunedUncachedMinStep = int64(1)
+	defaultCacheTTL                    = 5 * time.Minute
+	maxCacheTTL                        = time.Hour
+	virtualLedgerMaxKeys               = 100000
+	cacheReuseWindow                   = 5 * time.Minute
+	targetAutoUncachedInputRatio       = 0.02
+	targetAutoUncachedInputMinTokens   = int64(64)
+	targetAutoUncachedInputMinTotal    = int64(1000)
+	targetAutoUncachedInputSmallTokens = int64(1)
 )
 
 var defaultLedger = newVirtualCacheLedger(virtualLedgerMaxKeys)
@@ -339,14 +338,13 @@ func (l *virtualCacheLedger) commit(tx *VirtualCacheTransaction) {
 
 func (l *virtualCacheLedger) effectivePolicy(policy EffectiveVirtualCacheConfig, now time.Time) EffectiveVirtualCacheConfig {
 	policy = normalizeEffectiveVirtualCacheConfig(policy)
-	if l == nil || !policy.Enabled || policy.TargetCacheReuseRatio <= 0 {
+	if l == nil {
 		return policy
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.pruneReuseSamplesLocked(now)
-	snapshot := reuseSnapshotFromSamples(l.reuseSamples, policy.TargetCacheReuseRatio)
-	return applyTargetCacheReuseTuning(policy, snapshot)
+	return policy
 }
 
 func (l *virtualCacheLedger) reuseSnapshot(targetRatio float64, now time.Time) VirtualCacheReuseSnapshot {
@@ -748,7 +746,7 @@ func (tx *VirtualCacheTransaction) rewriteTargetRatioUsageAtPath(payload []byte,
 		out, _ = sjson.SetBytes(out, path+".output_tokens", outputTokens)
 	}
 	DebugLogf(
-		"claude api pool virtual cache rewrite mode=target path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d rewritten_input=%d rewritten_creation=%d rewritten_read=%d output=%d target_reuse=%.3f hit_rate=%.3f uncached=%d max_creation=%d prior_observed=%d estimate=%d",
+		"claude api pool virtual cache rewrite mode=target path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d rewritten_input=%d rewritten_creation=%d rewritten_read=%d output=%d target_reuse=%.3f hit_rate=%.3f input_floor=%d max_creation=%d prior_observed=%d estimate=%d",
 		path,
 		first,
 		tx.resetLedger,
@@ -762,7 +760,7 @@ func (tx *VirtualCacheTransaction) rewriteTargetRatioUsageAtPath(payload []byte,
 		outputTokens,
 		tx.policy.TargetCacheReuseRatio,
 		tx.policy.HitRate,
-		tx.policy.UncachedInputTokens,
+		tx.targetInputFloorTokens(totalInputTokens),
 		tx.policy.MaxCreationTokens,
 		tx.priorObserved,
 		tx.estimateTokens,
@@ -838,14 +836,12 @@ func (tx *VirtualCacheTransaction) configuredTargetInitialCreationTokens(totalIn
 	if tx.policy.MaxCacheTokens > 0 && creationTokens > tx.policy.MaxCacheTokens {
 		creationTokens = tx.policy.MaxCacheTokens
 	}
-	if floor := tx.policy.UncachedInputTokens; floor > 0 {
-		maxCreation := totalInputTokens - floor
-		if maxCreation < 0 {
-			maxCreation = 0
-		}
-		if creationTokens > maxCreation {
-			creationTokens = maxCreation
-		}
+	maxCreation := totalInputTokens - tx.targetInputFloorTokens(totalInputTokens)
+	if maxCreation < 0 {
+		maxCreation = 0
+	}
+	if creationTokens > maxCreation {
+		creationTokens = maxCreation
 	}
 	if creationTokens < 0 {
 		return 0
@@ -854,7 +850,7 @@ func (tx *VirtualCacheTransaction) configuredTargetInitialCreationTokens(totalIn
 }
 
 func (tx *VirtualCacheTransaction) configuredTargetDeltaCreationTokens(totalInputTokens, readTokens int64) int64 {
-	if tx == nil || totalInputTokens <= 0 || readTokens <= 0 || tx.policy.HitRate <= 0 || tx.policy.MaxCreationTokens <= 0 {
+	if tx == nil || totalInputTokens <= 0 || readTokens <= 0 || tx.policy.HitRate <= 0 {
 		return 0
 	}
 	deltaBase := tx.priorObserved
@@ -869,13 +865,10 @@ func (tx *VirtualCacheTransaction) configuredTargetDeltaCreationTokens(totalInpu
 	if tx.policy.MinCreationTokens > 0 && creationTokens < tx.policy.MinCreationTokens {
 		creationTokens = tx.policy.MinCreationTokens
 	}
-	if creationTokens > tx.policy.MaxCreationTokens {
+	if tx.policy.MaxCreationTokens > 0 && creationTokens > tx.policy.MaxCreationTokens {
 		creationTokens = tx.policy.MaxCreationTokens
 	}
-	maxCreation := totalInputTokens - readTokens
-	if floor := tx.policy.UncachedInputTokens; floor > 0 {
-		maxCreation = totalInputTokens - readTokens - floor
-	}
+	maxCreation := totalInputTokens - readTokens - tx.targetInputFloorTokens(totalInputTokens)
 	if maxCreation < 0 {
 		maxCreation = 0
 	}
@@ -913,7 +906,7 @@ func (tx *VirtualCacheTransaction) configuredTargetReadTokens(totalInputTokens i
 	if tx.policy.MaxCacheTokens > 0 && readTokens > tx.policy.MaxCacheTokens {
 		readTokens = tx.policy.MaxCacheTokens
 	}
-	if floor := tx.policy.UncachedInputTokens; floor > 0 && totalInputTokens > floor && totalInputTokens-readTokens < floor {
+	if floor := tx.targetInputFloorTokens(totalInputTokens); floor > 0 && totalInputTokens > floor && totalInputTokens-readTokens < floor {
 		readTokens = totalInputTokens - floor
 	}
 	if readTokens > totalInputTokens {
@@ -923,6 +916,29 @@ func (tx *VirtualCacheTransaction) configuredTargetReadTokens(totalInputTokens i
 		return 0
 	}
 	return readTokens
+}
+
+func (tx *VirtualCacheTransaction) targetInputFloorTokens(totalInputTokens int64) int64 {
+	if tx == nil || totalInputTokens <= 0 {
+		return 0
+	}
+	if tx.policy.UncachedInputTokens > 0 {
+		return minInt64(tx.policy.UncachedInputTokens, totalInputTokens)
+	}
+	if tx.policy.TargetCacheReuseRatio >= 1 {
+		return 0
+	}
+	floor := int64(math.Round(float64(totalInputTokens) * targetAutoUncachedInputRatio))
+	if totalInputTokens >= targetAutoUncachedInputMinTotal && floor < targetAutoUncachedInputMinTokens {
+		floor = targetAutoUncachedInputMinTokens
+	}
+	if floor < targetAutoUncachedInputSmallTokens {
+		floor = targetAutoUncachedInputSmallTokens
+	}
+	if floor > totalInputTokens {
+		floor = totalInputTokens
+	}
+	return floor
 }
 
 func (tx *VirtualCacheTransaction) targetReadTokens(totalInputTokens, currentReadTokens int64) int64 {
@@ -1180,42 +1196,6 @@ func normalizeEffectiveVirtualCacheConfig(cfg EffectiveVirtualCacheConfig) Effec
 	return cfg
 }
 
-func applyTargetCacheReuseTuning(policy EffectiveVirtualCacheConfig, snapshot VirtualCacheReuseSnapshot) EffectiveVirtualCacheConfig {
-	if policy.TargetCacheReuseRatio <= 0 ||
-		!policy.Enabled ||
-		snapshot.SampleCount < cacheReuseMinSamples ||
-		snapshot.DenominatorTokens <= 0 {
-		return policy
-	}
-	target := clampRatio(policy.TargetCacheReuseRatio)
-	actual := clampRatio(snapshot.ActualRatio)
-	errorRatio := target - actual
-	if math.Abs(errorRatio) < cacheReuseTuningDeadband {
-		return policy
-	}
-	step := errorRatio
-	if step > cacheReuseTuningMaxStep {
-		step = cacheReuseTuningMaxStep
-	}
-	if step < -cacheReuseTuningMaxStep {
-		step = -cacheReuseTuningMaxStep
-	}
-	factor := 1.0 + step
-	policy.HitRate = clampFloat(policy.HitRate*factor, 0, cacheReuseTunedHitRateMax)
-	policy.ReadScale = factor
-	if policy.TargetCacheReuseRatio > 0 && policy.HitRate <= 0 {
-		policy.HitRate = minFloat64(policy.TargetCacheReuseRatio, cacheReuseTunedHitRateMax)
-	}
-	inverseFactor := 1.0 - step
-	policy.UncachedInputTokens = scaleInt64(policy.UncachedInputTokens, inverseFactor, cacheReuseTunedUncachedMinStep)
-	policy.MinCreationTokens = scaleInt64(policy.MinCreationTokens, factor, 0)
-	policy.MaxCreationTokens = scaleInt64(policy.MaxCreationTokens, factor, 0)
-	if policy.MinCreationTokens > 0 && policy.MaxCreationTokens > 0 && policy.MinCreationTokens > policy.MaxCreationTokens {
-		policy.MinCreationTokens = policy.MaxCreationTokens
-	}
-	return normalizeEffectiveVirtualCacheConfig(policy)
-}
-
 func clampRatio(value float64) float64 {
 	if value > 1 {
 		value = value / 100
@@ -1234,23 +1214,6 @@ func clampFloat(value, minValue, maxValue float64) float64 {
 		return maxValue
 	}
 	return value
-}
-
-func scaleInt64(value int64, factor float64, minValue int64) int64 {
-	if value <= 0 {
-		return value
-	}
-	scaled := math.Round(float64(value) * factor)
-	if math.IsNaN(scaled) || math.IsInf(scaled, 0) {
-		return maxInt64(value, minValue)
-	}
-	if scaled < float64(minValue) {
-		return minValue
-	}
-	if scaled > float64(math.MaxInt64) {
-		return math.MaxInt64
-	}
-	return int64(scaled)
 }
 
 func estimateTextTokens(text string) int64 {
@@ -1297,13 +1260,6 @@ func maxInt64(a, b int64) int64 {
 }
 
 func minInt64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func minFloat64(a, b float64) float64 {
 	if a < b {
 		return a
 	}

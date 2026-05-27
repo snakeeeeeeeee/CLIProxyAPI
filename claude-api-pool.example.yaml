@@ -14,22 +14,14 @@ version: 1
 # Virtual cache controls downstream usage rewriting for this pool only.
 # enabled: false disables local virtual cache accounting entirely.
 # hit-rate: 0.9 means about 90% of the cache-control prefix is reported as cached.
-# target-cache-reuse-ratio: 0 disables dynamic target tuning. Set 0.9 to bias the recent
-# 5-minute window toward about 90% cache_read_input_tokens.
-# max-cache-tokens: 0 means no cap. Set a positive number to limit reported cached tokens per request.
-# uncached-input-tokens: 0 means no floor. Set a positive number to keep at least that many input_tokens.
+# target-cache-reuse-ratio: 0 disables stable reuse rewriting. Set 0.9 to make
+# follow-up requests report about 90% cache_read_input_tokens.
 # context-shrink-reset-ratio: 0.7 resets the local ledger when the observed cache prefix shrinks below 70%.
-# min/max-creation-tokens cap the newly written cache tokens after a rolling cache hit. 0 means no extra cap.
 virtual-cache:
   enabled: true
   hit-rate: 0.9
   target-cache-reuse-ratio: 0
-  min-cache-tokens: 0
-  max-cache-tokens: 0
-  uncached-input-tokens: 0
   context-shrink-reset-ratio: 0.7
-  min-creation-tokens: 0
-  max-creation-tokens: 0
 
 # Pool routing controls only apply to Claude API Pool accounts.
 # per-account-rpm: 0 disables local RPM protection. Set it to the real safe RPM of one account.
