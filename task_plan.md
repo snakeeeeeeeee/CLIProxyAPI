@@ -15,6 +15,7 @@ Implement `claude-api-pool` as a separate file-backed Claude API account pool wi
 9. SQLite primary store migration - complete
 10. Local-ledger-only virtual cache rewrite - superseded
 11. Upstream-total-anchored virtual cache rewrite - complete
+12. Growth-based virtual cache read/write split - complete
 
 ## Decisions
 - Main config only stores `claude-api-pool.enabled` and `claude-api-pool.path`.
@@ -22,7 +23,7 @@ Implement `claude-api-pool` as a separate file-backed Claude API account pool wi
 - Runtime auth IDs are stable hashes of `api-key + base-url`.
 - First UI version is a dense table with pagination, filters, import/export, and drawer-style row editing.
 - Virtual cache ledger now models rolling Claude cache behavior with 5m/1h buckets, cache-read plus delta cache-write on growing contexts, and context-shrink reset.
-- `target-cache-reuse-ratio` now splits the anchored cacheable input budget; cache reads are capped by cache tokens previously created in the local ledger.
+- `target-cache-reuse-ratio` is kept as a target/stat signal, not a hard per-request split. Warm virtual-cache rewrites now read the local cached budget first and create only the growth remainder.
 - Claude API Pool now uses fixed SQLite primary storage at `claude-api-pool.db`; `claude-api-pool.yaml` remains the import/export format and first-run migration source.
 - Virtual cache usage rewrite anchors `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` to the real Claude upstream total when present. The local ledger only splits that total into input/create/read, preserving upstream `input_tokens` when upstream cache fields exist and using local request delta only when upstream reports no cache split.
 

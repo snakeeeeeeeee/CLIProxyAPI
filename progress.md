@@ -80,6 +80,14 @@
 - Verified:
   - `go test ./internal/claudeapipool`
   - `go build -o test-output ./cmd/server && rm test-output`
+- Adjusted the anchored virtual cache split to match the growth-based Kiro-style ledger:
+  - warm requests now report `cache_read_input_tokens = min(previous local cache, current cache budget)`
+  - `cache_creation_input_tokens` is only the remaining growth budget, not a fixed 8% slice from `target-cache-reuse-ratio`
+  - target reuse remains a reporting/target setting, but no longer forces each request into a 92/8 read/create split
+  - updated the cctest-like multi-round test to assert growth-based creation such as R2 creating only the budget increase after R1
+- Verified:
+  - `go test ./internal/claudeapipool`
+  - `go build -o test-output ./cmd/server && rm test-output`
 - Migrated Claude API Pool account storage to SQLite primary storage:
   - added fixed `claude-api-pool.db` store beside `config.yaml`
   - first access imports existing `claude-api-pool.yaml` only when the SQLite store is empty

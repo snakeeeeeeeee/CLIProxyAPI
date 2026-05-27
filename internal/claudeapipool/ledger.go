@@ -720,13 +720,7 @@ func (tx *VirtualCacheTransaction) localReadTokens(cacheableBudget int64) int64 
 	if tx == nil || cacheableBudget <= 0 {
 		return 0
 	}
-	readTokens := cacheableBudget
-	if tx.policy.TargetCacheReuseRatio > 0 {
-		readTokens = int64(math.Round(float64(cacheableBudget) * tx.policy.TargetCacheReuseRatio))
-	}
-	if available := tx.availableHitTokens(); readTokens > available {
-		readTokens = available
-	}
+	readTokens := minInt64(tx.availableHitTokens(), cacheableBudget)
 	if readTokens > cacheableBudget {
 		readTokens = cacheableBudget
 	}
