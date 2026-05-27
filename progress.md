@@ -59,6 +59,18 @@
   - `go build -o test-output ./cmd/server && rm test-output`
   - Management Center `npm run type-check`
   - Management Center `npm run build`
+
+## 2026-05-28
+- Reworked Claude API Pool virtual cache usage rewrite to be local-ledger-only:
+  - request parsing now separates cache-control prefix tokens from post-cache-control delta tokens
+  - rewritten `input_tokens` comes from locally estimated request delta, not real Claude usage fields
+  - first request creates cache from the local cacheable prefix budget
+  - later requests read only cache tokens that were previously created in the local ledger, capped by target reuse ratio
+  - real Claude `cache_creation_input_tokens` / `cache_read_input_tokens` are ignored for virtual cache split decisions
+  - removed old automatic input floors and unused target rewrite helpers
+- Verified:
+  - `go test ./internal/claudeapipool`
+  - `go build -o test-output ./cmd/server && rm test-output`
 - Migrated Claude API Pool account storage to SQLite primary storage:
   - added fixed `claude-api-pool.db` store beside `config.yaml`
   - first access imports existing `claude-api-pool.yaml` only when the SQLite store is empty

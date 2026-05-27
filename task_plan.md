@@ -11,8 +11,9 @@ Implement `claude-api-pool` as a separate file-backed Claude API account pool wi
 5. Management Center table UI - complete
 6. Verification and cleanup - complete
 7. Claude-like virtual cache ledger upgrade - complete
-8. Sliding-window target cache reuse tuning - complete
+8. Sliding-window target cache reuse tuning - superseded
 9. SQLite primary store migration - complete
+10. Local-ledger-only virtual cache rewrite - complete
 
 ## Decisions
 - Main config only stores `claude-api-pool.enabled` and `claude-api-pool.path`.
@@ -20,8 +21,9 @@ Implement `claude-api-pool` as a separate file-backed Claude API account pool wi
 - Runtime auth IDs are stable hashes of `api-key + base-url`.
 - First UI version is a dense table with pagination, filters, import/export, and drawer-style row editing.
 - Virtual cache ledger now models rolling Claude cache behavior with 5m/1h buckets, cache-read plus delta cache-write on growing contexts, and context-shrink reset.
-- `target-cache-reuse-ratio` uses recent rewritten usage samples to bias future virtual cache reads/creation toward a configured cache reuse target without changing default behavior when set to 0.
+- `target-cache-reuse-ratio` now splits only the locally estimated cacheable prefix budget; cache reads are capped by cache tokens previously created in the local ledger.
 - Claude API Pool now uses fixed SQLite primary storage at `claude-api-pool.db`; `claude-api-pool.yaml` remains the import/export format and first-run migration source.
+- Virtual cache usage rewrite no longer passes through or derives cache read/create values from real Claude upstream usage fields. It preserves a locally estimated per-request delta as `input_tokens`, creates local cache from the cache-control prefix on first use, and reads only previously created local cache on later requests.
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
