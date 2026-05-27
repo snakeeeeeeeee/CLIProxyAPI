@@ -536,6 +536,14 @@ func beginClaudePoolVirtualCache(auth *cliproxyauth.Auth, opts cliproxyexecutor.
 	if strings.TrimSpace(sessionKey) == "" {
 		sessionKey = cliproxyauth.ExtractVirtualCacheSessionKey(opts.Headers, body, opts.Metadata)
 	}
+	if strings.TrimSpace(sessionKey) == "" {
+		claudeapipool.DebugLogf(
+			"claude api pool virtual cache skip reason=missing_session_key auth=%s model=%s",
+			claudeapipool.DebugAuthRef(auth.ID),
+			model,
+		)
+		return nil
+	}
 	return claudeapipool.BeginVirtualCache("claude", model, sessionKey, body)
 }
 

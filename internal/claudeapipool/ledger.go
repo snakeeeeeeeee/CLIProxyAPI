@@ -108,6 +108,18 @@ func SetVirtualCacheConfig(cfg EffectiveVirtualCacheConfig) {
 	virtualCachePolicyMu.Lock()
 	defer virtualCachePolicyMu.Unlock()
 	defaultVirtualCachePolicy = normalizeEffectiveVirtualCacheConfig(cfg)
+	DebugLogf(
+		"claude api pool virtual cache config enabled=%t hit_rate=%.3f target_reuse=%.3f min_cache=%d max_cache=%d uncached=%d shrink_reset=%.3f min_creation=%d max_creation=%d",
+		defaultVirtualCachePolicy.Enabled,
+		defaultVirtualCachePolicy.HitRate,
+		defaultVirtualCachePolicy.TargetCacheReuseRatio,
+		defaultVirtualCachePolicy.MinCacheTokens,
+		defaultVirtualCachePolicy.MaxCacheTokens,
+		defaultVirtualCachePolicy.UncachedInputTokens,
+		defaultVirtualCachePolicy.ContextShrinkResetRatio,
+		defaultVirtualCachePolicy.MinCreationTokens,
+		defaultVirtualCachePolicy.MaxCreationTokens,
+	)
 }
 
 // CurrentVirtualCacheConfig returns the runtime policy used by future transactions.
@@ -143,9 +155,42 @@ func (l *virtualCacheLedger) begin(provider, model, sessionKey string, requestPa
 	policy := l.effectivePolicy(CurrentVirtualCacheConfig(), now)
 	fingerprint, ttl, estimateTokens, ok := cachePrefixFingerprint(requestPayload)
 	if provider == "" || model == "" || sessionKey == "" || !ok || !policy.Enabled || policy.HitRate <= 0 {
+		reason := "unknown"
+		switch {
+		case provider == "":
+			reason = "empty_provider"
+		case model == "":
+			reason = "empty_model"
+		case sessionKey == "":
+			reason = "empty_session"
+		case !ok:
+			reason = "no_cache_prefix"
+		case !policy.Enabled:
+			reason = "disabled"
+		case policy.HitRate <= 0:
+			reason = "hit_rate_zero"
+		}
+		DebugLogf(
+			"claude api pool virtual cache skip reason=%s provider=%s model=%s session=%s enabled=%t hit_rate=%.3f target_reuse=%.3f",
+			reason,
+			provider,
+			model,
+			debugShortHash(sessionKey),
+			policy.Enabled,
+			policy.HitRate,
+			policy.TargetCacheReuseRatio,
+		)
 		return nil
 	}
 	if policy.MinCacheTokens > 0 && estimateTokens < policy.MinCacheTokens {
+		DebugLogf(
+			"claude api pool virtual cache skip reason=below_min_cache provider=%s model=%s session=%s estimate=%d min_cache=%d",
+			provider,
+			model,
+			debugShortHash(sessionKey),
+			estimateTokens,
+			policy.MinCacheTokens,
+		)
 		return nil
 	}
 	key := strings.Join([]string{provider, model, sessionKey}, "\x00")
@@ -170,6 +215,20 @@ func (l *virtualCacheLedger) begin(provider, model, sessionKey string, requestPa
 			tx.observedTokens = entry.lastObservedInputTokens
 		}
 	}
+	DebugLogf(
+		"claude api pool virtual cache begin provider=%s model=%s session=%s fingerprint=%s ttl_ms=%d estimate=%d hit_tokens=%d prior_observed=%d reset=%t target_reuse=%.3f hit_rate=%.3f",
+		provider,
+		model,
+		debugShortHash(sessionKey),
+		debugShortHash(fingerprint),
+		debugDurationMS(ttl),
+		estimateTokens,
+		tx.hitTokens,
+		tx.priorObserved,
+		tx.resetLedger,
+		policy.TargetCacheReuseRatio,
+		policy.HitRate,
+	)
 	return tx
 }
 
@@ -246,9 +305,36 @@ func (l *virtualCacheLedger) commit(tx *VirtualCacheTransaction) {
 	entry.updatedAt = now
 	if entry.cached5mTokens <= 0 && entry.cached1hTokens <= 0 && entry.lastObservedInputTokens <= 0 {
 		delete(l.entries, tx.key)
+		DebugLogf(
+			"claude api pool virtual cache commit action=delete key=%s fingerprint=%s observed=%d input=%d read=%d creation=%d reset=%t",
+			debugShortHash(tx.key),
+			debugShortHash(tx.fingerprint),
+			tx.observedTokens,
+			tx.rewrittenInputTokens(),
+			tx.hitTokens,
+			tx.creationTokens,
+			tx.resetLedger,
+		)
 		return
 	}
 	l.entries[tx.key] = entry
+	DebugLogf(
+		"claude api pool virtual cache commit key=%s fingerprint=%s ttl_ms=%d estimate=%d observed=%d input=%d read=%d creation=%d reset=%t cached_5m=%d cached_1h=%d expires_5m=%s expires_1h=%s samples=%d",
+		debugShortHash(tx.key),
+		debugShortHash(tx.fingerprint),
+		debugDurationMS(tx.ttl),
+		tx.estimateTokens,
+		tx.observedTokens,
+		tx.rewrittenInputTokens(),
+		tx.hitTokens,
+		tx.creationTokens,
+		tx.resetLedger,
+		entry.cached5mTokens,
+		entry.cached1hTokens,
+		debugTime(entry.cached5mExpiresAt),
+		debugTime(entry.cached1hExpiresAt),
+		len(l.reuseSamples),
+	)
 }
 
 func (l *virtualCacheLedger) effectivePolicy(policy EffectiveVirtualCacheConfig, now time.Time) EffectiveVirtualCacheConfig {
@@ -484,14 +570,40 @@ func (tx *VirtualCacheTransaction) rewriteUsageAtPath(payload []byte, path strin
 			tx.rememberUsage(inputTokens, cacheReadTokens, cacheCreationTokens)
 			tx.hitTokens = maxInt64(tx.hitTokens, cacheReadTokens)
 			tx.creationTokens = maxInt64(tx.creationTokens, cacheCreationTokens)
+			DebugLogf(
+				"claude api pool virtual cache rewrite mode=legacy_passthrough path=%s upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d rewritten_input=%d rewritten_creation=%d rewritten_read=%d output=%d",
+				path,
+				inputTokens,
+				cacheCreationTokens,
+				cacheReadTokens,
+				reportedTotalInputTokens,
+				inputTokens,
+				cacheCreationTokens,
+				cacheReadTokens,
+				outputTokens,
+			)
 			return payload
 		}
 		totalInputTokens := inputTokens
 		if totalInputTokens <= 0 {
+			DebugLogf(
+				"claude api pool virtual cache rewrite skip reason=zero_total mode=legacy path=%s upstream_input=%d upstream_creation=%d upstream_read=%d",
+				path,
+				inputTokens,
+				cacheCreationTokens,
+				cacheReadTokens,
+			)
 			return payload
 		}
 		virtualCreationTokens := tx.configuredCacheTokens(totalInputTokens)
 		if virtualCreationTokens <= 0 {
+			DebugLogf(
+				"claude api pool virtual cache rewrite skip reason=zero_creation mode=legacy path=%s upstream_input=%d upstream_total=%d hit_rate=%.3f",
+				path,
+				inputTokens,
+				totalInputTokens,
+				tx.policy.HitRate,
+			)
 			return payload
 		}
 		tx.creationTokens = maxInt64(tx.creationTokens, virtualCreationTokens)
@@ -506,10 +618,33 @@ func (tx *VirtualCacheTransaction) rewriteUsageAtPath(payload []byte, path strin
 		if outputTokens > 0 && !usage.Get("output_tokens").Exists() {
 			out, _ = sjson.SetBytes(out, path+".output_tokens", outputTokens)
 		}
+		DebugLogf(
+			"claude api pool virtual cache rewrite mode=legacy_initial path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d rewritten_input=%d rewritten_creation=%d rewritten_read=%d output=%d hit_rate=%.3f target_reuse=%.3f",
+			path,
+			true,
+			tx.resetLedger,
+			inputTokens,
+			cacheCreationTokens,
+			cacheReadTokens,
+			totalInputTokens,
+			rewrittenInputTokens,
+			virtualCreationTokens,
+			int64(0),
+			outputTokens,
+			tx.policy.HitRate,
+			tx.policy.TargetCacheReuseRatio,
+		)
 		return out
 	}
 	totalInputTokens := inputTokens + cacheCreationTokens + cacheReadTokens
 	if totalInputTokens <= 0 {
+		DebugLogf(
+			"claude api pool virtual cache rewrite skip reason=zero_total mode=legacy_hit path=%s upstream_input=%d upstream_creation=%d upstream_read=%d",
+			path,
+			inputTokens,
+			cacheCreationTokens,
+			cacheReadTokens,
+		)
 		return payload
 	}
 	virtualReadTokens := tx.hitTokens
@@ -551,6 +686,24 @@ func (tx *VirtualCacheTransaction) rewriteUsageAtPath(payload []byte, path strin
 	if outputTokens > 0 && !usage.Get("output_tokens").Exists() {
 		out, _ = sjson.SetBytes(out, path+".output_tokens", outputTokens)
 	}
+	DebugLogf(
+		"claude api pool virtual cache rewrite mode=legacy_hit path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d rewritten_input=%d rewritten_creation=%d rewritten_read=%d output=%d hit_tokens=%d prior_observed=%d hit_rate=%.3f target_reuse=%.3f",
+		path,
+		false,
+		tx.resetLedger,
+		inputTokens,
+		cacheCreationTokens,
+		cacheReadTokens,
+		totalInputTokens,
+		rewrittenInputTokens,
+		virtualCreationTokens,
+		virtualReadTokens,
+		outputTokens,
+		tx.hitTokens,
+		tx.priorObserved,
+		tx.policy.HitRate,
+		tx.policy.TargetCacheReuseRatio,
+	)
 	return out
 }
 
@@ -561,6 +714,7 @@ func (tx *VirtualCacheTransaction) rewriteTargetRatioUsageAtPath(payload []byte,
 
 	var virtualReadTokens int64
 	var virtualCreationTokens int64
+	first := tx.hitTokens <= 0
 	if tx.hitTokens <= 0 {
 		virtualCreationTokens = tx.configuredTargetInitialCreationTokens(totalInputTokens)
 	} else {
@@ -593,6 +747,26 @@ func (tx *VirtualCacheTransaction) rewriteTargetRatioUsageAtPath(payload []byte,
 	if outputTokens > 0 && !usage.Get("output_tokens").Exists() {
 		out, _ = sjson.SetBytes(out, path+".output_tokens", outputTokens)
 	}
+	DebugLogf(
+		"claude api pool virtual cache rewrite mode=target path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d rewritten_input=%d rewritten_creation=%d rewritten_read=%d output=%d target_reuse=%.3f hit_rate=%.3f uncached=%d max_creation=%d prior_observed=%d estimate=%d",
+		path,
+		first,
+		tx.resetLedger,
+		usage.Get("input_tokens").Int(),
+		usage.Get("cache_creation_input_tokens").Int(),
+		usage.Get("cache_read_input_tokens").Int(),
+		totalInputTokens,
+		rewrittenInputTokens,
+		virtualCreationTokens,
+		virtualReadTokens,
+		outputTokens,
+		tx.policy.TargetCacheReuseRatio,
+		tx.policy.HitRate,
+		tx.policy.UncachedInputTokens,
+		tx.policy.MaxCreationTokens,
+		tx.priorObserved,
+		tx.estimateTokens,
+	)
 	return out
 }
 

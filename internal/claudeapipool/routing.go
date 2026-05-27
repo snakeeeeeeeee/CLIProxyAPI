@@ -55,6 +55,20 @@ func SetRoutingConfig(cfg EffectiveRoutingConfig) {
 	routingPolicyMu.Lock()
 	defer routingPolicyMu.Unlock()
 	defaultRoutingPolicy = normalizeEffectiveRoutingConfig(cfg)
+	DebugLogf(
+		"claude api pool routing config rpm=%d concurrency=%d max_switches=%d switch_delay_ms=%d rate_cooldown_ms=%d rate_max_cooldown_ms=%d overload_cooldown_ms=%d overload_max_cooldown_ms=%d same_retry_429=%d same_retry_529=%d same_retry_delay_ms=%d",
+		defaultRoutingPolicy.PerAccountRPM,
+		defaultRoutingPolicy.PerAccountConcurrency,
+		defaultRoutingPolicy.MaxSwitches,
+		defaultRoutingPolicy.SwitchDelayMS,
+		defaultRoutingPolicy.RateLimitCooldownMS,
+		defaultRoutingPolicy.RateLimitMaxCooldownMS,
+		defaultRoutingPolicy.OverloadCooldownMS,
+		defaultRoutingPolicy.OverloadMaxCooldownMS,
+		defaultRoutingPolicy.SameAccountRetry429,
+		defaultRoutingPolicy.SameAccountRetry529,
+		defaultRoutingPolicy.SameAccountRetryDelayMS,
+	)
 }
 
 // CurrentRoutingConfig returns the runtime pool routing policy.
@@ -152,17 +166,53 @@ func (r *poolRouter) tryAcquire(authID, model string, policy EffectiveRoutingCon
 	modelState := r.ensureStateLocked(modelKey)
 	r.pruneRecentStartsLocked(accountState, now)
 	if modelState.CoolingUntil.After(now) {
+		DebugLogf(
+			"claude api pool route denied auth=%s model=%s reason=cooling cooling_until=%s cooling_ms=%d inflight=%d rpm_used=%d rpm_limit=%d",
+			debugAuthRef(authID),
+			model,
+			debugTime(modelState.CoolingUntil),
+			debugUntilMS(now, modelState.CoolingUntil),
+			accountState.InFlight,
+			len(accountState.RecentStarts),
+			policy.PerAccountRPM,
+		)
 		return nil, false
 	}
 	if policy.PerAccountConcurrency > 0 && accountState.InFlight >= int64(policy.PerAccountConcurrency) {
+		DebugLogf(
+			"claude api pool route denied auth=%s model=%s reason=concurrency inflight=%d concurrency_limit=%d rpm_used=%d rpm_limit=%d",
+			debugAuthRef(authID),
+			model,
+			accountState.InFlight,
+			policy.PerAccountConcurrency,
+			len(accountState.RecentStarts),
+			policy.PerAccountRPM,
+		)
 		return nil, false
 	}
 	if policy.PerAccountRPM > 0 && len(accountState.RecentStarts) >= policy.PerAccountRPM {
+		DebugLogf(
+			"claude api pool route denied auth=%s model=%s reason=rpm inflight=%d rpm_used=%d rpm_limit=%d",
+			debugAuthRef(authID),
+			model,
+			accountState.InFlight,
+			len(accountState.RecentStarts),
+			policy.PerAccountRPM,
+		)
 		return nil, false
 	}
 	accountState.InFlight++
 	accountState.RecentStarts = append(accountState.RecentStarts, now)
 	accountState.UpdatedAt = now
+	DebugLogf(
+		"claude api pool route acquired auth=%s model=%s inflight=%d concurrency_limit=%d rpm_used=%d rpm_limit=%d",
+		debugAuthRef(authID),
+		model,
+		accountState.InFlight,
+		policy.PerAccountConcurrency,
+		len(accountState.RecentStarts),
+		policy.PerAccountRPM,
+	)
 	return &RouteLease{router: r, key: accountKey}, true
 }
 
@@ -180,22 +230,69 @@ func (r *poolRouter) noteResult(authID, model string, statusCode int, retryAfter
 	case StatusTooManyRequests:
 		cooldown, nextLevel, ok := cooldownForStatus(statusCode, state.RateLimitLevel, retryAfter, policy)
 		if !ok {
+			DebugLogf(
+				"claude api pool route result auth=%s model=%s status=%d action=no_cooldown rate_level=%d overload_level=%d",
+				debugAuthRef(authID),
+				model,
+				statusCode,
+				state.RateLimitLevel,
+				state.OverloadLevel,
+			)
 			return
 		}
 		state.RateLimitLevel = nextLevel
 		state.CoolingUntil = laterTime(state.CoolingUntil, now.Add(cooldown))
+		DebugLogf(
+			"claude api pool route result auth=%s model=%s status=%d cooldown_ms=%d rate_level=%d overload_level=%d cooling_until=%s retry_after_ms=%d",
+			debugAuthRef(authID),
+			model,
+			statusCode,
+			debugDurationMS(cooldown),
+			state.RateLimitLevel,
+			state.OverloadLevel,
+			debugTime(state.CoolingUntil),
+			debugRetryAfterMS(retryAfter),
+		)
 	case StatusOverloaded:
 		cooldown, nextLevel, ok := cooldownForStatus(statusCode, state.OverloadLevel, retryAfter, policy)
 		if !ok {
+			DebugLogf(
+				"claude api pool route result auth=%s model=%s status=%d action=no_cooldown rate_level=%d overload_level=%d",
+				debugAuthRef(authID),
+				model,
+				statusCode,
+				state.RateLimitLevel,
+				state.OverloadLevel,
+			)
 			return
 		}
 		state.OverloadLevel = nextLevel
 		state.CoolingUntil = laterTime(state.CoolingUntil, now.Add(cooldown))
+		DebugLogf(
+			"claude api pool route result auth=%s model=%s status=%d cooldown_ms=%d rate_level=%d overload_level=%d cooling_until=%s retry_after_ms=%d",
+			debugAuthRef(authID),
+			model,
+			statusCode,
+			debugDurationMS(cooldown),
+			state.RateLimitLevel,
+			state.OverloadLevel,
+			debugTime(state.CoolingUntil),
+			debugRetryAfterMS(retryAfter),
+		)
 	default:
 		if statusCode >= 200 && statusCode < 300 {
 			state.RateLimitLevel = 0
 			state.OverloadLevel = 0
 		}
+		DebugLogf(
+			"claude api pool route result auth=%s model=%s status=%d rate_level=%d overload_level=%d cooling_until=%s",
+			debugAuthRef(authID),
+			model,
+			statusCode,
+			state.RateLimitLevel,
+			state.OverloadLevel,
+			debugTime(state.CoolingUntil),
+		)
 	}
 }
 
@@ -293,7 +390,15 @@ func (l *RouteLease) Release() {
 			state.InFlight--
 		}
 		state.UpdatedAt = time.Now()
+		DebugLogf("claude api pool route released key=%s inflight=%d", debugAuthRef(l.key), state.InFlight)
 	})
+}
+
+func debugRetryAfterMS(retryAfter *time.Duration) int64 {
+	if retryAfter == nil {
+		return 0
+	}
+	return debugDurationMS(*retryAfter)
 }
 
 func (r *poolRouter) ensureStateLocked(key string) *routeState {

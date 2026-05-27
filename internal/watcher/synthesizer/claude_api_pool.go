@@ -40,6 +40,7 @@ func (s *ClaudeAPIPoolSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreaut
 		}
 		out = append(out, auth)
 	}
+	claudeapipool.DebugLogf("claude api pool synthesize complete items=%d runtime_auths=%d", len(items), len(out))
 	return out, nil
 }
 
@@ -55,6 +56,7 @@ func SynthesizeClaudeAPIPoolAuth(ctx *SynthesisContext, item claudeapipool.Resol
 	}
 	base := strings.TrimSpace(ck.BaseURL)
 	id, token := ctx.IDGenerator.Next("claude-api-pool:apikey", key, base)
+	claudeapipool.RegisterAuthDebugLabel(id, fmt.Sprintf("#%d", item.Position))
 	attrs := map[string]string{
 		"source":                   fmt.Sprintf("config:claude-api-pool[#%d:%s]", item.Position, token),
 		"api_key":                  key,

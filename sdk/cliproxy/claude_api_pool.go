@@ -27,6 +27,8 @@ func (s *Service) SyncClaudeAPIPoolAuths(ctx context.Context) error {
 			if auth == nil || !claudeapipool.IsAttributesPoolAuth(auth.Attributes) {
 				continue
 			}
+			claudeapipool.DebugLogf("claude api pool sync delete disabled auth=%s", claudeapipool.DebugAuthRef(auth.ID))
+			claudeapipool.UnregisterAuthDebugLabel(auth.ID)
 			s.emitAuthUpdate(ctx, watcher.AuthUpdate{Action: watcher.AuthUpdateActionDelete, ID: auth.ID})
 		}
 		return nil
@@ -57,6 +59,8 @@ func (s *Service) SyncClaudeAPIPoolAuths(ctx context.Context) error {
 			continue
 		}
 		if _, ok := next[auth.ID]; !ok {
+			claudeapipool.DebugLogf("claude api pool sync delete stale auth=%s", claudeapipool.DebugAuthRef(auth.ID))
+			claudeapipool.UnregisterAuthDebugLabel(auth.ID)
 			s.emitAuthUpdate(ctx, watcher.AuthUpdate{Action: watcher.AuthUpdateActionDelete, ID: auth.ID})
 		}
 	}
@@ -65,7 +69,30 @@ func (s *Service) SyncClaudeAPIPoolAuths(ctx context.Context) error {
 		if _, ok := s.coreManager.GetByID(auth.ID); ok {
 			action = watcher.AuthUpdateActionModify
 		}
+		claudeapipool.DebugLogf(
+			"claude api pool sync auth action=%s auth=%s status=%s disabled=%t",
+			action,
+			claudeapipool.DebugAuthRef(auth.ID),
+			auth.Status,
+			auth.Disabled,
+		)
 		s.emitAuthUpdate(ctx, watcher.AuthUpdate{Action: action, ID: auth.ID, Auth: auth})
 	}
+	vc := claudeapipool.CurrentVirtualCacheConfig()
+	rt := claudeapipool.CurrentRoutingConfig()
+	claudeapipool.DebugLogf(
+		"claude api pool sync complete items=%d runtime_auths=%d virtual_cache_enabled=%t hit_rate=%.3f target_reuse=%.3f uncached=%d max_creation=%d routing_rpm=%d routing_concurrency=%d max_switches=%d switch_delay_ms=%d",
+		len(items),
+		len(next),
+		vc.Enabled,
+		vc.HitRate,
+		vc.TargetCacheReuseRatio,
+		vc.UncachedInputTokens,
+		vc.MaxCreationTokens,
+		rt.PerAccountRPM,
+		rt.PerAccountConcurrency,
+		rt.MaxSwitches,
+		rt.SwitchDelayMS,
+	)
 	return nil
 }
