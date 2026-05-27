@@ -16,14 +16,10 @@ import (
 )
 
 const (
-	defaultCacheTTL                    = 5 * time.Minute
-	maxCacheTTL                        = time.Hour
-	virtualLedgerMaxKeys               = 100000
-	cacheReuseWindow                   = 5 * time.Minute
-	targetAutoUncachedInputRatio       = 0.02
-	targetAutoUncachedInputMinTokens   = int64(64)
-	targetAutoUncachedInputMinTotal    = int64(1000)
-	targetAutoUncachedInputSmallTokens = int64(1)
+	defaultCacheTTL      = 5 * time.Minute
+	maxCacheTTL          = time.Hour
+	virtualLedgerMaxKeys = 100000
+	cacheReuseWindow     = 5 * time.Minute
 )
 
 var defaultLedger = newVirtualCacheLedger(virtualLedgerMaxKeys)
@@ -72,19 +68,21 @@ type VirtualCacheReuseSnapshot struct {
 // VirtualCacheTransaction rewrites Claude usage for one request based on a
 // ledger lookup taken before the upstream request completed.
 type VirtualCacheTransaction struct {
-	ledger         *virtualCacheLedger
-	key            string
-	fingerprint    string
-	ttl            time.Duration
-	policy         EffectiveVirtualCacheConfig
-	estimateTokens int64
-	hitTokens      int64
-	priorObserved  int64
-	observedTokens int64
-	inputTokens    int64
-	creationTokens int64
-	resetLedger    bool
-	now            time.Time
+	ledger                *virtualCacheLedger
+	key                   string
+	fingerprint           string
+	ttl                   time.Duration
+	policy                EffectiveVirtualCacheConfig
+	estimateTokens        int64
+	deltaTokens           int64
+	hitTokens             int64
+	priorObserved         int64
+	observedTokens        int64
+	inputTokens           int64
+	creationTokens        int64
+	cacheableBudgetTokens int64
+	resetLedger           bool
+	now                   time.Time
 }
 
 func newVirtualCacheLedger(maxKeys int) *virtualCacheLedger {
@@ -108,16 +106,13 @@ func SetVirtualCacheConfig(cfg EffectiveVirtualCacheConfig) {
 	defer virtualCachePolicyMu.Unlock()
 	defaultVirtualCachePolicy = normalizeEffectiveVirtualCacheConfig(cfg)
 	DebugLogf(
-		"claude api pool virtual cache config enabled=%t hit_rate=%.3f target_reuse=%.3f min_cache=%d max_cache=%d uncached=%d shrink_reset=%.3f min_creation=%d max_creation=%d",
+		"claude api pool virtual cache config enabled=%t hit_rate=%.3f target_reuse=%.3f min_cache=%d max_cache=%d shrink_reset=%.3f",
 		defaultVirtualCachePolicy.Enabled,
 		defaultVirtualCachePolicy.HitRate,
 		defaultVirtualCachePolicy.TargetCacheReuseRatio,
 		defaultVirtualCachePolicy.MinCacheTokens,
 		defaultVirtualCachePolicy.MaxCacheTokens,
-		defaultVirtualCachePolicy.UncachedInputTokens,
 		defaultVirtualCachePolicy.ContextShrinkResetRatio,
-		defaultVirtualCachePolicy.MinCreationTokens,
-		defaultVirtualCachePolicy.MaxCreationTokens,
 	)
 }
 
@@ -152,7 +147,7 @@ func (l *virtualCacheLedger) begin(provider, model, sessionKey string, requestPa
 	model = strings.TrimSpace(model)
 	sessionKey = strings.TrimSpace(sessionKey)
 	policy := l.effectivePolicy(CurrentVirtualCacheConfig(), now)
-	fingerprint, ttl, estimateTokens, ok := cachePrefixFingerprint(requestPayload)
+	fingerprint, ttl, estimateTokens, deltaTokens, ok := cachePrefixFingerprint(requestPayload)
 	if provider == "" || model == "" || sessionKey == "" || !ok || !policy.Enabled || policy.HitRate <= 0 {
 		reason := "unknown"
 		switch {
@@ -200,6 +195,7 @@ func (l *virtualCacheLedger) begin(provider, model, sessionKey string, requestPa
 		ttl:            ttl,
 		policy:         policy,
 		estimateTokens: estimateTokens,
+		deltaTokens:    deltaTokens,
 		now:            now,
 	}
 	l.mu.Lock()
@@ -215,13 +211,14 @@ func (l *virtualCacheLedger) begin(provider, model, sessionKey string, requestPa
 		}
 	}
 	DebugLogf(
-		"claude api pool virtual cache begin provider=%s model=%s session=%s fingerprint=%s ttl_ms=%d estimate=%d hit_tokens=%d prior_observed=%d reset=%t target_reuse=%.3f hit_rate=%.3f",
+		"claude api pool virtual cache begin provider=%s model=%s session=%s fingerprint=%s ttl_ms=%d estimate=%d delta=%d hit_tokens=%d prior_observed=%d reset=%t target_reuse=%.3f hit_rate=%.3f",
 		provider,
 		model,
 		debugShortHash(sessionKey),
 		debugShortHash(fingerprint),
 		debugDurationMS(ttl),
 		estimateTokens,
+		deltaTokens,
 		tx.hitTokens,
 		tx.priorObserved,
 		tx.resetLedger,
@@ -255,7 +252,7 @@ func (l *virtualCacheLedger) commit(tx *VirtualCacheTransaction) {
 	if l == nil || tx == nil || tx.key == "" {
 		return
 	}
-	if tx.observedTokens <= 0 && tx.hitTokens <= 0 && tx.creationTokens <= 0 {
+	if tx.observedTokens <= 0 && tx.hitTokens <= 0 && tx.creationTokens <= 0 && tx.cacheableBudgetTokens <= 0 {
 		return
 	}
 	now := time.Now()
@@ -300,7 +297,7 @@ func (l *virtualCacheLedger) commit(tx *VirtualCacheTransaction) {
 			entry.cached1hExpiresAt = now.Add(maxCacheTTL)
 		}
 	}
-	l.capEntryCachedTokensLocked(&entry, maxInt64(0, entry.lastObservedInputTokens-tx.policy.UncachedInputTokens))
+	l.capEntryCachedTokensLocked(&entry, tx.cacheableBudgetTokens)
 	entry.updatedAt = now
 	if entry.cached5mTokens <= 0 && entry.cached1hTokens <= 0 && entry.lastObservedInputTokens <= 0 {
 		delete(l.entries, tx.key)
@@ -545,192 +542,72 @@ func (tx *VirtualCacheTransaction) rewriteUsageAtPath(payload []byte, path strin
 	if !usage.Exists() || !usage.IsObject() {
 		return payload
 	}
-	inputTokens := usage.Get("input_tokens").Int()
 	outputTokens := usage.Get("output_tokens").Int()
+	inputTokens := usage.Get("input_tokens").Int()
 	cacheCreationTokens := usage.Get("cache_creation_input_tokens").Int()
 	cacheReadTokens := usage.Get("cache_read_input_tokens").Int()
-	cacheableTokens := cacheCreationTokens + cacheReadTokens
 	reportedTotalInputTokens := inputTokens + cacheCreationTokens + cacheReadTokens
-	if reportedTotalInputTokens > tx.observedTokens {
-		tx.observedTokens = reportedTotalInputTokens
-	}
-	if tx.policy.TargetCacheReuseRatio > 0 {
-		return tx.rewriteTargetRatioUsageAtPath(
-			payload,
+	localTotalInputTokens := tx.localTotalInputTokens()
+	if localTotalInputTokens <= 0 {
+		DebugLogf(
+			"claude api pool virtual cache rewrite skip reason=zero_local_total mode=local path=%s upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d estimate=%d delta=%d hit_rate=%.3f",
 			path,
-			usage,
+			inputTokens,
+			cacheCreationTokens,
+			cacheReadTokens,
 			reportedTotalInputTokens,
-			outputTokens,
-		)
-	}
-	if tx.hitTokens <= 0 {
-		if cacheableTokens > 0 {
-			tx.rememberUsage(inputTokens, cacheReadTokens, cacheCreationTokens)
-			tx.hitTokens = maxInt64(tx.hitTokens, cacheReadTokens)
-			tx.creationTokens = maxInt64(tx.creationTokens, cacheCreationTokens)
-			DebugLogf(
-				"claude api pool virtual cache rewrite mode=legacy_passthrough path=%s upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d rewritten_input=%d rewritten_creation=%d rewritten_read=%d output=%d",
-				path,
-				inputTokens,
-				cacheCreationTokens,
-				cacheReadTokens,
-				reportedTotalInputTokens,
-				inputTokens,
-				cacheCreationTokens,
-				cacheReadTokens,
-				outputTokens,
-			)
-			return payload
-		}
-		totalInputTokens := inputTokens
-		if totalInputTokens <= 0 {
-			DebugLogf(
-				"claude api pool virtual cache rewrite skip reason=zero_total mode=legacy path=%s upstream_input=%d upstream_creation=%d upstream_read=%d",
-				path,
-				inputTokens,
-				cacheCreationTokens,
-				cacheReadTokens,
-			)
-			return payload
-		}
-		virtualCreationTokens := tx.configuredCacheTokens(totalInputTokens)
-		if virtualCreationTokens <= 0 {
-			DebugLogf(
-				"claude api pool virtual cache rewrite skip reason=zero_creation mode=legacy path=%s upstream_input=%d upstream_total=%d hit_rate=%.3f",
-				path,
-				inputTokens,
-				totalInputTokens,
-				tx.policy.HitRate,
-			)
-			return payload
-		}
-		tx.creationTokens = maxInt64(tx.creationTokens, virtualCreationTokens)
-		tx.observedTokens = maxInt64(tx.observedTokens, totalInputTokens)
-		rewrittenInputTokens := totalInputTokens - virtualCreationTokens
-		tx.rememberUsage(rewrittenInputTokens, 0, virtualCreationTokens)
-		out := payload
-		out, _ = sjson.SetBytes(out, path+".input_tokens", rewrittenInputTokens)
-		out, _ = sjson.SetBytes(out, path+".cache_creation_input_tokens", virtualCreationTokens)
-		out, _ = sjson.SetBytes(out, path+".cache_read_input_tokens", int64(0))
-		out = tx.setCacheCreationTTLBreakdown(out, path, virtualCreationTokens)
-		if outputTokens > 0 && !usage.Get("output_tokens").Exists() {
-			out, _ = sjson.SetBytes(out, path+".output_tokens", outputTokens)
-		}
-		DebugLogf(
-			"claude api pool virtual cache rewrite mode=legacy_initial path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d rewritten_input=%d rewritten_creation=%d rewritten_read=%d output=%d hit_rate=%.3f target_reuse=%.3f",
-			path,
-			true,
-			tx.resetLedger,
-			inputTokens,
-			cacheCreationTokens,
-			cacheReadTokens,
-			totalInputTokens,
-			rewrittenInputTokens,
-			virtualCreationTokens,
-			int64(0),
-			outputTokens,
+			tx.estimateTokens,
+			tx.deltaTokens,
 			tx.policy.HitRate,
-			tx.policy.TargetCacheReuseRatio,
-		)
-		return out
-	}
-	totalInputTokens := inputTokens + cacheCreationTokens + cacheReadTokens
-	if totalInputTokens <= 0 {
-		DebugLogf(
-			"claude api pool virtual cache rewrite skip reason=zero_total mode=legacy_hit path=%s upstream_input=%d upstream_creation=%d upstream_read=%d",
-			path,
-			inputTokens,
-			cacheCreationTokens,
-			cacheReadTokens,
 		)
 		return payload
 	}
-	virtualReadTokens := tx.hitTokens
-	if cacheableTokens > virtualReadTokens {
-		virtualReadTokens = cacheableTokens
-	}
-	if virtualReadTokens > totalInputTokens {
-		virtualReadTokens = totalInputTokens
-	}
-	virtualReadTokens = tx.targetReadTokens(totalInputTokens, virtualReadTokens)
-	if floor := tx.policy.UncachedInputTokens; floor > 0 && totalInputTokens > floor && totalInputTokens-virtualReadTokens < floor {
-		virtualReadTokens = totalInputTokens - floor
-	}
-	virtualReadTokens = tx.configuredReadTokens(virtualReadTokens)
-	if virtualReadTokens > totalInputTokens {
-		virtualReadTokens = totalInputTokens
-	}
-	if floor := tx.policy.UncachedInputTokens; floor > 0 && totalInputTokens > floor && totalInputTokens-virtualReadTokens < floor {
-		virtualReadTokens = totalInputTokens - floor
-	}
-	if virtualReadTokens < 0 {
-		virtualReadTokens = 0
-	}
-	virtualCreationTokens := tx.configuredDeltaCreationTokens(totalInputTokens, virtualReadTokens)
-	rewrittenInputTokens := totalInputTokens - virtualReadTokens - virtualCreationTokens
-	tx.observedTokens = maxInt64(tx.observedTokens, totalInputTokens)
-	tx.hitTokens = virtualReadTokens
-	tx.creationTokens = maxInt64(tx.creationTokens, virtualCreationTokens)
-	tx.rememberUsage(rewrittenInputTokens, virtualReadTokens, virtualCreationTokens)
-	out := payload
-	out, _ = sjson.SetBytes(out, path+".input_tokens", rewrittenInputTokens)
-	out, _ = sjson.SetBytes(out, path+".cache_read_input_tokens", virtualReadTokens)
-	if usage.Get("cache_creation_input_tokens").Exists() || cacheCreationTokens > 0 || virtualCreationTokens > 0 {
-		out, _ = sjson.SetBytes(out, path+".cache_creation_input_tokens", virtualCreationTokens)
-	}
-	if usage.Get("cache_creation").Exists() || virtualCreationTokens > 0 {
-		out = tx.setCacheCreationTTLBreakdown(out, path, virtualCreationTokens)
-	}
-	if outputTokens > 0 && !usage.Get("output_tokens").Exists() {
-		out, _ = sjson.SetBytes(out, path+".output_tokens", outputTokens)
-	}
-	DebugLogf(
-		"claude api pool virtual cache rewrite mode=legacy_hit path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d rewritten_input=%d rewritten_creation=%d rewritten_read=%d output=%d hit_tokens=%d prior_observed=%d hit_rate=%.3f target_reuse=%.3f",
-		path,
-		false,
-		tx.resetLedger,
-		inputTokens,
-		cacheCreationTokens,
-		cacheReadTokens,
-		totalInputTokens,
-		rewrittenInputTokens,
-		virtualCreationTokens,
-		virtualReadTokens,
-		outputTokens,
-		tx.hitTokens,
-		tx.priorObserved,
-		tx.policy.HitRate,
-		tx.policy.TargetCacheReuseRatio,
-	)
-	return out
+	tx.observedTokens = maxInt64(tx.observedTokens, localTotalInputTokens)
+	return tx.rewriteLocalLedgerUsageAtPath(payload, path, usage, localTotalInputTokens, reportedTotalInputTokens, outputTokens)
 }
 
-func (tx *VirtualCacheTransaction) rewriteTargetRatioUsageAtPath(payload []byte, path string, usage gjson.Result, totalInputTokens, outputTokens int64) []byte {
-	if tx == nil || totalInputTokens <= 0 {
+func (tx *VirtualCacheTransaction) rewriteLocalLedgerUsageAtPath(payload []byte, path string, usage gjson.Result, localTotalInputTokens, reportedTotalInputTokens, outputTokens int64) []byte {
+	if tx == nil || localTotalInputTokens <= 0 {
 		return payload
 	}
+
+	inputTokens := usage.Get("input_tokens").Int()
+	upstreamCreationTokens := usage.Get("cache_creation_input_tokens").Int()
+	upstreamReadTokens := usage.Get("cache_read_input_tokens").Int()
 
 	var virtualReadTokens int64
 	var virtualCreationTokens int64
-	first := tx.hitTokens <= 0
-	if tx.hitTokens <= 0 {
-		virtualCreationTokens = tx.configuredTargetInitialCreationTokens(totalInputTokens)
-	} else {
-		virtualReadTokens = tx.configuredTargetReadTokens(totalInputTokens)
-		virtualCreationTokens = tx.configuredTargetDeltaCreationTokens(totalInputTokens, virtualReadTokens)
+	rewrittenInputTokens := tx.requestInputTokens(localTotalInputTokens)
+	availableHitTokens := tx.availableHitTokens()
+	first := availableHitTokens <= 0
+	if rewrittenInputTokens < 0 {
+		rewrittenInputTokens = 0
 	}
-	if virtualReadTokens+virtualCreationTokens > totalInputTokens {
-		virtualCreationTokens = totalInputTokens - virtualReadTokens
+	if rewrittenInputTokens > localTotalInputTokens {
+		rewrittenInputTokens = localTotalInputTokens
+	}
+	cacheableBudget := localTotalInputTokens - rewrittenInputTokens
+	tx.cacheableBudgetTokens = maxInt64(tx.cacheableBudgetTokens, cacheableBudget)
+	if first {
+		virtualCreationTokens = cacheableBudget
+	} else {
+		virtualReadTokens = tx.localReadTokens(cacheableBudget)
+		virtualCreationTokens = cacheableBudget - virtualReadTokens
+	}
+	if virtualReadTokens+virtualCreationTokens > localTotalInputTokens {
+		virtualCreationTokens = localTotalInputTokens - virtualReadTokens
 	}
 	if virtualCreationTokens < 0 {
 		virtualCreationTokens = 0
 	}
-	rewrittenInputTokens := totalInputTokens - virtualReadTokens - virtualCreationTokens
 	if rewrittenInputTokens < 0 {
 		rewrittenInputTokens = 0
 	}
+	if maxInput := localTotalInputTokens - virtualReadTokens - virtualCreationTokens; rewrittenInputTokens > maxInput {
+		rewrittenInputTokens = maxInt64(0, maxInput)
+	}
 
-	tx.observedTokens = maxInt64(tx.observedTokens, totalInputTokens)
+	tx.observedTokens = maxInt64(tx.observedTokens, localTotalInputTokens)
 	tx.hitTokens = virtualReadTokens
 	tx.creationTokens = maxInt64(tx.creationTokens, virtualCreationTokens)
 	tx.rememberUsage(rewrittenInputTokens, virtualReadTokens, virtualCreationTokens)
@@ -746,26 +623,83 @@ func (tx *VirtualCacheTransaction) rewriteTargetRatioUsageAtPath(payload []byte,
 		out, _ = sjson.SetBytes(out, path+".output_tokens", outputTokens)
 	}
 	DebugLogf(
-		"claude api pool virtual cache rewrite mode=target path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d rewritten_input=%d rewritten_creation=%d rewritten_read=%d output=%d target_reuse=%.3f hit_rate=%.3f input_floor=%d max_creation=%d prior_observed=%d estimate=%d",
+		"claude api pool virtual cache rewrite mode=local path=%s first=%t reset=%t upstream_input=%d upstream_creation=%d upstream_read=%d upstream_total=%d local_total=%d local_input=%d cacheable_budget=%d rewritten_creation=%d rewritten_read=%d output=%d target_reuse=%.3f hit_rate=%.3f available_hit=%d prior_observed=%d estimate=%d delta=%d",
 		path,
 		first,
 		tx.resetLedger,
-		usage.Get("input_tokens").Int(),
-		usage.Get("cache_creation_input_tokens").Int(),
-		usage.Get("cache_read_input_tokens").Int(),
-		totalInputTokens,
+		inputTokens,
+		upstreamCreationTokens,
+		upstreamReadTokens,
+		reportedTotalInputTokens,
+		localTotalInputTokens,
 		rewrittenInputTokens,
+		cacheableBudget,
 		virtualCreationTokens,
 		virtualReadTokens,
 		outputTokens,
 		tx.policy.TargetCacheReuseRatio,
 		tx.policy.HitRate,
-		tx.targetInputFloorTokens(totalInputTokens),
-		tx.policy.MaxCreationTokens,
+		availableHitTokens,
 		tx.priorObserved,
 		tx.estimateTokens,
+		tx.deltaTokens,
 	)
 	return out
+}
+
+func (tx *VirtualCacheTransaction) availableHitTokens() int64 {
+	if tx == nil {
+		return 0
+	}
+	if tx.hitTokens < 0 {
+		return 0
+	}
+	return tx.hitTokens
+}
+
+func (tx *VirtualCacheTransaction) localCacheableBudgetTokens() int64 {
+	if tx == nil || tx.estimateTokens <= 0 || tx.policy.HitRate <= 0 {
+		return 0
+	}
+	tokens := int64(math.Round(float64(tx.estimateTokens) * tx.policy.HitRate))
+	if tx.policy.MaxCacheTokens > 0 && tokens > tx.policy.MaxCacheTokens {
+		tokens = tx.policy.MaxCacheTokens
+	}
+	if tokens < 0 {
+		return 0
+	}
+	return tokens
+}
+
+func (tx *VirtualCacheTransaction) localTotalInputTokens() int64 {
+	if tx == nil {
+		return 0
+	}
+	inputTokens := tx.deltaTokens
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	return inputTokens + tx.localCacheableBudgetTokens()
+}
+
+func (tx *VirtualCacheTransaction) localReadTokens(cacheableBudget int64) int64 {
+	if tx == nil || cacheableBudget <= 0 {
+		return 0
+	}
+	readTokens := cacheableBudget
+	if tx.policy.TargetCacheReuseRatio > 0 {
+		readTokens = int64(math.Round(float64(cacheableBudget) * tx.policy.TargetCacheReuseRatio))
+	}
+	if available := tx.availableHitTokens(); readTokens > available {
+		readTokens = available
+	}
+	if readTokens > cacheableBudget {
+		readTokens = cacheableBudget
+	}
+	if readTokens < 0 {
+		return 0
+	}
+	return readTokens
 }
 
 func (tx *VirtualCacheTransaction) rememberUsage(inputTokens, cacheReadTokens, cacheCreationTokens int64) {
@@ -790,169 +724,18 @@ func (tx *VirtualCacheTransaction) rewrittenInputTokens() int64 {
 	return 0
 }
 
-func (tx *VirtualCacheTransaction) configuredDeltaCreationTokens(totalInputTokens, readTokens int64) int64 {
-	if tx == nil || totalInputTokens <= 0 || readTokens <= 0 {
-		return 0
-	}
-	deltaBase := tx.priorObserved
-	if deltaBase <= 0 {
-		deltaBase = tx.observedTokens
-	}
-	delta := totalInputTokens - deltaBase
-	if delta <= 0 {
-		return 0
-	}
-	creationTokens := int64(math.Round(float64(delta) * tx.policy.HitRate))
-	if tx.policy.MinCreationTokens > 0 && creationTokens < tx.policy.MinCreationTokens {
-		creationTokens = tx.policy.MinCreationTokens
-	}
-	if tx.policy.MaxCreationTokens > 0 && creationTokens > tx.policy.MaxCreationTokens {
-		creationTokens = tx.policy.MaxCreationTokens
-	}
-	maxCreation := totalInputTokens - readTokens
-	if floor := tx.policy.UncachedInputTokens; floor > 0 {
-		maxCreation = totalInputTokens - readTokens - floor
-	}
-	if maxCreation < 0 {
-		maxCreation = 0
-	}
-	if creationTokens > maxCreation {
-		creationTokens = maxCreation
-	}
-	if creationTokens < 0 {
-		return 0
-	}
-	return creationTokens
-}
-
-func (tx *VirtualCacheTransaction) configuredTargetInitialCreationTokens(totalInputTokens int64) int64 {
-	if tx == nil || totalInputTokens <= 0 || !tx.policy.Enabled || tx.policy.HitRate <= 0 {
-		return 0
-	}
-	if tx.policy.MinCacheTokens > 0 && totalInputTokens < tx.policy.MinCacheTokens {
-		return 0
-	}
-	creationTokens := int64(math.Round(float64(totalInputTokens) * tx.policy.HitRate))
-	if tx.policy.MaxCacheTokens > 0 && creationTokens > tx.policy.MaxCacheTokens {
-		creationTokens = tx.policy.MaxCacheTokens
-	}
-	maxCreation := totalInputTokens - tx.targetInputFloorTokens(totalInputTokens)
-	if maxCreation < 0 {
-		maxCreation = 0
-	}
-	if creationTokens > maxCreation {
-		creationTokens = maxCreation
-	}
-	if creationTokens < 0 {
-		return 0
-	}
-	return creationTokens
-}
-
-func (tx *VirtualCacheTransaction) configuredTargetDeltaCreationTokens(totalInputTokens, readTokens int64) int64 {
-	if tx == nil || totalInputTokens <= 0 || readTokens <= 0 || tx.policy.HitRate <= 0 {
-		return 0
-	}
-	deltaBase := tx.priorObserved
-	if deltaBase <= 0 {
-		deltaBase = tx.observedTokens
-	}
-	delta := totalInputTokens - deltaBase
-	if delta <= 0 {
-		return 0
-	}
-	creationTokens := int64(math.Round(float64(delta) * tx.policy.HitRate))
-	if tx.policy.MinCreationTokens > 0 && creationTokens < tx.policy.MinCreationTokens {
-		creationTokens = tx.policy.MinCreationTokens
-	}
-	if tx.policy.MaxCreationTokens > 0 && creationTokens > tx.policy.MaxCreationTokens {
-		creationTokens = tx.policy.MaxCreationTokens
-	}
-	maxCreation := totalInputTokens - readTokens - tx.targetInputFloorTokens(totalInputTokens)
-	if maxCreation < 0 {
-		maxCreation = 0
-	}
-	if creationTokens > maxCreation {
-		creationTokens = maxCreation
-	}
-	if creationTokens < 0 {
-		return 0
-	}
-	return creationTokens
-}
-
-func (tx *VirtualCacheTransaction) configuredReadTokens(tokens int64) int64 {
-	if tx == nil || tokens <= 0 {
-		return 0
-	}
-	readTokens := tokens
-	if tx.policy.ReadScale > 0 {
-		readTokens = int64(math.Round(float64(readTokens) * tx.policy.ReadScale))
-	}
-	if tx.policy.MaxCacheTokens > 0 && readTokens > tx.policy.MaxCacheTokens {
-		readTokens = tx.policy.MaxCacheTokens
-	}
-	if readTokens < 0 {
-		return 0
-	}
-	return readTokens
-}
-
-func (tx *VirtualCacheTransaction) configuredTargetReadTokens(totalInputTokens int64) int64 {
-	if tx == nil || totalInputTokens <= 0 || tx.policy.TargetCacheReuseRatio <= 0 {
-		return 0
-	}
-	readTokens := int64(math.Round(float64(totalInputTokens) * tx.policy.TargetCacheReuseRatio))
-	if tx.policy.MaxCacheTokens > 0 && readTokens > tx.policy.MaxCacheTokens {
-		readTokens = tx.policy.MaxCacheTokens
-	}
-	if floor := tx.targetInputFloorTokens(totalInputTokens); floor > 0 && totalInputTokens > floor && totalInputTokens-readTokens < floor {
-		readTokens = totalInputTokens - floor
-	}
-	if readTokens > totalInputTokens {
-		readTokens = totalInputTokens
-	}
-	if readTokens < 0 {
-		return 0
-	}
-	return readTokens
-}
-
-func (tx *VirtualCacheTransaction) targetInputFloorTokens(totalInputTokens int64) int64 {
+func (tx *VirtualCacheTransaction) requestInputTokens(totalInputTokens int64) int64 {
 	if tx == nil || totalInputTokens <= 0 {
 		return 0
 	}
-	if tx.policy.UncachedInputTokens > 0 {
-		return minInt64(tx.policy.UncachedInputTokens, totalInputTokens)
+	inputTokens := tx.deltaTokens
+	if inputTokens < 0 {
+		inputTokens = 0
 	}
-	if tx.policy.TargetCacheReuseRatio >= 1 {
-		return 0
+	if inputTokens > totalInputTokens {
+		inputTokens = totalInputTokens
 	}
-	floor := int64(math.Round(float64(totalInputTokens) * targetAutoUncachedInputRatio))
-	if totalInputTokens >= targetAutoUncachedInputMinTotal && floor < targetAutoUncachedInputMinTokens {
-		floor = targetAutoUncachedInputMinTokens
-	}
-	if floor < targetAutoUncachedInputSmallTokens {
-		floor = targetAutoUncachedInputSmallTokens
-	}
-	if floor > totalInputTokens {
-		floor = totalInputTokens
-	}
-	return floor
-}
-
-func (tx *VirtualCacheTransaction) targetReadTokens(totalInputTokens, currentReadTokens int64) int64 {
-	if tx == nil || totalInputTokens <= 0 || currentReadTokens <= 0 || tx.policy.TargetCacheReuseRatio <= 0 {
-		return currentReadTokens
-	}
-	targetReadTokens := int64(math.Round(float64(totalInputTokens) * tx.policy.TargetCacheReuseRatio))
-	if targetReadTokens < 0 {
-		return 0
-	}
-	if targetReadTokens > totalInputTokens {
-		return totalInputTokens
-	}
-	return targetReadTokens
+	return inputTokens
 }
 
 func (tx *VirtualCacheTransaction) setCacheCreationTTLBreakdown(payload []byte, path string, tokens int64) []byte {
@@ -964,36 +747,6 @@ func (tx *VirtualCacheTransaction) setCacheCreationTTLBreakdown(payload []byte, 
 	payload, _ = sjson.SetBytes(payload, path+".cache_creation.ephemeral_5m_input_tokens", tokens)
 	payload, _ = sjson.SetBytes(payload, path+".cache_creation.ephemeral_1h_input_tokens", int64(0))
 	return payload
-}
-
-func (tx *VirtualCacheTransaction) configuredCacheTokens(totalInputTokens int64) int64 {
-	if tx == nil || totalInputTokens <= 0 || tx.estimateTokens <= 0 || !tx.policy.Enabled || tx.policy.HitRate <= 0 {
-		return 0
-	}
-	cacheable := tx.estimateTokens
-	if cacheable > totalInputTokens {
-		cacheable = totalInputTokens
-	}
-	if tx.policy.MinCacheTokens > 0 && cacheable < tx.policy.MinCacheTokens {
-		return 0
-	}
-	virtualTokens := int64(math.Round(float64(cacheable) * tx.policy.HitRate))
-	if tx.policy.MaxCacheTokens > 0 && virtualTokens > tx.policy.MaxCacheTokens {
-		virtualTokens = tx.policy.MaxCacheTokens
-	}
-	if floor := tx.policy.UncachedInputTokens; floor > 0 {
-		maxVirtual := totalInputTokens - floor
-		if maxVirtual < 0 {
-			maxVirtual = 0
-		}
-		if virtualTokens > maxVirtual {
-			virtualTokens = maxVirtual
-		}
-	}
-	if virtualTokens < 0 {
-		return 0
-	}
-	return virtualTokens
 }
 
 func splitSSEDataLine(line []byte) ([]byte, []byte, bool) {
@@ -1010,11 +763,12 @@ func splitSSEDataLine(line []byte) ([]byte, []byte, bool) {
 	return line[:payloadStart], line[payloadStart:], true
 }
 
-func cachePrefixFingerprint(payload []byte) (string, time.Duration, int64, bool) {
+func cachePrefixFingerprint(payload []byte) (string, time.Duration, int64, int64, bool) {
 	if len(bytes.TrimSpace(payload)) == 0 || !gjson.ValidBytes(payload) {
-		return "", 0, 0, false
+		return "", 0, 0, 0, false
 	}
 	var b strings.Builder
+	var delta strings.Builder
 	ttl := maxCacheTTL
 	found := false
 	appendPart := func(label string, raw string) {
@@ -1086,13 +840,23 @@ func cachePrefixFingerprint(payload []byte) (string, time.Duration, int64, bool)
 
 	messages := gjson.GetBytes(payload, "messages")
 	if messages.Exists() && messages.IsArray() {
+		type messageCacheInfo struct {
+			raw                   string
+			lastCacheContentIndex int
+		}
 		lastMsg := -1
+		messageInfos := make([]messageCacheInfo, 0)
 		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
+			info := messageCacheInfo{
+				raw:                   msg.Raw,
+				lastCacheContentIndex: -1,
+			}
 			content := msg.Get("content")
 			if content.IsArray() {
-				content.ForEach(func(_, item gjson.Result) bool {
+				content.ForEach(func(contentIdx, item gjson.Result) bool {
 					if cc := item.Get("cache_control"); cc.Exists() {
 						lastMsg = int(msgIdx.Int())
+						info.lastCacheContentIndex = int(contentIdx.Int())
 						observeCacheControl(cc)
 					}
 					return true
@@ -1101,31 +865,58 @@ func cachePrefixFingerprint(payload []byte) (string, time.Duration, int64, bool)
 				lastMsg = int(msgIdx.Int())
 				observeCacheControl(cc)
 			}
+			messageInfos = append(messageInfos, info)
 			return true
 		})
 		if lastMsg >= 0 {
 			var section strings.Builder
-			messages.ForEach(func(idx, msg gjson.Result) bool {
-				if int(idx.Int()) > lastMsg {
-					return false
+			for idx, info := range messageInfos {
+				switch {
+				case idx > lastMsg:
+					break
+				case idx < lastMsg || info.lastCacheContentIndex < 0:
+					section.WriteString(info.raw)
+					section.WriteByte('\n')
+				default:
+					msg := gjson.Parse(info.raw)
+					section.WriteString("role=")
+					section.WriteString(msg.Get("role").Raw)
+					section.WriteByte('\n')
+					content := msg.Get("content")
+					content.ForEach(func(contentIdx, item gjson.Result) bool {
+						if int(contentIdx.Int()) > info.lastCacheContentIndex {
+							delta.WriteString(item.Raw)
+							delta.WriteByte('\n')
+							return true
+						}
+						section.WriteString(item.Raw)
+						section.WriteByte('\n')
+						return true
+					})
 				}
-				section.WriteString(msg.Raw)
-				section.WriteByte('\n')
-				return true
-			})
+			}
 			appendPart("messages", section.String())
+			for idx := lastMsg + 1; idx < len(messageInfos); idx++ {
+				delta.WriteString(messageInfos[idx].raw)
+				delta.WriteByte('\n')
+			}
+		} else if found {
+			for _, info := range messageInfos {
+				delta.WriteString(info.raw)
+				delta.WriteByte('\n')
+			}
 		}
 	}
 
 	if !found {
-		return "", 0, 0, false
+		return "", 0, 0, 0, false
 	}
 	if ttl <= 0 || ttl > maxCacheTTL {
 		ttl = defaultCacheTTL
 	}
 	prefix := b.String()
 	sum := sha256.Sum256([]byte(prefix))
-	return hex.EncodeToString(sum[:]), ttl, estimateTextTokens(prefix), true
+	return hex.EncodeToString(sum[:]), ttl, estimateTextTokens(prefix), estimateTextTokens(delta.String()), true
 }
 
 func parseCacheControlTTL(cc gjson.Result) time.Duration {

@@ -1,6 +1,7 @@
 package claudeapipool
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,11 +28,16 @@ func TestVirtualCacheLedgerRewritesClaudeUsageOnSecondRequest(t *testing.T) {
 	upstream := []byte(`{"usage":{"input_tokens":100,"output_tokens":5,"cache_creation_input_tokens":90}}`)
 	out := first.RewriteClaudeResponseUsage(upstream)
 	first.Commit()
-	if got := gjson.GetBytes(out, "usage.cache_creation_input_tokens").Int(); got != 90 {
-		t.Fatalf("first cache_creation_input_tokens = %d, want 90", got)
+	wantInput := first.deltaTokens
+	wantCreation := first.localCacheableBudgetTokens()
+	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != wantInput {
+		t.Fatalf("first input_tokens = %d, want local delta %d; out=%s", got, wantInput, out)
 	}
-	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Exists(); got {
-		t.Fatalf("first cache_read_input_tokens should not be added: %s", out)
+	if got := gjson.GetBytes(out, "usage.cache_creation_input_tokens").Int(); got != wantCreation {
+		t.Fatalf("first cache_creation_input_tokens = %d, want local budget %d", got, wantCreation)
+	}
+	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 0 {
+		t.Fatalf("first cache_read_input_tokens = %d, want 0: %s", got, out)
 	}
 
 	second := ledger.begin("claude", "claude-opus", "session-1", request, time.Now())
@@ -40,11 +46,11 @@ func TestVirtualCacheLedgerRewritesClaudeUsageOnSecondRequest(t *testing.T) {
 	}
 	out = second.RewriteClaudeResponseUsage(upstream)
 	second.Commit()
-	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != 100 {
-		t.Fatalf("second input_tokens = %d, want 100", got)
+	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != wantInput {
+		t.Fatalf("second input_tokens = %d, want local delta %d", got, wantInput)
 	}
-	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 90 {
-		t.Fatalf("second cache_read_input_tokens = %d, want 90", got)
+	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != wantCreation {
+		t.Fatalf("second cache_read_input_tokens = %d, want prior local creation %d", got, wantCreation)
 	}
 	if got := gjson.GetBytes(out, "usage.cache_creation_input_tokens").Int(); got != 0 {
 		t.Fatalf("second cache_creation_input_tokens = %d, want 0", got)
@@ -62,18 +68,23 @@ func TestVirtualCacheLedgerRewritesClaudeStreamUsage(t *testing.T) {
 	}`)
 	first := ledger.begin("claude", "claude-sonnet", "session-1", request, time.Now())
 	line := []byte(`data: {"type":"message_delta","usage":{"input_tokens":40,"output_tokens":3,"cache_creation_input_tokens":30}}`)
-	_ = first.RewriteClaudeStreamLine(line)
+	firstOut := first.RewriteClaudeStreamLine(line)
 	first.Commit()
+	firstPayload := gjson.Parse(strings.TrimSpace(strings.TrimPrefix(string(firstOut), "data:")))
+	wantCreation := first.localCacheableBudgetTokens()
+	if got := firstPayload.Get("usage.cache_creation_input_tokens").Int(); got != wantCreation {
+		t.Fatalf("first stream cache_creation_input_tokens = %d, want %d; out=%s", got, wantCreation, firstOut)
+	}
 
 	second := ledger.begin("claude", "claude-sonnet", "session-1", request, time.Now())
 	out := second.RewriteClaudeStreamLine(line)
 	second.Commit()
 	payload := gjson.Parse(strings.TrimSpace(strings.TrimPrefix(string(out), "data:")))
-	if got := payload.Get("usage.input_tokens").Int(); got != 40 {
-		t.Fatalf("stream input_tokens = %d, want 40; out=%s", got, out)
+	if got := payload.Get("usage.input_tokens").Int(); got != second.deltaTokens {
+		t.Fatalf("stream input_tokens = %d, want local delta %d; out=%s", got, second.deltaTokens, out)
 	}
-	if got := payload.Get("usage.cache_read_input_tokens").Int(); got != 30 {
-		t.Fatalf("stream cache_read_input_tokens = %d, want 30; out=%s", got, out)
+	if got := payload.Get("usage.cache_read_input_tokens").Int(); got != wantCreation {
+		t.Fatalf("stream cache_read_input_tokens = %d, want prior local creation %d; out=%s", got, wantCreation, out)
 	}
 	if got := payload.Get("usage.cache_creation_input_tokens").Int(); got != 0 {
 		t.Fatalf("stream cache_creation_input_tokens = %d, want 0; out=%s", got, out)
@@ -93,8 +104,11 @@ func TestVirtualCacheLedgerTTLExpires(t *testing.T) {
 		t.Fatal("second transaction is nil")
 	}
 	out := second.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":10,"cache_creation_input_tokens":8}}`))
-	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Exists(); got {
+	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 0 {
 		t.Fatalf("expired entry should not rewrite cache_read_input_tokens: %s", out)
+	}
+	if got := gjson.GetBytes(out, "usage.cache_creation_input_tokens").Int(); got != second.localCacheableBudgetTokens() {
+		t.Fatalf("expired entry should rebuild creation from local budget: %s", out)
 	}
 }
 
@@ -131,8 +145,11 @@ func TestVirtualCacheLedgerEstimatesWhenUpstreamCacheUsageIsZero(t *testing.T) {
 	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 0 {
 		t.Fatalf("first cache_read_input_tokens = %d, want 0; out=%s", got, out)
 	}
-	if sum := rewrittenUsageTotal(out); sum != 1500 {
-		t.Fatalf("first rewritten total = %d, want 1500; out=%s", sum, out)
+	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != first.deltaTokens {
+		t.Fatalf("first input_tokens = %d, want local delta %d; out=%s", got, first.deltaTokens, out)
+	}
+	if sum := rewrittenUsageTotal(out); sum != first.localTotalInputTokens() {
+		t.Fatalf("first rewritten total = %d, want local total %d; out=%s", sum, first.localTotalInputTokens(), out)
 	}
 
 	second := ledger.begin("claude", "claude-opus", "session-1", request, time.Now())
@@ -141,17 +158,18 @@ func TestVirtualCacheLedgerEstimatesWhenUpstreamCacheUsageIsZero(t *testing.T) {
 	}
 	out = second.RewriteClaudeResponseUsage(upstream)
 	second.Commit()
-	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 1350 {
-		t.Fatalf("second cache_read_input_tokens = %d, want 1350; out=%s", got, out)
+	wantRead := minInt64(first.localCacheableBudgetTokens(), int64(math.Round(float64(second.localCacheableBudgetTokens())*0.90)))
+	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != wantRead {
+		t.Fatalf("second cache_read_input_tokens = %d, want local target read %d; out=%s", got, wantRead, out)
 	}
-	if got := gjson.GetBytes(out, "usage.cache_creation_input_tokens").Int(); got != 0 {
-		t.Fatalf("second cache_creation_input_tokens = %d, want 0; out=%s", got, out)
+	if got := gjson.GetBytes(out, "usage.cache_creation_input_tokens").Int(); got != second.localCacheableBudgetTokens()-wantRead {
+		t.Fatalf("second cache_creation_input_tokens = %d, want remaining local budget; out=%s", got, out)
 	}
-	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != 150 {
-		t.Fatalf("second input_tokens = %d, want 150; out=%s", got, out)
+	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != second.deltaTokens {
+		t.Fatalf("second input_tokens = %d, want local delta %d; out=%s", got, second.deltaTokens, out)
 	}
-	if sum := rewrittenUsageTotal(out); sum != 1500 {
-		t.Fatalf("second rewritten total = %d, want 1500; out=%s", sum, out)
+	if sum := rewrittenUsageTotal(out); sum != second.localTotalInputTokens() {
+		t.Fatalf("second rewritten total = %d, want local total %d; out=%s", sum, second.localTotalInputTokens(), out)
 	}
 }
 
@@ -173,17 +191,17 @@ func TestVirtualCacheLedgerConfigCapsEstimatedTokens(t *testing.T) {
 	if got := gjson.GetBytes(out, "usage.cache_creation_input_tokens").Int(); got != 100 {
 		t.Fatalf("cache_creation_input_tokens = %d, want max cap 100; out=%s", got, out)
 	}
-	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != 900 {
-		t.Fatalf("input_tokens = %d, want 900; out=%s", got, out)
+	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != first.deltaTokens {
+		t.Fatalf("input_tokens = %d, want local delta %d; out=%s", got, first.deltaTokens, out)
 	}
 
 	second := ledger.begin("claude", "claude-haiku", "session-1", request, time.Now())
 	out = second.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":80,"output_tokens":1}}`))
-	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 55 {
-		t.Fatalf("cache_read_input_tokens = %d, want uncached floor 55; out=%s", got, out)
+	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 100 {
+		t.Fatalf("cache_read_input_tokens = %d, want local capped budget 100; out=%s", got, out)
 	}
-	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != 25 {
-		t.Fatalf("input_tokens = %d, want uncached floor 25; out=%s", got, out)
+	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != second.deltaTokens {
+		t.Fatalf("input_tokens = %d, want local delta %d; out=%s", got, second.deltaTokens, out)
 	}
 }
 
@@ -217,14 +235,15 @@ func TestVirtualCacheLedgerKeepsClaudeLikeRollingCacheAcrossPrefixGrowth(t *test
 	}
 	secondOut := second.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":1800,"output_tokens":1}}`))
 	second.Commit()
-	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != 1620 {
-		t.Fatalf("second cache_read_input_tokens = %d, want 1620; out=%s", got, secondOut)
+	wantRead := minInt64(created, int64(math.Round(float64(second.localCacheableBudgetTokens())*0.90)))
+	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != wantRead {
+		t.Fatalf("second cache_read_input_tokens = %d, want local target read %d; out=%s", got, wantRead, secondOut)
 	}
 	if got := gjson.GetBytes(secondOut, "usage.cache_creation_input_tokens").Int(); got <= 0 {
 		t.Fatalf("second cache_creation_input_tokens = %d, want rolling delta creation; out=%s", got, secondOut)
 	}
-	if sum := rewrittenUsageTotal(secondOut); sum != 1800 {
-		t.Fatalf("second rewritten total = %d, want 1800; out=%s", sum, secondOut)
+	if sum := rewrittenUsageTotal(secondOut); sum != second.localTotalInputTokens() {
+		t.Fatalf("second rewritten total = %d, want local total %d; out=%s", sum, second.localTotalInputTokens(), secondOut)
 	}
 }
 
@@ -345,8 +364,8 @@ func TestVirtualCacheTargetReuseRatioBiasesFutureRewritesTowardTarget(t *testing
 	firstOut := first.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2000,"output_tokens":1}}`))
 	first.Commit()
 	firstCreated := gjson.GetBytes(firstOut, "usage.cache_creation_input_tokens").Int()
-	if firstCreated != 1000 {
-		t.Fatalf("first creation = %d, want configured 50%% hit-rate creation; out=%s", firstCreated, firstOut)
+	if firstCreated != first.localCacheableBudgetTokens() {
+		t.Fatalf("first creation = %d, want local budget %d; out=%s", firstCreated, first.localCacheableBudgetTokens(), firstOut)
 	}
 
 	second := ledger.begin("claude", "claude-opus", "session-target", request, now.Add(4*time.Second))
@@ -354,11 +373,12 @@ func TestVirtualCacheTargetReuseRatioBiasesFutureRewritesTowardTarget(t *testing
 		t.Fatal("second transaction is nil")
 	}
 	secondOut := second.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2000,"output_tokens":1}}`))
-	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != 1800 {
-		t.Fatalf("cache_read_input_tokens = %d, want target read 1800; out=%s", got, secondOut)
+	wantRead := minInt64(first.localCacheableBudgetTokens(), int64(math.Round(float64(second.localCacheableBudgetTokens())*0.90)))
+	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != wantRead {
+		t.Fatalf("cache_read_input_tokens = %d, want local target read %d; out=%s", got, wantRead, secondOut)
 	}
-	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got != 200 {
-		t.Fatalf("input_tokens = %d, want remaining input 200; out=%s", got, secondOut)
+	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got != second.deltaTokens {
+		t.Fatalf("input_tokens = %d, want local delta %d; out=%s", got, second.deltaTokens, secondOut)
 	}
 }
 
@@ -377,27 +397,69 @@ func TestVirtualCacheTargetReuseRatioRewritesTowardConfiguredRatio(t *testing.T)
 	first := ledger.begin("claude", "claude-opus", "session-force-target", request, time.Now())
 	firstOut := first.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2000,"output_tokens":1}}`))
 	first.Commit()
-	if created := gjson.GetBytes(firstOut, "usage.cache_creation_input_tokens").Int(); created != 1000 {
-		t.Fatalf("first creation = %d, want 1000; out=%s", created, firstOut)
+	firstBudget := first.localCacheableBudgetTokens()
+	if created := gjson.GetBytes(firstOut, "usage.cache_creation_input_tokens").Int(); created != firstBudget {
+		t.Fatalf("first creation = %d, want local budget %d; out=%s", created, firstBudget, firstOut)
 	}
 	if read := gjson.GetBytes(firstOut, "usage.cache_read_input_tokens").Int(); read != 0 {
 		t.Fatalf("first cache_read_input_tokens = %d, want 0; out=%s", read, firstOut)
 	}
-	if got := gjson.GetBytes(firstOut, "usage.input_tokens").Int(); got != 1000 {
-		t.Fatalf("first input_tokens = %d, want 1000; out=%s", got, firstOut)
+	if got := gjson.GetBytes(firstOut, "usage.input_tokens").Int(); got != first.deltaTokens {
+		t.Fatalf("first input_tokens = %d, want local delta %d; out=%s", got, first.deltaTokens, firstOut)
 	}
 
 	second := ledger.begin("claude", "claude-opus", "session-force-target", request, time.Now())
 	secondOut := second.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2000,"output_tokens":1}}`))
 	read := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int()
-	if read != 1900 {
-		t.Fatalf("cache_read_input_tokens = %d, want 1900; out=%s", read, secondOut)
+	wantRead := int64(math.Round(float64(second.localCacheableBudgetTokens()) * 0.95))
+	if read != wantRead {
+		t.Fatalf("cache_read_input_tokens = %d, want local target read %d; out=%s", read, wantRead, secondOut)
 	}
-	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got != 100 {
-		t.Fatalf("input_tokens = %d, want 100; out=%s", got, secondOut)
+	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got != second.deltaTokens {
+		t.Fatalf("input_tokens = %d, want local delta %d; out=%s", got, second.deltaTokens, secondOut)
 	}
-	if sum := rewrittenUsageTotal(secondOut); sum != 2000 {
-		t.Fatalf("second rewritten total = %d, want 2000; out=%s", sum, secondOut)
+	if sum := rewrittenUsageTotal(secondOut); sum != second.localTotalInputTokens() {
+		t.Fatalf("second rewritten total = %d, want local total %d; out=%s", sum, second.localTotalInputTokens(), secondOut)
+	}
+}
+
+func TestVirtualCacheTargetReuseRatioIgnoresUpstreamCacheBreakdown(t *testing.T) {
+	ledger := newVirtualCacheLedger(100)
+	old := CurrentVirtualCacheConfig()
+	SetVirtualCacheConfig(EffectiveVirtualCacheConfig{
+		Enabled:                 true,
+		HitRate:                 0.90,
+		TargetCacheReuseRatio:   0.92,
+		ContextShrinkResetRatio: 0.70,
+	})
+	t.Cleanup(func() { SetVirtualCacheConfig(old) })
+
+	request := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":` + strconv.Quote(strings.Repeat("cache prefix ", 500)) + `,"cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
+	first := ledger.begin("claude", "claude-opus", "session-preserve-input", request, time.Now())
+	firstOut := first.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":1,"cache_creation_input_tokens":23000,"cache_read_input_tokens":0,"output_tokens":1}}`))
+	first.Commit()
+	if got := gjson.GetBytes(firstOut, "usage.input_tokens").Int(); got != first.deltaTokens {
+		t.Fatalf("first input_tokens = %d, want local delta %d; out=%s", got, first.deltaTokens, firstOut)
+	}
+	if got := gjson.GetBytes(firstOut, "usage.cache_creation_input_tokens").Int(); got != first.localCacheableBudgetTokens() {
+		t.Fatalf("first creation = %d, want local budget %d; out=%s", got, first.localCacheableBudgetTokens(), firstOut)
+	}
+
+	second := ledger.begin("claude", "claude-opus", "session-preserve-input", request, time.Now())
+	secondOut := second.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":1,"cache_creation_input_tokens":900,"cache_read_input_tokens":24000,"output_tokens":1}}`))
+	second.Commit()
+	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got != second.deltaTokens {
+		t.Fatalf("second input_tokens = %d, want local delta %d; out=%s", got, second.deltaTokens, secondOut)
+	}
+	wantRead := int64(math.Round(float64(second.localCacheableBudgetTokens()) * 0.92))
+	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != wantRead {
+		t.Fatalf("second read = %d, want local target read %d; out=%s", got, wantRead, secondOut)
+	}
+	if got := gjson.GetBytes(secondOut, "usage.cache_creation_input_tokens").Int(); got != second.localCacheableBudgetTokens()-wantRead {
+		t.Fatalf("second creation = %d, want remaining local budget; out=%s", got, secondOut)
+	}
+	if sum := rewrittenUsageTotal(secondOut); sum != second.localTotalInputTokens() {
+		t.Fatalf("second total = %d, want local total %d; out=%s", sum, second.localTotalInputTokens(), secondOut)
 	}
 }
 
@@ -422,25 +484,27 @@ func TestVirtualCacheTargetReuseRatioRewritesStreamUsage(t *testing.T) {
 	if got := firstPayload.Get("usage.cache_read_input_tokens").Int(); got != 0 {
 		t.Fatalf("first stream cache_read_input_tokens = %d, want 0; out=%s", got, firstOut)
 	}
-	if got := firstPayload.Get("usage.cache_creation_input_tokens").Int(); got != 500 {
-		t.Fatalf("first stream cache_creation_input_tokens = %d, want 500; out=%s", got, firstOut)
+	firstBudget := first.localCacheableBudgetTokens()
+	if got := firstPayload.Get("usage.cache_creation_input_tokens").Int(); got != firstBudget {
+		t.Fatalf("first stream cache_creation_input_tokens = %d, want local budget %d; out=%s", got, firstBudget, firstOut)
 	}
-	if got := firstPayload.Get("usage.input_tokens").Int(); got != 500 {
-		t.Fatalf("first stream input_tokens = %d, want 500; out=%s", got, firstOut)
+	if got := firstPayload.Get("usage.input_tokens").Int(); got != first.deltaTokens {
+		t.Fatalf("first stream input_tokens = %d, want local delta %d; out=%s", got, first.deltaTokens, firstOut)
 	}
 
 	second := ledger.begin("claude", "claude-sonnet", "session-stream-target", request, time.Now())
 	secondOut := second.RewriteClaudeStreamLine(line)
 	second.Commit()
 	secondPayload := gjson.Parse(strings.TrimSpace(strings.TrimPrefix(string(secondOut), "data:")))
-	if got := secondPayload.Get("usage.cache_read_input_tokens").Int(); got != 900 {
-		t.Fatalf("second stream cache_read_input_tokens = %d, want 900; out=%s", got, secondOut)
+	wantRead := int64(math.Round(float64(second.localCacheableBudgetTokens()) * 0.90))
+	if got := secondPayload.Get("usage.cache_read_input_tokens").Int(); got != wantRead {
+		t.Fatalf("second stream cache_read_input_tokens = %d, want local target read %d; out=%s", got, wantRead, secondOut)
 	}
-	if got := secondPayload.Get("usage.cache_creation_input_tokens").Int(); got != 0 {
-		t.Fatalf("second stream cache_creation_input_tokens = %d, want 0; out=%s", got, secondOut)
+	if got := secondPayload.Get("usage.cache_creation_input_tokens").Int(); got != second.localCacheableBudgetTokens()-wantRead {
+		t.Fatalf("second stream cache_creation_input_tokens = %d, want remaining local budget; out=%s", got, secondOut)
 	}
-	if got := secondPayload.Get("usage.input_tokens").Int(); got != 100 {
-		t.Fatalf("second stream input_tokens = %d, want 100; out=%s", got, secondOut)
+	if got := secondPayload.Get("usage.input_tokens").Int(); got != second.deltaTokens {
+		t.Fatalf("second stream input_tokens = %d, want local delta %d; out=%s", got, second.deltaTokens, secondOut)
 	}
 }
 
@@ -463,24 +527,25 @@ func TestVirtualCacheTargetReuseRatioAutoCreatesDeltaWithoutAdvancedCaps(t *test
 	first := ledger.begin("claude", "claude-opus", "session-auto-delta", firstRequest, time.Now())
 	firstOut := first.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2000,"output_tokens":1}}`))
 	first.Commit()
-	if got := gjson.GetBytes(firstOut, "usage.cache_creation_input_tokens").Int(); got != 1800 {
-		t.Fatalf("first creation = %d, want 1800; out=%s", got, firstOut)
+	if got := gjson.GetBytes(firstOut, "usage.cache_creation_input_tokens").Int(); got != first.localCacheableBudgetTokens() {
+		t.Fatalf("first creation = %d, want local budget %d; out=%s", got, first.localCacheableBudgetTokens(), firstOut)
 	}
 
 	second := ledger.begin("claude", "claude-opus", "session-auto-delta", secondRequest, time.Now())
 	secondOut := second.RewriteClaudeResponseUsage([]byte(`{"usage":{"input_tokens":2300,"output_tokens":1}}`))
 	second.Commit()
-	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != 2070 {
-		t.Fatalf("second read = %d, want 2070; out=%s", got, secondOut)
+	wantRead := minInt64(first.localCacheableBudgetTokens(), int64(math.Round(float64(second.localCacheableBudgetTokens())*0.90)))
+	if got := gjson.GetBytes(secondOut, "usage.cache_read_input_tokens").Int(); got != wantRead {
+		t.Fatalf("second read = %d, want local target read %d; out=%s", got, wantRead, secondOut)
 	}
 	if got := gjson.GetBytes(secondOut, "usage.cache_creation_input_tokens").Int(); got <= 0 {
 		t.Fatalf("second creation = %d, want auto delta creation; out=%s", got, secondOut)
 	}
-	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got < targetAutoUncachedInputMinTokens {
-		t.Fatalf("second input = %d, want automatic input floor; out=%s", got, secondOut)
+	if got := gjson.GetBytes(secondOut, "usage.input_tokens").Int(); got != second.deltaTokens {
+		t.Fatalf("second input = %d, want local delta %d; out=%s", got, second.deltaTokens, secondOut)
 	}
-	if sum := rewrittenUsageTotal(secondOut); sum != 2300 {
-		t.Fatalf("second total = %d, want 2300; out=%s", sum, secondOut)
+	if sum := rewrittenUsageTotal(secondOut); sum != second.localTotalInputTokens() {
+		t.Fatalf("second total = %d, want local total %d; out=%s", sum, second.localTotalInputTokens(), secondOut)
 	}
 }
 
