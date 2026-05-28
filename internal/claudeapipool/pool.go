@@ -27,7 +27,7 @@ const (
 	VirtualCacheModeNatural = "natural"
 	VirtualCacheModeForced  = "forced"
 	// SimpleImportWorkspaceHeader is populated by apiKey-----workspaceId imports.
-	SimpleImportWorkspaceHeader = "workspaceId"
+	SimpleImportWorkspaceHeader = "anthropic-workspace-id"
 
 	AttrPool       = "claude_api_pool"
 	AttrPosition   = "claude_api_pool_position"
@@ -956,6 +956,19 @@ func ModelsFromAttributes(attrs map[string]string) []config.ClaudeModel {
 	return normalizeModels(models)
 }
 
+// NormalizeDefaults normalizes pool-level inherited account settings.
+func NormalizeDefaults(defaults Defaults) Defaults {
+	defaults.BaseURL = strings.TrimSpace(defaults.BaseURL)
+	defaults.ProxyURL = strings.TrimSpace(defaults.ProxyURL)
+	defaults.Headers = config.NormalizeHeaders(defaults.Headers)
+	return defaults
+}
+
+// NormalizeModelList normalizes a public model list for management updates.
+func NormalizeModelList(models []config.ClaudeModel) []config.ClaudeModel {
+	return normalizeModels(models)
+}
+
 // IsAttributesPoolAuth reports whether the attributes belong to a pool auth.
 func IsAttributesPoolAuth(attrs map[string]string) bool {
 	if len(attrs) == 0 {
@@ -980,6 +993,20 @@ func ReplaceItem(doc *File, position int, expectedHash string, item Item) (*Reso
 	doc.Items[index] = item
 	Normalize(doc)
 	return ResolveOne(doc, index), nil
+}
+
+// AppendItem appends one account entry and returns its resolved view.
+func AppendItem(doc *File, item Item) (*ResolvedItem, error) {
+	if doc == nil {
+		return nil, fmt.Errorf("pool document is nil")
+	}
+	NormalizeItem(&item)
+	if strings.TrimSpace(item.APIKey) == "" {
+		return nil, fmt.Errorf("api key is required")
+	}
+	doc.Items = append(doc.Items, item)
+	Normalize(doc)
+	return ResolveOne(doc, len(doc.Items)-1), nil
 }
 
 // DeleteItem removes one one-based position guarded by item hash.

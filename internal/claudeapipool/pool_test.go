@@ -394,6 +394,9 @@ key-2 ----- workspace-b
 	if doc.Items[1].APIKey != "key-2" || doc.Items[1].Headers[SimpleImportWorkspaceHeader] != "workspace-b" {
 		t.Fatalf("second item = %#v", doc.Items[1])
 	}
+	if doc.Items[0].Headers["anthropic-workspace-id"] != "workspace-a" {
+		t.Fatalf("workspace header key = %#v", doc.Items[0].Headers)
+	}
 }
 
 func TestApplyImportReplacePreservesImportedDefaultsAndModels(t *testing.T) {

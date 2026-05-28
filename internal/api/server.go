@@ -678,6 +678,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/claude-api-pool/items", s.mgmt.GetClaudeAPIPoolItems)
 		mgmt.GET("/claude-api-pool/export", s.mgmt.ExportClaudeAPIPool)
 		mgmt.POST("/claude-api-pool/import", s.mgmt.ImportClaudeAPIPool)
+		mgmt.POST("/claude-api-pool/items", s.mgmt.CreateClaudeAPIPoolItem)
 		mgmt.PATCH("/claude-api-pool/items", s.mgmt.PatchClaudeAPIPoolItemsBatch)
 		mgmt.POST("/claude-api-pool/items/:position/test", s.mgmt.TestClaudeAPIPoolItem)
 		mgmt.PATCH("/claude-api-pool/items/:position", s.mgmt.PatchClaudeAPIPoolItem)

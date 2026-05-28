@@ -42,6 +42,8 @@ func (h *Handler) GetClaudeAPIPoolConfig(c *gin.Context) {
 		"path":          claudeapipool.DefaultDBFileName,
 		"import_path":   claudeapipool.DefaultFileName,
 		"storage":       "sqlite",
+		"defaults":      doc.Defaults,
+		"models":        doc.Models,
 		"virtual-cache": claudeapipool.EffectiveVirtualCache(doc.VirtualCache),
 		"routing":       claudeapipool.EffectiveRouting(doc.Routing),
 		"reuse-stats":   claudeapipool.VirtualCacheReuseStats(),
@@ -54,6 +56,8 @@ func (h *Handler) PutClaudeAPIPoolConfig(c *gin.Context) {
 		Enabled      *bool                                      `json:"enabled"`
 		VirtualCache *claudeapipool.EffectiveVirtualCacheConfig `json:"virtual-cache"`
 		Routing      *claudeapipool.EffectiveRoutingConfig      `json:"routing"`
+		Defaults     *claudeapipool.Defaults                    `json:"defaults"`
+		Models       *[]config.ClaudeModel                      `json:"models"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -76,18 +80,29 @@ func (h *Handler) PutClaudeAPIPoolConfig(c *gin.Context) {
 	configPath := h.configFilePath
 	cfg := h.cfg
 	h.mu.Unlock()
-	if body.VirtualCache != nil || body.Routing != nil {
-		doc, err := claudeapipool.LoadStore(configPath, cfg)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "load_failed", "message": err.Error()})
-			return
-		}
-		if body.VirtualCache != nil {
-			doc.VirtualCache = claudeapipool.VirtualCacheConfigFromEffective(*body.VirtualCache)
-		}
-		if body.Routing != nil {
-			doc.Routing = claudeapipool.RoutingConfigFromEffective(*body.Routing)
-		}
+	doc, err := claudeapipool.LoadStore(configPath, cfg)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "load_failed", "message": err.Error()})
+		return
+	}
+	storeChanged := false
+	if body.VirtualCache != nil {
+		doc.VirtualCache = claudeapipool.VirtualCacheConfigFromEffective(*body.VirtualCache)
+		storeChanged = true
+	}
+	if body.Routing != nil {
+		doc.Routing = claudeapipool.RoutingConfigFromEffective(*body.Routing)
+		storeChanged = true
+	}
+	if body.Defaults != nil {
+		doc.Defaults = claudeapipool.NormalizeDefaults(*body.Defaults)
+		storeChanged = true
+	}
+	if body.Models != nil {
+		doc.Models = claudeapipool.NormalizeModelList(*body.Models)
+		storeChanged = true
+	}
+	if storeChanged {
 		if err := claudeapipool.SaveStore(configPath, cfg, doc); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "save_failed", "message": err.Error()})
 			return
@@ -105,6 +120,8 @@ func (h *Handler) PutClaudeAPIPoolConfig(c *gin.Context) {
 		"path":          claudeapipool.DefaultDBFileName,
 		"import_path":   claudeapipool.DefaultFileName,
 		"storage":       "sqlite",
+		"defaults":      doc.Defaults,
+		"models":        doc.Models,
 		"virtual-cache": claudeapipool.CurrentVirtualCacheConfig(),
 		"routing":       claudeapipool.CurrentRoutingConfig(),
 		"reuse-stats":   claudeapipool.VirtualCacheReuseStats(),
@@ -197,6 +214,39 @@ func (h *Handler) ImportClaudeAPIPool(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "imported": imported})
+}
+
+func (h *Handler) CreateClaudeAPIPoolItem(c *gin.Context) {
+	var body struct {
+		Value *claudeapipool.Item `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing value"})
+		return
+	}
+	doc, err := h.loadClaudeAPIPool()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "load_failed", "message": err.Error()})
+		return
+	}
+	resolved, err := claudeapipool.AppendItem(doc, *body.Value)
+	if err != nil {
+		writePoolMutationError(c, err)
+		return
+	}
+	if err := h.saveClaudeAPIPool(doc); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "save_failed", "message": err.Error()})
+		return
+	}
+	if err := h.syncClaudeAPIPool(c.Request.Context()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "sync_failed", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "item": claudeapipool.ToView(*resolved, h.claudeAPIPoolRuntimeStatus()[resolved.Position])})
 }
 
 func (h *Handler) PatchClaudeAPIPoolItem(c *gin.Context) {
