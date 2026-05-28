@@ -223,6 +223,11 @@ func APIKeyFromContext(ctx context.Context) string {
 
 func resolveUsageSource(auth *cliproxyauth.Auth, ctxAPIKey string) string {
 	if auth != nil {
+		if auth.Attributes != nil {
+			if source := strings.TrimSpace(auth.Attributes["source"]); strings.HasPrefix(source, "config:claude-api-pool[") {
+				return source
+			}
+		}
 		provider := strings.TrimSpace(auth.Provider)
 		if strings.EqualFold(provider, "gemini-cli") {
 			if id := strings.TrimSpace(auth.ID); id != "" {

@@ -56,7 +56,7 @@ func SetRoutingConfig(cfg EffectiveRoutingConfig) {
 	defer routingPolicyMu.Unlock()
 	defaultRoutingPolicy = normalizeEffectiveRoutingConfig(cfg)
 	DebugLogf(
-		"claude api pool routing config rpm=%d concurrency=%d max_switches=%d switch_delay_ms=%d rate_cooldown_ms=%d rate_max_cooldown_ms=%d overload_cooldown_ms=%d overload_max_cooldown_ms=%d same_retry_429=%d same_retry_529=%d same_retry_delay_ms=%d",
+		"claude api pool routing config rpm=%d concurrency=%d max_switches=%d switch_delay_ms=%d rate_cooldown_ms=%d rate_max_cooldown_ms=%d overload_cooldown_ms=%d overload_max_cooldown_ms=%d same_retry_429=%d same_retry_529=%d same_retry_delay_ms=%d affinity_enabled=%t affinity_auto=%t affinity_lanes=%d affinity_max_lanes=%d affinity_min_tokens=%d affinity_wait_ms=%d affinity_ttl_ms=%d",
 		defaultRoutingPolicy.PerAccountRPM,
 		defaultRoutingPolicy.PerAccountConcurrency,
 		defaultRoutingPolicy.MaxSwitches,
@@ -68,6 +68,13 @@ func SetRoutingConfig(cfg EffectiveRoutingConfig) {
 		defaultRoutingPolicy.SameAccountRetry429,
 		defaultRoutingPolicy.SameAccountRetry529,
 		defaultRoutingPolicy.SameAccountRetryDelayMS,
+		defaultRoutingPolicy.CacheAffinityEnabled,
+		defaultRoutingPolicy.CacheAffinityAuto,
+		defaultRoutingPolicy.CacheAffinityLanes,
+		defaultRoutingPolicy.CacheAffinityMaxLanes,
+		defaultRoutingPolicy.CacheAffinityMinTokens,
+		defaultRoutingPolicy.CacheAffinityWaitMS,
+		defaultRoutingPolicy.CacheAffinityTTLMS,
 	)
 }
 
@@ -336,6 +343,15 @@ func (r *poolRouter) aggregateStatus(authID string, policy EffectiveRoutingConfi
 			out.Unavailable = true
 			out.CoolingTo = laterTime(out.CoolingTo, state.CoolingUntil)
 		}
+	}
+	return out
+}
+
+// AggregateRouteStatuses returns route pressure for a set of auth IDs.
+func AggregateRouteStatuses(authIDs []string) []RouteStatus {
+	out := make([]RouteStatus, 0, len(authIDs))
+	for _, authID := range authIDs {
+		out = append(out, AggregateRouteStatus(authID))
 	}
 	return out
 }

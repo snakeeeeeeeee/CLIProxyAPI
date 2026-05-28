@@ -81,7 +81,7 @@ func (s *Service) SyncClaudeAPIPoolAuths(ctx context.Context) error {
 	vc := claudeapipool.CurrentVirtualCacheConfig()
 	rt := claudeapipool.CurrentRoutingConfig()
 	claudeapipool.DebugLogf(
-		"claude api pool sync complete items=%d runtime_auths=%d virtual_cache_enabled=%t virtual_cache_mode=%s hit_rate=%.3f target_reuse=%.3f uncached=%d max_creation=%d routing_rpm=%d routing_concurrency=%d max_switches=%d switch_delay_ms=%d",
+		"claude api pool sync complete items=%d runtime_auths=%d virtual_cache_enabled=%t virtual_cache_mode=%s hit_rate=%.3f target_reuse=%.3f uncached=%d max_creation=%d routing_rpm=%d routing_concurrency=%d max_switches=%d switch_delay_ms=%d affinity_enabled=%t affinity_auto=%t affinity_lanes=%d affinity_max_lanes=%d",
 		len(items),
 		len(next),
 		vc.Enabled,
@@ -94,6 +94,10 @@ func (s *Service) SyncClaudeAPIPoolAuths(ctx context.Context) error {
 		rt.PerAccountConcurrency,
 		rt.MaxSwitches,
 		rt.SwitchDelayMS,
+		rt.CacheAffinityEnabled,
+		rt.CacheAffinityAuto,
+		rt.CacheAffinityLanes,
+		rt.CacheAffinityMaxLanes,
 	)
 	return nil
 }

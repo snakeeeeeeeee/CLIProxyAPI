@@ -29,3 +29,10 @@
 - Existing Claude provider pages are card-oriented; the new Claude API Pool page should be separate and table-oriented.
 - The new Management Center route is `/claude-api-pool`; sidebar navigation uses the existing icon system and locale nav keys.
 - The local checkout did not have frontend dependencies installed initially, so `npm install` was required before `npm run type-check` and `npm run build`.
+
+## Claude API Pool Cache Affinity
+- Real-cache affinity routing is implemented as a routing-layer feature. It chooses upstream Claude API pool accounts using provider/model/session/cache-prefix identity and does not change the downstream virtual-cache usage rewrite.
+- The affinity router uses rendezvous hashing, warm lanes, TTL pruning, and optional automatic lane expansion under 429/529/5xx pressure.
+- Current pre-execution affinity is effective for Claude-format inbound requests where the Claude payload is already available before account selection. Non-Claude source formats would need a shared canonical Claude-body preparation step to avoid duplicating executor payload mutation logic before routing.
+- Pool monitoring metrics are collected from the existing usage reporter before virtual-cache rewriting, so `real_cache_ratio` reflects actual upstream Claude usage, not the downstream rewritten ledger.
+- Claude API pool usage metrics require preserving the synthesized `config:claude-api-pool[...]` source on usage records; pool accounts now keep that source instead of being reported as raw API keys.

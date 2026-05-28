@@ -45,6 +45,7 @@ func (h *Handler) GetClaudeAPIPoolConfig(c *gin.Context) {
 		"virtual-cache": claudeapipool.EffectiveVirtualCache(doc.VirtualCache),
 		"routing":       claudeapipool.EffectiveRouting(doc.Routing),
 		"reuse-stats":   claudeapipool.VirtualCacheReuseStats(),
+		"runtime-stats": h.claudeAPIPoolRuntimeStats(),
 	})
 }
 
@@ -107,6 +108,7 @@ func (h *Handler) PutClaudeAPIPoolConfig(c *gin.Context) {
 		"virtual-cache": claudeapipool.CurrentVirtualCacheConfig(),
 		"routing":       claudeapipool.CurrentRoutingConfig(),
 		"reuse-stats":   claudeapipool.VirtualCacheReuseStats(),
+		"runtime-stats": h.claudeAPIPoolRuntimeStats(),
 	})
 }
 
@@ -556,6 +558,7 @@ func (h *Handler) claudeAPIPoolRuntimeStatus() map[int]claudeapipool.RuntimeStat
 		status := claudeapipool.RuntimeStatus{
 			AuthID:   auth.ID,
 			Disabled: auth.Disabled || auth.Status == coreauth.StatusDisabled,
+			Metrics:  claudeapipool.AccountMetrics(auth.ID),
 		}
 		routeStatus := claudeapipool.AggregateRouteStatus(auth.ID)
 		status.InFlight = routeStatus.InFlight
@@ -583,6 +586,23 @@ func (h *Handler) claudeAPIPoolRuntimeStatus() map[int]claudeapipool.RuntimeStat
 		out[position] = status
 	}
 	return out
+}
+
+func (h *Handler) claudeAPIPoolRuntimeStats() claudeapipool.GlobalRuntimeStats {
+	if h == nil || h.authManager == nil {
+		return claudeapipool.RuntimeStats(nil, nil)
+	}
+	auths := h.authManager.List()
+	authIDs := make([]string, 0, len(auths))
+	statuses := make([]claudeapipool.RouteStatus, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || !claudeapipool.IsAttributesPoolAuth(auth.Attributes) {
+			continue
+		}
+		authIDs = append(authIDs, auth.ID)
+		statuses = append(statuses, claudeapipool.AggregateRouteStatus(auth.ID))
+	}
+	return claudeapipool.RuntimeStats(authIDs, statuses)
 }
 
 func parsePositiveInt(raw string, fallback int) int {

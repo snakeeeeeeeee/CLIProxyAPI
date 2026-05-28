@@ -154,6 +154,28 @@ func TestEffectiveRoutingDefaultsAndNormalization(t *testing.T) {
 	if got.SameAccountRetry429 != 1 || got.SameAccountRetry529 != 2 || got.SameAccountRetryDelayMS != 1500 {
 		t.Fatalf("same account retry = %#v", got)
 	}
+
+	got = EffectiveRouting(RoutingConfig{
+		CacheAffinityEnabled:   true,
+		CacheAffinityAuto:      true,
+		CacheAffinityMinTokens: -1,
+		CacheAffinityLanes:     8,
+		CacheAffinityMaxLanes:  2,
+		CacheAffinityWaitMS:    -1,
+		CacheAffinityTTLMS:     -1,
+	})
+	if !got.CacheAffinityEnabled || !got.CacheAffinityAuto {
+		t.Fatalf("cache affinity flags = %#v", got)
+	}
+	if got.CacheAffinityMinTokens != 4096 {
+		t.Fatalf("CacheAffinityMinTokens = %d, want 4096", got.CacheAffinityMinTokens)
+	}
+	if got.CacheAffinityLanes != 8 || got.CacheAffinityMaxLanes != 8 {
+		t.Fatalf("cache affinity lanes = %#v, want max raised to lanes", got)
+	}
+	if got.CacheAffinityWaitMS != 250 || got.CacheAffinityTTLMS != 300000 {
+		t.Fatalf("cache affinity timing defaults = %#v", got)
+	}
 }
 
 func TestVirtualCacheConfigFromEffective(t *testing.T) {

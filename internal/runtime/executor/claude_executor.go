@@ -202,6 +202,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 	virtualCache := beginClaudePoolVirtualCache(auth, opts, baseModel, bodyForTranslation)
+	attachClaudePoolAffinityMetadata(opts.Metadata, opts, baseModel, bodyForTranslation)
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
@@ -378,6 +379,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 	virtualCache := beginClaudePoolVirtualCache(auth, opts, baseModel, bodyForTranslation)
+	attachClaudePoolAffinityMetadata(opts.Metadata, opts, baseModel, bodyForTranslation)
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
@@ -545,6 +547,19 @@ func beginClaudePoolVirtualCache(auth *cliproxyauth.Auth, opts cliproxyexecutor.
 		return nil
 	}
 	return claudeapipool.BeginVirtualCache("claude", model, sessionKey, body)
+}
+
+func attachClaudePoolAffinityMetadata(meta map[string]any, opts cliproxyexecutor.Options, model string, body []byte) {
+	if meta == nil {
+		return
+	}
+	sessionKey := cliproxyauth.ExtractVirtualCacheSessionKey(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if sessionKey == "" {
+		sessionKey = cliproxyauth.ExtractVirtualCacheSessionKey(opts.Headers, body, opts.Metadata)
+	}
+	if req, ok := claudeapipool.BuildAffinityRequest(model, sessionKey, body); ok {
+		meta[cliproxyexecutor.ClaudePoolAffinityMetadataKey] = req
+	}
 }
 
 func rewriteClaudeUsageForVirtualCache(tx *claudeapipool.VirtualCacheTransaction, data []byte, stream bool) []byte {

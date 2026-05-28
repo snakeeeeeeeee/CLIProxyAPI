@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -156,6 +157,23 @@ func TestUsageReporterBuildRecordIncludesRequestedModelAlias(t *testing.T) {
 	}
 	if record.Alias != "client-gpt" {
 		t.Fatalf("alias = %q, want %q", record.Alias, "client-gpt")
+	}
+}
+
+func TestUsageReporterKeepsClaudeAPIPoolSource(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-a",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key": "sk-secret",
+			"source":  "config:claude-api-pool[#1:abc123]",
+		},
+	}
+	reporter := NewUsageReporter(context.Background(), "claude", "claude-opus", auth)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.Source != "config:claude-api-pool[#1:abc123]" {
+		t.Fatalf("source = %q, want claude api pool source", record.Source)
 	}
 }
 

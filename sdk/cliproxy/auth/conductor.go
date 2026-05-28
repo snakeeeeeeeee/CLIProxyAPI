@@ -109,6 +109,8 @@ type Result struct {
 	Error *Error
 }
 
+type claudePoolAffinitySelectionContextKey struct{}
+
 // Selector chooses an auth candidate for execution.
 type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
@@ -903,7 +905,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	var lastErr error
 	for idx, execModel := range execModels {
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
-		lease, acquired := acquireClaudePoolRoute(auth, resultModel)
+		lease, acquired := acquireClaudePoolRouteWithAffinity(ctx, auth, resultModel, claudePoolAffinitySelectionFromContext(ctx))
 		if !acquired {
 			lastErr = &Error{Code: "pool_route_limited", Message: "claude api pool account is locally rate limited", Retryable: true}
 			continue
@@ -1406,6 +1408,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	routeModel := req.Model
 	maxRetryCredentials = effectivePoolMaxRetryCredentials(maxRetryCredentials, providers)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	affinityReq, affinityActive := claudePoolAffinityFromRequest(routeModel, req, opts)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
@@ -1422,7 +1425,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		auth, executor, provider, affinitySelection, errPick := m.pickNextMixedWithAffinity(ctx, providers, routeModel, pickOpts, tried, affinityReq, affinityActive && !homeMode)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
@@ -1441,6 +1444,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
+		execCtx = contextWithClaudePoolAffinitySelection(execCtx, affinitySelection)
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
@@ -1449,7 +1453,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		var authErr error
 		for _, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
-			lease, acquired := acquireClaudePoolRoute(auth, resultModel)
+			lease, acquired := acquireClaudePoolRouteWithAffinity(execCtx, auth, resultModel, affinitySelection)
 			if !acquired {
 				authErr = &Error{Code: "pool_route_limited", Message: "claude api pool account is locally rate limited", Retryable: true}
 				continue
@@ -1519,6 +1523,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	routeModel := req.Model
 	maxRetryCredentials = effectivePoolMaxRetryCredentials(maxRetryCredentials, providers)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	affinityReq, affinityActive := claudePoolAffinityFromRequest(routeModel, req, opts)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
@@ -1535,7 +1540,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		auth, executor, provider, affinitySelection, errPick := m.pickNextMixedWithAffinity(ctx, providers, routeModel, pickOpts, tried, affinityReq, affinityActive && !homeMode)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
@@ -1554,6 +1559,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
+		execCtx = contextWithClaudePoolAffinitySelection(execCtx, affinitySelection)
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
@@ -1562,7 +1568,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		var authErr error
 		for _, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
-			lease, acquired := acquireClaudePoolRoute(auth, resultModel)
+			lease, acquired := acquireClaudePoolRouteWithAffinity(execCtx, auth, resultModel, affinitySelection)
 			if !acquired {
 				authErr = &Error{Code: "pool_route_limited", Message: "claude api pool account is locally rate limited", Retryable: true}
 				continue
@@ -1632,6 +1638,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	routeModel := req.Model
 	maxRetryCredentials = effectivePoolMaxRetryCredentials(maxRetryCredentials, providers)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	affinityReq, affinityActive := claudePoolAffinityFromRequest(routeModel, req, opts)
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
@@ -1648,7 +1655,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		auth, executor, provider, affinitySelection, errPick := m.pickNextMixedWithAffinity(ctx, providers, routeModel, pickOpts, tried, affinityReq, affinityActive && !homeMode)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return nil, lastErr
@@ -1666,6 +1673,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		execCtx = contextWithClaudePoolAffinitySelection(execCtx, affinitySelection)
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
 			continue
@@ -2303,6 +2311,22 @@ func acquireClaudePoolRoute(auth *Auth, model string) (*claudeapipool.RouteLease
 	return claudeapipool.TryAcquireRoute(auth.ID, model)
 }
 
+func acquireClaudePoolRouteWithAffinity(ctx context.Context, auth *Auth, model string, selection claudeapipool.AffinitySelection) (*claudeapipool.RouteLease, bool) {
+	lease, ok := acquireClaudePoolRoute(auth, model)
+	if !ok {
+		if selection.Active {
+			wait := time.Duration(claudeapipool.CurrentRoutingConfig().CacheAffinityWaitMS) * time.Millisecond
+			if wait > 0 {
+				if errWait := waitForCooldown(ctx, wait); errWait == nil {
+					return acquireClaudePoolRoute(auth, model)
+				}
+			}
+		}
+		return nil, false
+	}
+	return lease, ok
+}
+
 func shouldRetrySameClaudePoolAuth(auth *Auth, err error, attempt int) bool {
 	if auth == nil || !claudeapipool.IsAttributesPoolAuth(auth.Attributes) || err == nil || attempt < 0 {
 		return false
@@ -2323,6 +2347,48 @@ func sameClaudePoolRetryDelay(err error) time.Duration {
 
 func waitForClaudePoolSwitchDelay(ctx context.Context) error {
 	return waitForCooldown(ctx, claudeapipool.SwitchDelay())
+}
+
+func contextWithClaudePoolAffinitySelection(ctx context.Context, selection claudeapipool.AffinitySelection) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !selection.Active {
+		return ctx
+	}
+	return context.WithValue(ctx, claudePoolAffinitySelectionContextKey{}, selection)
+}
+
+func claudePoolAffinitySelectionFromContext(ctx context.Context) claudeapipool.AffinitySelection {
+	if ctx == nil {
+		return claudeapipool.AffinitySelection{}
+	}
+	selection, _ := ctx.Value(claudePoolAffinitySelectionContextKey{}).(claudeapipool.AffinitySelection)
+	return selection
+}
+
+func claudePoolAffinityFromRequest(routeModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (claudeapipool.AffinityRequest, bool) {
+	if req.Metadata != nil {
+		if value, ok := req.Metadata[cliproxyexecutor.ClaudePoolAffinityMetadataKey].(claudeapipool.AffinityRequest); ok && value.PrefixFingerprint != "" {
+			return value, true
+		}
+	}
+	if opts.Metadata != nil {
+		if value, ok := opts.Metadata[cliproxyexecutor.ClaudePoolAffinityMetadataKey].(claudeapipool.AffinityRequest); ok && value.PrefixFingerprint != "" {
+			return value, true
+		}
+	}
+	if !claudeapipool.CurrentRoutingConfig().CacheAffinityEnabled {
+		return claudeapipool.AffinityRequest{}, false
+	}
+	if opts.SourceFormat.String() != "claude" {
+		return claudeapipool.AffinityRequest{}, false
+	}
+	sessionKey := ExtractVirtualCacheSessionKey(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if sessionKey == "" {
+		sessionKey = ExtractVirtualCacheSessionKey(opts.Headers, req.Payload, opts.Metadata)
+	}
+	return claudeapipool.BuildAffinityRequest(routeModel, sessionKey, req.Payload)
 }
 
 // MarkResult records an execution result and notifies hooks.
@@ -2500,10 +2566,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	if authSnapshot != nil && claudeapipool.IsAttributesPoolAuth(authSnapshot.Attributes) {
+		statusCode := http.StatusOK
 		if result.Error != nil {
-			claudeapipool.NoteRouteResult(result.AuthID, result.Model, statusCodeFromResult(result.Error), result.RetryAfter)
+			statusCode = statusCodeFromResult(result.Error)
+			claudeapipool.NoteRouteResult(result.AuthID, result.Model, statusCode, result.RetryAfter)
 		} else if result.Success {
 			claudeapipool.NoteRouteResult(result.AuthID, result.Model, http.StatusOK, nil)
+		}
+		selection := claudePoolAffinitySelectionFromContext(ctx)
+		if selection.Active {
+			claudeapipool.NoteAffinityResult(selection, statusCode, result.Success)
 		}
 	}
 	if m.scheduler != nil && authSnapshot != nil {
@@ -3335,6 +3407,111 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.Unlock()
 	}
 	return authCopy, executor, providerKey, nil
+}
+
+func (m *Manager) pickNextMixedWithAffinity(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, affinityReq claudeapipool.AffinityRequest, affinityActive bool) (*Auth, ProviderExecutor, string, claudeapipool.AffinitySelection, error) {
+	if affinityActive {
+		auth, executor, provider, selection, err := m.pickClaudePoolAffinity(ctx, providers, model, opts, tried, affinityReq)
+		if err == nil && auth != nil {
+			return auth, executor, provider, selection, nil
+		}
+	}
+	auth, executor, provider, err := m.pickNextMixed(ctx, providers, model, opts, tried)
+	return auth, executor, provider, claudeapipool.AffinitySelection{}, err
+}
+
+func (m *Manager) pickClaudePoolAffinity(_ context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, affinityReq claudeapipool.AffinityRequest) (*Auth, ProviderExecutor, string, claudeapipool.AffinitySelection, error) {
+	if m == nil || strings.TrimSpace(affinityReq.PrefixFingerprint) == "" {
+		return nil, nil, "", claudeapipool.AffinitySelection{}, &Error{Code: "auth_not_found", Message: "no affinity candidate"}
+	}
+	hasClaude := false
+	for _, provider := range providers {
+		if strings.EqualFold(strings.TrimSpace(provider), "claude") {
+			hasClaude = true
+			break
+		}
+	}
+	if !hasClaude {
+		return nil, nil, "", claudeapipool.AffinitySelection{}, &Error{Code: "provider_not_found", Message: "claude provider not supplied"}
+	}
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	m.mu.RLock()
+	executor, okExecutor := m.executors["claude"]
+	if !okExecutor || executor == nil {
+		m.mu.RUnlock()
+		return nil, nil, "", claudeapipool.AffinitySelection{}, &Error{Code: "executor_not_found", Message: "executor not registered"}
+	}
+	candidates := make([]*Auth, 0, len(m.auths))
+	registryRef := registry.GetGlobalRegistry()
+	for _, candidate := range m.auths {
+		if candidate == nil || candidate.Disabled || !strings.EqualFold(candidate.Provider, "claude") {
+			continue
+		}
+		if !claudeapipool.IsAttributesPoolAuth(candidate.Attributes) {
+			continue
+		}
+		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			continue
+		}
+		if disallowFreeAuth && isFreeCodexAuth(candidate) {
+			continue
+		}
+		if tried != nil {
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
+		}
+		if !m.authAllowedForProviderRoute("claude", candidate) {
+			continue
+		}
+		if strings.TrimSpace(model) != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) == 0 {
+		m.mu.RUnlock()
+		return nil, nil, "", claudeapipool.AffinitySelection{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	available, errAvailable := m.availableAuthsForRouteModel(candidates, "claude", model, time.Now())
+	if errAvailable != nil {
+		m.mu.RUnlock()
+		return nil, nil, "", claudeapipool.AffinitySelection{}, errAvailable
+	}
+	authIDs := make([]string, 0, len(available))
+	for _, candidate := range available {
+		if candidate != nil {
+			authIDs = append(authIDs, candidate.ID)
+		}
+	}
+	selection := claudeapipool.SelectAffinityAuth(affinityReq, authIDs, nil)
+	if strings.TrimSpace(selection.AuthID) == "" {
+		m.mu.RUnlock()
+		return nil, nil, "", selection, &Error{Code: "auth_not_found", Message: "no affinity auth available"}
+	}
+	var selected *Auth
+	for _, candidate := range available {
+		if candidate != nil && candidate.ID == selection.AuthID {
+			selected = candidate
+			break
+		}
+	}
+	if selected == nil {
+		m.mu.RUnlock()
+		return nil, nil, "", selection, &Error{Code: "auth_not_found", Message: "affinity auth unavailable"}
+	}
+	authCopy := selected.Clone()
+	m.mu.RUnlock()
+	if !selected.indexAssigned {
+		m.mu.Lock()
+		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+			current.EnsureIndex()
+			authCopy = current.Clone()
+		}
+		m.mu.Unlock()
+	}
+	return authCopy, executor, "claude", selection, nil
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {

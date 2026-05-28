@@ -81,32 +81,46 @@ type EffectiveVirtualCacheConfig struct {
 
 // RoutingConfig controls local pool routing pressure before an upstream call is made.
 type RoutingConfig struct {
-	PerAccountRPM           int `yaml:"per-account-rpm,omitempty" json:"per-account-rpm,omitempty"`
-	PerAccountConcurrency   int `yaml:"per-account-concurrency,omitempty" json:"per-account-concurrency,omitempty"`
-	MaxSwitches             int `yaml:"max-switches,omitempty" json:"max-switches,omitempty"`
-	SwitchDelayMS           int `yaml:"switch-delay-ms,omitempty" json:"switch-delay-ms,omitempty"`
-	RateLimitCooldownMS     int `yaml:"rate-limit-cooldown-ms,omitempty" json:"rate-limit-cooldown-ms,omitempty"`
-	RateLimitMaxCooldownMS  int `yaml:"rate-limit-max-cooldown-ms,omitempty" json:"rate-limit-max-cooldown-ms,omitempty"`
-	OverloadCooldownMS      int `yaml:"overload-cooldown-ms,omitempty" json:"overload-cooldown-ms,omitempty"`
-	OverloadMaxCooldownMS   int `yaml:"overload-max-cooldown-ms,omitempty" json:"overload-max-cooldown-ms,omitempty"`
-	SameAccountRetry429     int `yaml:"same-account-retry-429,omitempty" json:"same-account-retry-429,omitempty"`
-	SameAccountRetry529     int `yaml:"same-account-retry-529,omitempty" json:"same-account-retry-529,omitempty"`
-	SameAccountRetryDelayMS int `yaml:"same-account-retry-delay-ms,omitempty" json:"same-account-retry-delay-ms,omitempty"`
+	PerAccountRPM           int  `yaml:"per-account-rpm,omitempty" json:"per-account-rpm,omitempty"`
+	PerAccountConcurrency   int  `yaml:"per-account-concurrency,omitempty" json:"per-account-concurrency,omitempty"`
+	MaxSwitches             int  `yaml:"max-switches,omitempty" json:"max-switches,omitempty"`
+	SwitchDelayMS           int  `yaml:"switch-delay-ms,omitempty" json:"switch-delay-ms,omitempty"`
+	RateLimitCooldownMS     int  `yaml:"rate-limit-cooldown-ms,omitempty" json:"rate-limit-cooldown-ms,omitempty"`
+	RateLimitMaxCooldownMS  int  `yaml:"rate-limit-max-cooldown-ms,omitempty" json:"rate-limit-max-cooldown-ms,omitempty"`
+	OverloadCooldownMS      int  `yaml:"overload-cooldown-ms,omitempty" json:"overload-cooldown-ms,omitempty"`
+	OverloadMaxCooldownMS   int  `yaml:"overload-max-cooldown-ms,omitempty" json:"overload-max-cooldown-ms,omitempty"`
+	SameAccountRetry429     int  `yaml:"same-account-retry-429,omitempty" json:"same-account-retry-429,omitempty"`
+	SameAccountRetry529     int  `yaml:"same-account-retry-529,omitempty" json:"same-account-retry-529,omitempty"`
+	SameAccountRetryDelayMS int  `yaml:"same-account-retry-delay-ms,omitempty" json:"same-account-retry-delay-ms,omitempty"`
+	CacheAffinityEnabled    bool `yaml:"cache-affinity-enabled,omitempty" json:"cache-affinity-enabled,omitempty"`
+	CacheAffinityAuto       bool `yaml:"cache-affinity-auto,omitempty" json:"cache-affinity-auto,omitempty"`
+	CacheAffinityMinTokens  int  `yaml:"cache-affinity-min-cache-tokens,omitempty" json:"cache-affinity-min-cache-tokens,omitempty"`
+	CacheAffinityLanes      int  `yaml:"cache-affinity-lanes,omitempty" json:"cache-affinity-lanes,omitempty"`
+	CacheAffinityMaxLanes   int  `yaml:"cache-affinity-max-lanes,omitempty" json:"cache-affinity-max-lanes,omitempty"`
+	CacheAffinityWaitMS     int  `yaml:"cache-affinity-wait-ms,omitempty" json:"cache-affinity-wait-ms,omitempty"`
+	CacheAffinityTTLMS      int  `yaml:"cache-affinity-ttl-ms,omitempty" json:"cache-affinity-ttl-ms,omitempty"`
 }
 
 // EffectiveRoutingConfig is the fully-defaulted runtime routing policy.
 type EffectiveRoutingConfig struct {
-	PerAccountRPM           int `json:"per_account_rpm"`
-	PerAccountConcurrency   int `json:"per_account_concurrency"`
-	MaxSwitches             int `json:"max_switches"`
-	SwitchDelayMS           int `json:"switch_delay_ms"`
-	RateLimitCooldownMS     int `json:"rate_limit_cooldown_ms"`
-	RateLimitMaxCooldownMS  int `json:"rate_limit_max_cooldown_ms"`
-	OverloadCooldownMS      int `json:"overload_cooldown_ms"`
-	OverloadMaxCooldownMS   int `json:"overload_max_cooldown_ms"`
-	SameAccountRetry429     int `json:"same_account_retry_429"`
-	SameAccountRetry529     int `json:"same_account_retry_529"`
-	SameAccountRetryDelayMS int `json:"same_account_retry_delay_ms"`
+	PerAccountRPM           int  `json:"per_account_rpm"`
+	PerAccountConcurrency   int  `json:"per_account_concurrency"`
+	MaxSwitches             int  `json:"max_switches"`
+	SwitchDelayMS           int  `json:"switch_delay_ms"`
+	RateLimitCooldownMS     int  `json:"rate_limit_cooldown_ms"`
+	RateLimitMaxCooldownMS  int  `json:"rate_limit_max_cooldown_ms"`
+	OverloadCooldownMS      int  `json:"overload_cooldown_ms"`
+	OverloadMaxCooldownMS   int  `json:"overload_max_cooldown_ms"`
+	SameAccountRetry429     int  `json:"same_account_retry_429"`
+	SameAccountRetry529     int  `json:"same_account_retry_529"`
+	SameAccountRetryDelayMS int  `json:"same_account_retry_delay_ms"`
+	CacheAffinityEnabled    bool `json:"cache_affinity_enabled"`
+	CacheAffinityAuto       bool `json:"cache_affinity_auto"`
+	CacheAffinityMinTokens  int  `json:"cache_affinity_min_cache_tokens"`
+	CacheAffinityLanes      int  `json:"cache_affinity_lanes"`
+	CacheAffinityMaxLanes   int  `json:"cache_affinity_max_lanes"`
+	CacheAffinityWaitMS     int  `json:"cache_affinity_wait_ms"`
+	CacheAffinityTTLMS      int  `json:"cache_affinity_ttl_ms"`
 }
 
 // Defaults contains pool-level values inherited by every item.
@@ -153,29 +167,31 @@ type RuntimeStatus struct {
 	Cooling   bool
 	CoolingTo time.Time
 	Disabled  bool
+	Metrics   AccountMetricsSnapshot
 }
 
 // ItemView is returned by the management API.
 type ItemView struct {
-	Position       int                  `json:"position"`
-	ItemHash       string               `json:"item_hash"`
-	AuthID         string               `json:"auth_id,omitempty"`
-	Status         string               `json:"status"`
-	APIKeyPreview  string               `json:"api_key_preview"`
-	BaseURL        string               `json:"base-url"`
-	ProxyURL       string               `json:"proxy-url"`
-	Priority       int                  `json:"priority"`
-	DisableCooling bool                 `json:"disable-cooling"`
-	Headers        map[string]string    `json:"headers,omitempty"`
-	Models         []config.ClaudeModel `json:"models,omitempty"`
-	ExcludedModels []string             `json:"excluded-models,omitempty"`
-	Raw            Item                 `json:"raw"`
-	InFlight       int64                `json:"in_flight"`
-	RPMUsed        int                  `json:"rpm_used"`
-	RPMLimit       int                  `json:"rpm_limit"`
-	Cooling        bool                 `json:"cooling"`
-	CoolingUntil   string               `json:"cooling_until,omitempty"`
-	WarmKeys       int                  `json:"warm_keys"`
+	Position       int                    `json:"position"`
+	ItemHash       string                 `json:"item_hash"`
+	AuthID         string                 `json:"auth_id,omitempty"`
+	Status         string                 `json:"status"`
+	APIKeyPreview  string                 `json:"api_key_preview"`
+	BaseURL        string                 `json:"base-url"`
+	ProxyURL       string                 `json:"proxy-url"`
+	Priority       int                    `json:"priority"`
+	DisableCooling bool                   `json:"disable-cooling"`
+	Headers        map[string]string      `json:"headers,omitempty"`
+	Models         []config.ClaudeModel   `json:"models,omitempty"`
+	ExcludedModels []string               `json:"excluded-models,omitempty"`
+	Raw            Item                   `json:"raw"`
+	InFlight       int64                  `json:"in_flight"`
+	RPMUsed        int                    `json:"rpm_used"`
+	RPMLimit       int                    `json:"rpm_limit"`
+	Cooling        bool                   `json:"cooling"`
+	CoolingUntil   string                 `json:"cooling_until,omitempty"`
+	WarmKeys       int                    `json:"warm_keys"`
+	Metrics        AccountMetricsSnapshot `json:"metrics"`
 }
 
 // ListQuery filters and pages resolved items.
@@ -416,6 +432,21 @@ func NormalizeRoutingConfig(cfg RoutingConfig) RoutingConfig {
 	if cfg.SameAccountRetryDelayMS < 0 {
 		cfg.SameAccountRetryDelayMS = 0
 	}
+	if cfg.CacheAffinityMinTokens < 0 {
+		cfg.CacheAffinityMinTokens = 0
+	}
+	if cfg.CacheAffinityLanes < 0 {
+		cfg.CacheAffinityLanes = 0
+	}
+	if cfg.CacheAffinityMaxLanes < 0 {
+		cfg.CacheAffinityMaxLanes = 0
+	}
+	if cfg.CacheAffinityWaitMS < 0 {
+		cfg.CacheAffinityWaitMS = 0
+	}
+	if cfg.CacheAffinityTTLMS < 0 {
+		cfg.CacheAffinityTTLMS = 0
+	}
 	return cfg
 }
 
@@ -448,6 +479,29 @@ func EffectiveRouting(cfg RoutingConfig) EffectiveRoutingConfig {
 	if sameAccountRetryDelayMS <= 0 {
 		sameAccountRetryDelayMS = 1500
 	}
+	cacheAffinityMinTokens := cfg.CacheAffinityMinTokens
+	if cacheAffinityMinTokens <= 0 {
+		cacheAffinityMinTokens = 4096
+	}
+	cacheAffinityLanes := cfg.CacheAffinityLanes
+	if cacheAffinityLanes <= 0 {
+		cacheAffinityLanes = 2
+	}
+	cacheAffinityMaxLanes := cfg.CacheAffinityMaxLanes
+	if cacheAffinityMaxLanes <= 0 {
+		cacheAffinityMaxLanes = 4
+	}
+	if cacheAffinityMaxLanes < cacheAffinityLanes {
+		cacheAffinityMaxLanes = cacheAffinityLanes
+	}
+	cacheAffinityWaitMS := cfg.CacheAffinityWaitMS
+	if cacheAffinityWaitMS <= 0 {
+		cacheAffinityWaitMS = 250
+	}
+	cacheAffinityTTLMS := cfg.CacheAffinityTTLMS
+	if cacheAffinityTTLMS <= 0 {
+		cacheAffinityTTLMS = int((5 * time.Minute) / time.Millisecond)
+	}
 	return EffectiveRoutingConfig{
 		PerAccountRPM:           cfg.PerAccountRPM,
 		PerAccountConcurrency:   cfg.PerAccountConcurrency,
@@ -460,6 +514,13 @@ func EffectiveRouting(cfg RoutingConfig) EffectiveRoutingConfig {
 		SameAccountRetry429:     cfg.SameAccountRetry429,
 		SameAccountRetry529:     cfg.SameAccountRetry529,
 		SameAccountRetryDelayMS: sameAccountRetryDelayMS,
+		CacheAffinityEnabled:    cfg.CacheAffinityEnabled,
+		CacheAffinityAuto:       cfg.CacheAffinityAuto,
+		CacheAffinityMinTokens:  cacheAffinityMinTokens,
+		CacheAffinityLanes:      cacheAffinityLanes,
+		CacheAffinityMaxLanes:   cacheAffinityMaxLanes,
+		CacheAffinityWaitMS:     cacheAffinityWaitMS,
+		CacheAffinityTTLMS:      cacheAffinityTTLMS,
 	}
 }
 
@@ -477,6 +538,13 @@ func RoutingConfigFromEffective(cfg EffectiveRoutingConfig) RoutingConfig {
 		SameAccountRetry429:     cfg.SameAccountRetry429,
 		SameAccountRetry529:     cfg.SameAccountRetry529,
 		SameAccountRetryDelayMS: cfg.SameAccountRetryDelayMS,
+		CacheAffinityEnabled:    cfg.CacheAffinityEnabled,
+		CacheAffinityAuto:       cfg.CacheAffinityAuto,
+		CacheAffinityMinTokens:  cfg.CacheAffinityMinTokens,
+		CacheAffinityLanes:      cfg.CacheAffinityLanes,
+		CacheAffinityMaxLanes:   cfg.CacheAffinityMaxLanes,
+		CacheAffinityWaitMS:     cfg.CacheAffinityWaitMS,
+		CacheAffinityTTLMS:      cfg.CacheAffinityTTLMS,
 	})
 }
 
@@ -715,6 +783,7 @@ func ToView(item ResolvedItem, runtime RuntimeStatus) ItemView {
 		Cooling:        runtime.Cooling,
 		CoolingUntil:   coolingUntil,
 		WarmKeys:       runtime.WarmKeys,
+		Metrics:        runtime.Metrics,
 	}
 }
 

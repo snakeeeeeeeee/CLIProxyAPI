@@ -99,3 +99,21 @@
   - `go build -o test-output ./cmd/server && rm test-output`
   - Management Center `npm run type-check`
   - Management Center `npm run build`
+- Implemented real upstream Claude cache-affinity routing for Claude API Pool:
+  - added routing config for enable/auto/min tokens/lanes/max lanes/wait/TTL
+  - added rendezvous-hash affinity lanes keyed by provider/model/session/cache prefix
+  - added automatic lane pressure adjustment on 429/529/5xx
+  - wired selection into non-stream, stream, and count paths without changing downstream virtual-cache accounting
+  - exposed runtime stats and per-account rolling 60-minute metrics in management APIs
+  - added Management Center controls, global stats, table success/cache/history columns, and auto-refresh interval options
+  - fixed usage source handling so Claude API pool metrics are attributed to `config:claude-api-pool[...]` instead of raw API keys
+- Verified:
+  - `go test ./internal/claudeapipool ./sdk/cliproxy/auth ./internal/runtime/executor/helps`
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - Management Center `npm run build -- --mode production`
+- Ran one live local smoke using only `/tmp/cliproxy-claude-pool-smoke-*` temporary config files and removed them afterward:
+  - service started on `127.0.0.1:18317`
+  - management API loaded 2 pool accounts and returned runtime stats
+  - `/v1/models` returned `claude-opus-4-7`
+  - one `/v1/messages` request reached upstream but returned `403 Request not allowed`
+  - management stats showed affinity key/lanes and failure counters updated after the request

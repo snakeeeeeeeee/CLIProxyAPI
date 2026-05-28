@@ -65,6 +65,28 @@ type VirtualCacheReuseSnapshot struct {
 	SampleCount              int     `json:"sample_count"`
 }
 
+// CachePrefixInfo describes a prompt-cacheable request prefix.
+type CachePrefixInfo struct {
+	Fingerprint    string
+	TTL            time.Duration
+	EstimateTokens int64
+	DeltaTokens    int64
+	OK             bool
+}
+
+// AnalyzeCachePrefix returns the same cache-prefix identity used by the virtual
+// cache ledger without mutating the ledger.
+func AnalyzeCachePrefix(payload []byte) CachePrefixInfo {
+	fingerprint, ttl, estimateTokens, deltaTokens, ok := cachePrefixFingerprint(payload)
+	return CachePrefixInfo{
+		Fingerprint:    fingerprint,
+		TTL:            ttl,
+		EstimateTokens: estimateTokens,
+		DeltaTokens:    deltaTokens,
+		OK:             ok,
+	}
+}
+
 // VirtualCacheTransaction rewrites Claude usage for one request based on a
 // ledger lookup taken before the upstream request completed.
 type VirtualCacheTransaction struct {
