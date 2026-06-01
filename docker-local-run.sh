@@ -16,6 +16,29 @@
 
 set -euo pipefail
 
+set_top_level_yaml_bool() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local tmp
+  tmp="$(mktemp)"
+  awk -v key="${key}" -v value="${value}" '
+    BEGIN { found = 0 }
+    $0 ~ "^[[:space:]]*" key ":[[:space:]]*" {
+      print key ": " value
+      found = 1
+      next
+    }
+    { print }
+    END {
+      if (!found) {
+        print key ": " value
+      }
+    }
+  ' "${file}" > "${tmp}"
+  mv "${tmp}" "${file}"
+}
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="${IMAGE_NAME:-cli-proxy-api:local}"
 CONTAINER_NAME="${CONTAINER_NAME:-cli-proxy-api-local}"
@@ -24,6 +47,7 @@ HOST_PORT="${HOST_PORT:-28317}"
 CONTAINER_PORT="${CONTAINER_PORT:-}"
 DATA_DIR="${DATA_DIR:-${ROOT_DIR}/docker-data}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/docker-logs}"
+DEBUG_CONSOLE="${DEBUG_CONSOLE:-true}"
 
 VERSION="${VERSION:-$(git -C "${ROOT_DIR}" describe --tags --always --dirty 2>/dev/null || echo dev)}"
 COMMIT="${COMMIT:-$(git -C "${ROOT_DIR}" rev-parse --short HEAD 2>/dev/null || echo none)}"
@@ -47,6 +71,12 @@ for pool_file in claude-api-pool.db claude-api-pool.db-shm claude-api-pool.db-wa
     echo "Copied ${pool_file} to ${DATA_DIR}/${pool_file}"
   fi
 done
+
+if [[ "${DEBUG_CONSOLE}" == "true" ]]; then
+  set_top_level_yaml_bool "${DATA_DIR}/config.yaml" "debug" "true"
+  set_top_level_yaml_bool "${DATA_DIR}/config.yaml" "logging-to-file" "false"
+  echo "Enabled console debug logging in ${DATA_DIR}/config.yaml"
+fi
 
 if [[ -z "${CONTAINER_PORT}" ]]; then
   CONTAINER_PORT="$(awk '
