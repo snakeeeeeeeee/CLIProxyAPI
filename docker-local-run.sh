@@ -4,7 +4,7 @@
 #
 # Defaults:
 #   host port: 28317
-#   container port: 8317
+#   container port: read from config.yaml port, fallback 8317
 #   bind address: 0.0.0.0
 #   data dir: ./docker-data
 #   logs dir: ./docker-logs
@@ -21,7 +21,7 @@ IMAGE_NAME="${IMAGE_NAME:-cli-proxy-api:local}"
 CONTAINER_NAME="${CONTAINER_NAME:-cli-proxy-api-local}"
 HOST_BIND_IP="${HOST_BIND_IP:-0.0.0.0}"
 HOST_PORT="${HOST_PORT:-28317}"
-CONTAINER_PORT="${CONTAINER_PORT:-8317}"
+CONTAINER_PORT="${CONTAINER_PORT:-}"
 DATA_DIR="${DATA_DIR:-${ROOT_DIR}/docker-data}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/docker-logs}"
 
@@ -47,6 +47,23 @@ for pool_file in claude-api-pool.db claude-api-pool.db-shm claude-api-pool.db-wa
     echo "Copied ${pool_file} to ${DATA_DIR}/${pool_file}"
   fi
 done
+
+if [[ -z "${CONTAINER_PORT}" ]]; then
+  CONTAINER_PORT="$(awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*port:[[:space:]]*/ {
+      value=$0
+      sub(/^[[:space:]]*port:[[:space:]]*/, "", value)
+      sub(/[[:space:]]*#.*/, "", value)
+      gsub(/["'\''[:space:]]/, "", value)
+      if (value != "") {
+        print value
+        exit
+      }
+    }
+  ' "${DATA_DIR}/config.yaml")"
+  CONTAINER_PORT="${CONTAINER_PORT:-8317}"
+fi
 
 echo "Building ${IMAGE_NAME}"
 docker build \
@@ -75,5 +92,6 @@ docker run -d \
 echo
 echo "Started."
 echo "API:  http://${HOST_BIND_IP}:${HOST_PORT}"
+echo "Port: ${HOST_BIND_IP}:${HOST_PORT}->${CONTAINER_PORT}"
 echo "Logs: docker logs -f ${CONTAINER_NAME}"
 echo "Data: ${DATA_DIR}"
