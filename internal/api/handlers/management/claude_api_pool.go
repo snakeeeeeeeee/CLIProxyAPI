@@ -39,6 +39,7 @@ func (h *Handler) GetClaudeAPIPoolConfig(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"enabled":       enabled,
+		"pure-mode":     doc.PureMode,
 		"path":          claudeapipool.DefaultDBFileName,
 		"import_path":   claudeapipool.DefaultFileName,
 		"storage":       "sqlite",
@@ -54,6 +55,7 @@ func (h *Handler) GetClaudeAPIPoolConfig(c *gin.Context) {
 func (h *Handler) PutClaudeAPIPoolConfig(c *gin.Context) {
 	var body struct {
 		Enabled      *bool                                      `json:"enabled"`
+		PureMode     *bool                                      `json:"pure-mode"`
 		VirtualCache *claudeapipool.EffectiveVirtualCacheConfig `json:"virtual-cache"`
 		Routing      *claudeapipool.EffectiveRoutingConfig      `json:"routing"`
 		Defaults     *claudeapipool.Defaults                    `json:"defaults"`
@@ -90,6 +92,10 @@ func (h *Handler) PutClaudeAPIPoolConfig(c *gin.Context) {
 		doc.VirtualCache = claudeapipool.VirtualCacheConfigFromEffective(*body.VirtualCache)
 		storeChanged = true
 	}
+	if body.PureMode != nil {
+		doc.PureMode = *body.PureMode
+		storeChanged = true
+	}
 	if body.Routing != nil {
 		doc.Routing = claudeapipool.RoutingConfigFromEffective(*body.Routing)
 		storeChanged = true
@@ -117,6 +123,7 @@ func (h *Handler) PutClaudeAPIPoolConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":        "ok",
 		"enabled":       cfg.ClaudeAPIPool.Enabled,
+		"pure-mode":     doc.PureMode,
 		"path":          claudeapipool.DefaultDBFileName,
 		"import_path":   claudeapipool.DefaultFileName,
 		"storage":       "sqlite",

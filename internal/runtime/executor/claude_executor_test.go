@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
 	xxHash64 "github.com/pierrec/xxHash/xxHash64"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -933,6 +934,49 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	}
 	if !helps.IsValidUserID(userIDs[0]) || !helps.IsValidUserID(userIDs[1]) {
 		t.Fatalf("user_ids should be valid, got %q and %q", userIDs[0], userIDs[1])
+	}
+}
+
+func TestClaudeExecutor_PoolPureModeSkipsCloakingAndAutoCacheControl(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-opus-4-8","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":                    "key-123",
+		"base_url":                   server.URL,
+		claudeapipool.AttrPool:       "true",
+		claudeapipool.AttrPureMode:   "true",
+		claudeapipool.AttrPosition:   "1",
+		claudeapipool.AttrItemHash:   "hash",
+		claudeapipool.AttrModelsJSON: `[{"name":"claude-opus-4-8"}]`,
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected request body to be captured")
+	}
+	if gjson.GetBytes(seenBody, "system").Exists() {
+		t.Fatalf("system was injected in pure mode: %s", string(seenBody))
+	}
+	if got := countCacheControls(seenBody); got != 0 {
+		t.Fatalf("cache_control count = %d, want 0 in pure mode; body: %s", got, string(seenBody))
+	}
+	if got := gjson.GetBytes(seenBody, "messages.0.content.0.text").String(); got != "hi" {
+		t.Fatalf("message text = %q, want hi", got)
 	}
 }
 

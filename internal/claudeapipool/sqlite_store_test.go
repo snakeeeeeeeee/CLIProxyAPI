@@ -81,7 +81,8 @@ func TestSaveStoreRoundTripsConfigAndItemOrder(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	enabled := true
 	doc := &File{
-		Version: 1,
+		Version:  1,
+		PureMode: true,
 		VirtualCache: VirtualCacheConfig{
 			Enabled: &enabled,
 		},
@@ -111,7 +112,7 @@ func TestSaveStoreRoundTripsConfigAndItemOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadStore() error = %v", err)
 	}
-	if got.Routing.PerAccountRPM != 5 || got.Defaults.Priority != 3 || got.Models[0].Name != "claude-default" {
+	if !got.PureMode || got.Routing.PerAccountRPM != 5 || got.Defaults.Priority != 3 || got.Models[0].Name != "claude-default" {
 		t.Fatalf("round-tripped config = %#v", got)
 	}
 	if len(got.Items) != 2 || got.Items[0].APIKey != "key-1" || got.Items[1].APIKey != "key-3" {

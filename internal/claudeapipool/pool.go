@@ -34,6 +34,7 @@ const (
 	AttrItemHash   = "claude_api_pool_item_hash"
 	AttrModelsJSON = "claude_api_pool_models_json"
 	AttrCCHSigning = "claude_api_pool_experimental_cch_signing"
+	AttrPureMode   = "claude_api_pool_pure_mode"
 
 	StatusEnabled  = "enabled"
 	StatusDisabled = "disabled"
@@ -43,6 +44,7 @@ const (
 // File is the YAML document stored in claude-api-pool.yaml.
 type File struct {
 	Version      int                  `yaml:"version" json:"version"`
+	PureMode     bool                 `yaml:"pure-mode,omitempty" json:"pure-mode,omitempty"`
 	VirtualCache VirtualCacheConfig   `yaml:"virtual-cache,omitempty" json:"virtual-cache,omitempty"`
 	Routing      RoutingConfig        `yaml:"routing,omitempty" json:"routing,omitempty"`
 	Defaults     Defaults             `yaml:"defaults,omitempty" json:"defaults,omitempty"`
@@ -153,6 +155,7 @@ type ResolvedItem struct {
 	Position int              `json:"position"`
 	ItemHash string           `json:"item_hash"`
 	Status   string           `json:"status"`
+	PureMode bool             `json:"pure_mode"`
 	Raw      Item             `json:"raw"`
 	Config   config.ClaudeKey `json:"config"`
 }
@@ -696,6 +699,7 @@ func ResolveOne(doc *File, index int) *ResolvedItem {
 		Position: index + 1,
 		ItemHash: ItemHash(raw),
 		Status:   status,
+		PureMode: doc.PureMode,
 		Raw:      raw,
 		Config:   ck,
 	}
@@ -823,6 +827,9 @@ func ApplyImport(doc *File, data []byte, replace bool) (int, error) {
 func importHasPoolConfig(doc *File) bool {
 	if doc == nil {
 		return false
+	}
+	if doc.PureMode {
+		return true
 	}
 	if doc.VirtualCache.Enabled != nil ||
 		(doc.VirtualCache.Mode != "" && doc.VirtualCache.Mode != VirtualCacheModeNatural) ||

@@ -31,6 +31,7 @@ defaults:
 models:
   - name: "claude-opus"
     alias: "opus"
+pure-mode: true
 items:
   - api-key: " key-1 "
     headers:
@@ -48,6 +49,9 @@ items:
 	got := items[0]
 	if got.Position != 1 {
 		t.Fatalf("Position = %d, want 1", got.Position)
+	}
+	if !got.PureMode {
+		t.Fatal("PureMode = false, want true")
 	}
 	if got.Config.APIKey != "key-1" {
 		t.Fatalf("APIKey = %q, want trimmed key", got.Config.APIKey)

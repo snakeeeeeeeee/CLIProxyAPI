@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS pool_config (
 	version INTEGER NOT NULL DEFAULT 1,
 	virtual_cache_json TEXT NOT NULL DEFAULT '{}',
 	routing_json TEXT NOT NULL DEFAULT '{}',
+	options_json TEXT NOT NULL DEFAULT '{}',
 	defaults_json TEXT NOT NULL DEFAULT '{}',
 	models_json TEXT NOT NULL DEFAULT '[]',
 	created_at TEXT NOT NULL,
@@ -113,7 +114,48 @@ func openSQLiteStore(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("initialize claude api pool sqlite: %w", err)
 	}
+	if err := migrateSQLiteSchema(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return db, nil
+}
+
+func migrateSQLiteSchema(ctx context.Context, db *sql.DB) error {
+	if err := ensureSQLiteColumn(ctx, db, "pool_config", "options_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureSQLiteColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return fmt.Errorf("inspect claude api pool sqlite table %s: %w", table, err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("scan claude api pool sqlite table %s column: %w", table, err)
+		}
+		if strings.EqualFold(name, column) {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate claude api pool sqlite table %s columns: %w", table, err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition); err != nil {
+		return fmt.Errorf("migrate claude api pool sqlite add %s.%s: %w", table, column, err)
+	}
+	return nil
 }
 
 func migrateYAMLIfEmpty(ctx context.Context, db *sql.DB, yamlPath string) error {
@@ -160,9 +202,9 @@ func sqliteStoreEmpty(ctx context.Context, db *sql.DB) (bool, error) {
 
 func loadSQLiteFile(ctx context.Context, db *sql.DB) (*File, error) {
 	doc := &File{Version: 1}
-	var virtualCacheJSON, routingJSON, defaultsJSON, modelsJSON string
-	err := db.QueryRowContext(ctx, `SELECT version, virtual_cache_json, routing_json, defaults_json, models_json FROM pool_config WHERE id = 1`).
-		Scan(&doc.Version, &virtualCacheJSON, &routingJSON, &defaultsJSON, &modelsJSON)
+	var virtualCacheJSON, routingJSON, optionsJSON, defaultsJSON, modelsJSON string
+	err := db.QueryRowContext(ctx, `SELECT version, virtual_cache_json, routing_json, options_json, defaults_json, models_json FROM pool_config WHERE id = 1`).
+		Scan(&doc.Version, &virtualCacheJSON, &routingJSON, &optionsJSON, &defaultsJSON, &modelsJSON)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("read claude api pool config from sqlite: %w", err)
 	}
@@ -173,6 +215,13 @@ func loadSQLiteFile(ctx context.Context, db *sql.DB) (*File, error) {
 		if err := decodeSQLiteJSON(routingJSON, &doc.Routing, "routing"); err != nil {
 			return nil, err
 		}
+		var options struct {
+			PureMode bool `json:"pure_mode"`
+		}
+		if err := decodeSQLiteJSON(optionsJSON, &options, "options"); err != nil {
+			return nil, err
+		}
+		doc.PureMode = options.PureMode
 		if err := decodeSQLiteJSON(defaultsJSON, &doc.Defaults, "defaults"); err != nil {
 			return nil, err
 		}
@@ -229,6 +278,12 @@ func saveSQLiteFile(ctx context.Context, db *sql.DB, doc *File) error {
 	if err != nil {
 		return err
 	}
+	optionsJSON, err := marshalSQLiteJSON(struct {
+		PureMode bool `json:"pure_mode"`
+	}{PureMode: doc.PureMode}, "options")
+	if err != nil {
+		return err
+	}
 	defaultsJSON, err := marshalSQLiteJSON(doc.Defaults, "defaults")
 	if err != nil {
 		return err
@@ -238,16 +293,17 @@ func saveSQLiteFile(ctx context.Context, db *sql.DB, doc *File) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO pool_config(id, version, virtual_cache_json, routing_json, defaults_json, models_json, created_at, updated_at)
-VALUES(1, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO pool_config(id, version, virtual_cache_json, routing_json, options_json, defaults_json, models_json, created_at, updated_at)
+VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	version = excluded.version,
 	virtual_cache_json = excluded.virtual_cache_json,
 	routing_json = excluded.routing_json,
+	options_json = excluded.options_json,
 	defaults_json = excluded.defaults_json,
 	models_json = excluded.models_json,
 	updated_at = excluded.updated_at
-`, doc.Version, virtualCacheJSON, routingJSON, defaultsJSON, modelsJSON, now, now); err != nil {
+`, doc.Version, virtualCacheJSON, routingJSON, optionsJSON, defaultsJSON, modelsJSON, now, now); err != nil {
 		return fmt.Errorf("write claude api pool config to sqlite: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM pool_items`); err != nil {

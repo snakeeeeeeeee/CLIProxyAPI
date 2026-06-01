@@ -79,6 +79,9 @@ func SynthesizeClaudeAPIPoolAuth(ctx *SynthesisContext, item claudeapipool.Resol
 	if ck.ExperimentalCCHSigning {
 		attrs[claudeapipool.AttrCCHSigning] = "true"
 	}
+	if item.PureMode {
+		attrs[claudeapipool.AttrPureMode] = "true"
+	}
 	addConfigHeadersToAttrs(ck.Headers, attrs)
 	metadata := map[string]any{}
 	if ck.DisableCooling {

@@ -159,9 +159,12 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 
-	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
-	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	pureMode := isClaudePoolPureMode(auth)
+	if !pureMode {
+		// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
+		// based on client type and configuration.
+		body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -172,8 +175,8 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
 
-	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
+	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support).
+	if !pureMode && countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
 
@@ -340,9 +343,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 
-	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
-	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	pureMode := isClaudePoolPureMode(auth)
+	if !pureMode {
+		// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
+		// based on client type and configuration.
+		body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -353,8 +359,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
 
-	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
+	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support).
+	if !pureMode && countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
 
@@ -549,6 +555,13 @@ func beginClaudePoolVirtualCache(auth *cliproxyauth.Auth, opts cliproxyexecutor.
 	return claudeapipool.BeginVirtualCache("claude", model, sessionKey, body)
 }
 
+func isClaudePoolPureMode(auth *cliproxyauth.Auth) bool {
+	if auth == nil || !claudeapipool.IsAttributesPoolAuth(auth.Attributes) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Attributes[claudeapipool.AttrPureMode]), "true")
+}
+
 func attachClaudePoolAffinityMetadata(meta map[string]any, opts cliproxyexecutor.Options, model string, body []byte) {
 	if meta == nil {
 		return
@@ -670,7 +683,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
-	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
+	if !isClaudePoolPureMode(auth) && !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		body = checkSystemInstructions(body)
 	}
 
