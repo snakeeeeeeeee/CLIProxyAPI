@@ -57,6 +57,8 @@ defaults:
 
 # Shared model list. Items can override this with their own models block.
 models:
+  - name: claude-opus-4-8
+    alias: ""
   - name: claude-opus-4-7
     alias: ""
   - name: claude-sonnet-4-6

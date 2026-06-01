@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -50,7 +51,10 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
+	apiErrorLogMaxLen                = 1024
 )
+
+var apiErrorLogSensitiveValuePattern = regexp.MustCompile(`(?i)\b(authorization|x-api-key|api-key|apikey|api_key|token|secret)\b(\s*[:=]\s*"?)(?:Bearer\s+)?([^"\s,;}\]]+)`)
 
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
@@ -148,6 +152,99 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 		return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"server_error","code":"internal_server_error"}}`, errText))
 	}
 	return payload
+}
+
+func attachAPIErrorToAccessLog(c *gin.Context, label string, status int, errText string, body []byte) {
+	if c == nil {
+		return
+	}
+	summary := summarizeAPIErrorForAccessLog(errText, body)
+	if summary == "" {
+		return
+	}
+	if strings.TrimSpace(label) == "" {
+		label = "api_error"
+	}
+	_ = c.Error(fmt.Errorf("%s status=%d message=%s", label, status, summary)).SetType(gin.ErrorTypePrivate)
+}
+
+func summarizeAPIErrorForAccessLog(errText string, body []byte) string {
+	text := extractAPIErrorJSONMessage(body)
+	if text == "" {
+		text = strings.TrimSpace(errText)
+	}
+	text = redactAPIErrorLogText(strings.Join(strings.Fields(text), " "))
+	if len(text) > apiErrorLogMaxLen {
+		text = text[:apiErrorLogMaxLen] + "...(truncated)"
+	}
+	return text
+}
+
+func extractAPIErrorJSONMessage(body []byte) string {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 || !json.Valid(body) {
+		return ""
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+
+	if errValue, ok := payload["error"]; ok {
+		switch value := errValue.(type) {
+		case string:
+			return value
+		case map[string]any:
+			return formatAPIErrorJSONFields(value)
+		}
+	}
+
+	return formatAPIErrorJSONFields(payload)
+}
+
+func formatAPIErrorJSONFields(fields map[string]any) string {
+	if len(fields) == 0 {
+		return ""
+	}
+
+	message := jsonFieldString(fields, "message")
+	errType := jsonFieldString(fields, "type")
+	code := jsonFieldString(fields, "code")
+	if code == "" {
+		code = jsonFieldString(fields, "status")
+	}
+
+	parts := make([]string, 0, 3)
+	if errType != "" {
+		parts = append(parts, errType)
+	}
+	if code != "" && code != errType {
+		parts = append(parts, code)
+	}
+	if message != "" {
+		parts = append(parts, message)
+	}
+	return strings.Join(parts, ": ")
+}
+
+func jsonFieldString(fields map[string]any, key string) string {
+	value, ok := fields[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case float64:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
+}
+
+func redactAPIErrorLogText(text string) string {
+	return apiErrorLogSensitiveValuePattern.ReplaceAllString(text, `${1}${2}<redacted>`)
 }
 
 // StreamingKeepAliveInterval returns the SSE keep-alive interval for this server.
@@ -1011,10 +1108,7 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
-	status := http.StatusInternalServerError
-	if msg != nil && msg.StatusCode > 0 {
-		status = msg.StatusCode
-	}
+	status, errText := apiErrorStatusAndText(msg)
 	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
 			if len(values) == 0 {
@@ -1027,14 +1121,8 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 
-	errText := http.StatusText(status)
-	if msg != nil && msg.Error != nil {
-		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
-			errText = v
-		}
-	}
-
 	body := BuildErrorResponseBody(status, errText)
+	attachAPIErrorToAccessLog(c, "api_error", status, errText, body)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {
@@ -1057,6 +1145,21 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	}
 	c.Status(status)
 	_, _ = c.Writer.Write(body)
+}
+
+func apiErrorStatusAndText(msg *interfaces.ErrorMessage) (int, string) {
+	status := http.StatusInternalServerError
+	if msg != nil && msg.StatusCode > 0 {
+		status = msg.StatusCode
+	}
+
+	errText := http.StatusText(status)
+	if msg != nil && msg.Error != nil {
+		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
+			errText = v
+		}
+	}
+	return status, errText
 }
 
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {

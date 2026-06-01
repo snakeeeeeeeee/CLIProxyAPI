@@ -69,6 +69,54 @@ func TestWriteErrorResponse_AddonHeadersEnabled(t *testing.T) {
 	}
 }
 
+func TestWriteErrorResponse_AttachesAccessLogErrorSummary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusUnauthorized,
+		Error:      errors.New(`{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key","code":"invalid_api_key"},"request_id":"req_1"}`),
+	})
+
+	privateErrors := c.Errors.ByType(gin.ErrorTypePrivate).String()
+	if !strings.Contains(privateErrors, "api_error status=401") {
+		t.Fatalf("private errors missing status summary: %q", privateErrors)
+	}
+	if !strings.Contains(privateErrors, "authentication_error: invalid_api_key: invalid x-api-key") {
+		t.Fatalf("private errors missing extracted error message: %q", privateErrors)
+	}
+	if strings.Contains(privateErrors, `{"type":"error"`) {
+		t.Fatalf("private errors should not include the full upstream JSON: %q", privateErrors)
+	}
+}
+
+func TestWriteErrorResponse_RedactsAndTruncatesAccessLogError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadGateway,
+		Error:      errors.New("upstream failed authorization=Bearer sk-secret-value " + strings.Repeat("x", apiErrorLogMaxLen+128)),
+	})
+
+	privateErrors := c.Errors.ByType(gin.ErrorTypePrivate).String()
+	if strings.Contains(privateErrors, "sk-secret-value") {
+		t.Fatalf("private errors should redact sensitive values: %q", privateErrors)
+	}
+	if !strings.Contains(privateErrors, "authorization=<redacted>") {
+		t.Fatalf("private errors missing redacted value: %q", privateErrors)
+	}
+	if !strings.Contains(privateErrors, "...(truncated)") {
+		t.Fatalf("private errors should be truncated: %q", privateErrors)
+	}
+}
+
 func TestEnrichAuthSelectionError_DefaultsTo503WithContext(t *testing.T) {
 	in := &coreauth.Error{Code: "auth_not_found", Message: "no auth available"}
 	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")
