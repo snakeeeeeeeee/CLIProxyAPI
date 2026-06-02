@@ -106,15 +106,9 @@ func (r *affinityRouter) selectAuth(req AffinityRequest, authIDs []string, unava
 		return AffinitySelection{}
 	}
 	policy = normalizeEffectiveRoutingConfig(policy)
-	laneTarget := policy.CacheAffinityLanes
-	if policy.CacheAffinityAuto {
-		laneTarget = minInt(policy.CacheAffinityMaxLanes, maxInt(policy.CacheAffinityLanes, laneTarget))
-	}
-	if laneTarget <= 0 {
-		laneTarget = 1
-	}
-	if laneTarget > len(ordered) {
-		laneTarget = len(ordered)
+	laneTarget, laneMax := affinityLaneBoundsForSelection(policy, ordered, unavailable)
+	if laneTarget <= 0 || laneMax <= 0 {
+		return AffinitySelection{Key: key, Active: true}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -127,10 +121,7 @@ func (r *affinityRouter) selectAuth(req AffinityRequest, authIDs []string, unava
 	entry.expiresAt = now.Add(req.TTL)
 	entry.updatedAt = now
 	if policy.CacheAffinityAuto && entry.pressure > 0 {
-		laneTarget = minInt(policy.CacheAffinityMaxLanes, laneTarget+entry.pressure)
-		if laneTarget > len(ordered) {
-			laneTarget = len(ordered)
-		}
+		laneTarget = minInt(laneMax, laneTarget+entry.pressure)
 	}
 	entry.authIDs = normalizeWarmLanes(entry.authIDs, ordered, laneTarget)
 	for _, authID := range entry.authIDs {
@@ -144,8 +135,8 @@ func (r *affinityRouter) selectAuth(req AffinityRequest, authIDs []string, unava
 		}
 		if !containsString(entry.authIDs, authID) {
 			entry.authIDs = append(entry.authIDs, authID)
-			if len(entry.authIDs) > minInt(policy.CacheAffinityMaxLanes, len(ordered)) {
-				entry.authIDs = entry.authIDs[len(entry.authIDs)-minInt(policy.CacheAffinityMaxLanes, len(ordered)):]
+			if len(entry.authIDs) > laneMax {
+				entry.authIDs = entry.authIDs[len(entry.authIDs)-laneMax:]
 			}
 		}
 		return AffinitySelection{AuthID: authID, Key: key, Active: true}

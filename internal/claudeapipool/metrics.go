@@ -87,24 +87,28 @@ type AccountMetricsBucketView struct {
 
 // GlobalRuntimeStats summarizes pool-wide runtime state for management UI.
 type GlobalRuntimeStats struct {
-	WindowSeconds       int64   `json:"window_seconds"`
-	AccountCount        int     `json:"account_count"`
-	AvailableAccounts   int     `json:"available_accounts"`
-	CoolingAccounts     int     `json:"cooling_accounts"`
-	InFlight            int64   `json:"in_flight"`
-	RPMUsed             int     `json:"rpm_used"`
-	RPMLimit            int     `json:"rpm_limit"`
-	ActiveAffinityKeys  int     `json:"active_affinity_keys"`
-	WarmLanes           int     `json:"warm_lanes"`
-	RequestCount        int64   `json:"request_count"`
-	SuccessCount        int64   `json:"success_count"`
-	FailureCount        int64   `json:"failure_count"`
-	SuccessRate         float64 `json:"success_rate"`
-	RealCacheRatio      float64 `json:"real_cache_ratio"`
-	CacheReadTokens     int64   `json:"cache_read_tokens"`
-	CacheCreationTokens int64   `json:"cache_creation_tokens"`
-	InputTokens         int64   `json:"input_tokens"`
-	OutputTokens        int64   `json:"output_tokens"`
+	WindowSeconds       int64            `json:"window_seconds"`
+	AccountCount        int              `json:"account_count"`
+	AvailableAccounts   int              `json:"available_accounts"`
+	CoolingAccounts     int              `json:"cooling_accounts"`
+	InFlight            int64            `json:"in_flight"`
+	RPMUsed             int              `json:"rpm_used"`
+	RPMLimit            int              `json:"rpm_limit"`
+	ActiveAffinityKeys  int              `json:"active_affinity_keys"`
+	WarmLanes           int              `json:"warm_lanes"`
+	RequestCount        int64            `json:"request_count"`
+	SuccessCount        int64            `json:"success_count"`
+	FailureCount        int64            `json:"failure_count"`
+	Status429           int64            `json:"status_429"`
+	Status529           int64            `json:"status_529"`
+	Status5xx           int64            `json:"status_5xx"`
+	SuccessRate         float64          `json:"success_rate"`
+	RealCacheRatio      float64          `json:"real_cache_ratio"`
+	CacheReadTokens     int64            `json:"cache_read_tokens"`
+	CacheCreationTokens int64            `json:"cache_creation_tokens"`
+	InputTokens         int64            `json:"input_tokens"`
+	OutputTokens        int64            `json:"output_tokens"`
+	AffinityAutoPlan    AffinityAutoPlan `json:"affinity_auto_plan"`
 }
 
 var defaultRouteMetrics = &routeMetricsCollector{accounts: make(map[string]*accountMetrics)}
@@ -121,6 +125,15 @@ func AccountMetrics(authID string) AccountMetricsSnapshot {
 
 // RuntimeStats returns pool-wide metrics blended with current limiter state.
 func RuntimeStats(authIDs []string, statuses []RouteStatus) GlobalRuntimeStats {
+	return runtimeStats(authIDs, statuses, true)
+}
+
+// RefreshAffinityAutoPlan refreshes the runtime affinity auto plan without requiring a management UI poll.
+func RefreshAffinityAutoPlan(authIDs []string, statuses []RouteStatus) AffinityAutoPlan {
+	return runtimeStats(authIDs, statuses, false).AffinityAutoPlan
+}
+
+func runtimeStats(authIDs []string, statuses []RouteStatus, includeAffinityStats bool) GlobalRuntimeStats {
 	stats := defaultRouteMetrics.globalSnapshot(authIDs, time.Now())
 	for _, status := range statuses {
 		stats.AccountCount++
@@ -133,9 +146,12 @@ func RuntimeStats(authIDs []string, statuses []RouteStatus) GlobalRuntimeStats {
 			stats.AvailableAccounts++
 		}
 	}
-	activeKeys, warmLanes := AffinityStats()
-	stats.ActiveAffinityKeys = activeKeys
-	stats.WarmLanes = warmLanes
+	if includeAffinityStats {
+		activeKeys, warmLanes := AffinityStats()
+		stats.ActiveAffinityKeys = activeKeys
+		stats.WarmLanes = warmLanes
+	}
+	stats.AffinityAutoPlan = updateAffinityAutoPlan(stats, CurrentRoutingConfig())
 	return stats
 }
 
@@ -245,6 +261,9 @@ func (c *routeMetricsCollector) globalSnapshot(authIDs []string, now time.Time) 
 			stats.RequestCount += bucket.requests
 			stats.SuccessCount += bucket.success
 			stats.FailureCount += bucket.failures
+			stats.Status429 += bucket.status429
+			stats.Status529 += bucket.status529
+			stats.Status5xx += bucket.status5xx
 			stats.InputTokens += bucket.inputTokens
 			stats.OutputTokens += bucket.outputTokens
 			stats.CacheReadTokens += bucket.cacheReadTokens

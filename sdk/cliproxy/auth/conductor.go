@@ -3480,11 +3480,14 @@ func (m *Manager) pickClaudePoolAffinity(_ context.Context, providers []string, 
 		return nil, nil, "", claudeapipool.AffinitySelection{}, errAvailable
 	}
 	authIDs := make([]string, 0, len(available))
+	statuses := make([]claudeapipool.RouteStatus, 0, len(available))
 	for _, candidate := range available {
 		if candidate != nil {
 			authIDs = append(authIDs, candidate.ID)
+			statuses = append(statuses, claudeapipool.AggregateRouteStatus(candidate.ID))
 		}
 	}
+	claudeapipool.RefreshAffinityAutoPlan(authIDs, statuses)
 	selection := claudeapipool.SelectAffinityAuth(affinityReq, authIDs, nil)
 	if strings.TrimSpace(selection.AuthID) == "" {
 		m.mu.RUnlock()

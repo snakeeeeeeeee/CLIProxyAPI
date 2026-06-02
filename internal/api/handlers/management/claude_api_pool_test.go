@@ -13,6 +13,40 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
+func TestClaudeAPIPoolRuntimeStatsIncludesAffinityAutoPlan(t *testing.T) {
+	t.Cleanup(func() {
+		claudeapipool.SetRoutingConfig(claudeapipool.EffectiveRouting(claudeapipool.RoutingConfig{}))
+	})
+	claudeapipool.SetRoutingConfig(claudeapipool.EffectiveRouting(claudeapipool.RoutingConfig{
+		CacheAffinityAuto:     true,
+		CacheAffinityLanes:    1,
+		CacheAffinityMaxLanes: 2,
+	}))
+
+	h := NewHandler(&config.Config{}, filepath.Join(t.TempDir(), "config.yaml"), nil)
+	data, err := json.Marshal(map[string]claudeapipool.GlobalRuntimeStats{
+		"runtime-stats": h.claudeAPIPoolRuntimeStats(),
+	})
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
+	}
+	var decoded map[string]map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("decode stats json: %v", err)
+	}
+	stats, ok := decoded["runtime-stats"]
+	if !ok {
+		t.Fatalf("runtime-stats missing from %s", string(data))
+	}
+	plan, ok := stats["affinity_auto_plan"].(map[string]any)
+	if !ok {
+		t.Fatalf("affinity_auto_plan missing from %s", string(data))
+	}
+	if _, ok := plan["effective_lanes"]; !ok {
+		t.Fatalf("effective_lanes missing from plan %#v", plan)
+	}
+}
+
 func TestClaudeAPIPoolItemTestUsesSelectedAccount(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

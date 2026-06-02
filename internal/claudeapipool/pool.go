@@ -29,6 +29,15 @@ const (
 	// SimpleImportWorkspaceHeader is populated by apiKey-----workspaceId imports.
 	SimpleImportWorkspaceHeader = "anthropic-workspace-id"
 
+	AffinityAutoProfileCost       = "cost"
+	AffinityAutoProfileBalanced   = "balanced"
+	AffinityAutoProfileThroughput = "throughput"
+
+	AccountCapacityProfileConservative = "conservative"
+	AccountCapacityProfileStandard     = "standard"
+	AccountCapacityProfileAggressive   = "aggressive"
+	AccountCapacityProfileCustom       = "custom"
+
 	AttrPool       = "claude_api_pool"
 	AttrPosition   = "claude_api_pool_position"
 	AttrItemHash   = "claude_api_pool_item_hash"
@@ -83,46 +92,50 @@ type EffectiveVirtualCacheConfig struct {
 
 // RoutingConfig controls local pool routing pressure before an upstream call is made.
 type RoutingConfig struct {
-	PerAccountRPM           int  `yaml:"per-account-rpm,omitempty" json:"per-account-rpm,omitempty"`
-	PerAccountConcurrency   int  `yaml:"per-account-concurrency,omitempty" json:"per-account-concurrency,omitempty"`
-	MaxSwitches             int  `yaml:"max-switches,omitempty" json:"max-switches,omitempty"`
-	SwitchDelayMS           int  `yaml:"switch-delay-ms,omitempty" json:"switch-delay-ms,omitempty"`
-	RateLimitCooldownMS     int  `yaml:"rate-limit-cooldown-ms,omitempty" json:"rate-limit-cooldown-ms,omitempty"`
-	RateLimitMaxCooldownMS  int  `yaml:"rate-limit-max-cooldown-ms,omitempty" json:"rate-limit-max-cooldown-ms,omitempty"`
-	OverloadCooldownMS      int  `yaml:"overload-cooldown-ms,omitempty" json:"overload-cooldown-ms,omitempty"`
-	OverloadMaxCooldownMS   int  `yaml:"overload-max-cooldown-ms,omitempty" json:"overload-max-cooldown-ms,omitempty"`
-	SameAccountRetry429     int  `yaml:"same-account-retry-429,omitempty" json:"same-account-retry-429,omitempty"`
-	SameAccountRetry529     int  `yaml:"same-account-retry-529,omitempty" json:"same-account-retry-529,omitempty"`
-	SameAccountRetryDelayMS int  `yaml:"same-account-retry-delay-ms,omitempty" json:"same-account-retry-delay-ms,omitempty"`
-	CacheAffinityEnabled    bool `yaml:"cache-affinity-enabled,omitempty" json:"cache-affinity-enabled,omitempty"`
-	CacheAffinityAuto       bool `yaml:"cache-affinity-auto,omitempty" json:"cache-affinity-auto,omitempty"`
-	CacheAffinityMinTokens  int  `yaml:"cache-affinity-min-cache-tokens,omitempty" json:"cache-affinity-min-cache-tokens,omitempty"`
-	CacheAffinityLanes      int  `yaml:"cache-affinity-lanes,omitempty" json:"cache-affinity-lanes,omitempty"`
-	CacheAffinityMaxLanes   int  `yaml:"cache-affinity-max-lanes,omitempty" json:"cache-affinity-max-lanes,omitempty"`
-	CacheAffinityWaitMS     int  `yaml:"cache-affinity-wait-ms,omitempty" json:"cache-affinity-wait-ms,omitempty"`
-	CacheAffinityTTLMS      int  `yaml:"cache-affinity-ttl-ms,omitempty" json:"cache-affinity-ttl-ms,omitempty"`
+	PerAccountRPM            int    `yaml:"per-account-rpm,omitempty" json:"per-account-rpm,omitempty"`
+	PerAccountConcurrency    int    `yaml:"per-account-concurrency,omitempty" json:"per-account-concurrency,omitempty"`
+	MaxSwitches              int    `yaml:"max-switches,omitempty" json:"max-switches,omitempty"`
+	SwitchDelayMS            int    `yaml:"switch-delay-ms,omitempty" json:"switch-delay-ms,omitempty"`
+	RateLimitCooldownMS      int    `yaml:"rate-limit-cooldown-ms,omitempty" json:"rate-limit-cooldown-ms,omitempty"`
+	RateLimitMaxCooldownMS   int    `yaml:"rate-limit-max-cooldown-ms,omitempty" json:"rate-limit-max-cooldown-ms,omitempty"`
+	OverloadCooldownMS       int    `yaml:"overload-cooldown-ms,omitempty" json:"overload-cooldown-ms,omitempty"`
+	OverloadMaxCooldownMS    int    `yaml:"overload-max-cooldown-ms,omitempty" json:"overload-max-cooldown-ms,omitempty"`
+	SameAccountRetry429      int    `yaml:"same-account-retry-429,omitempty" json:"same-account-retry-429,omitempty"`
+	SameAccountRetry529      int    `yaml:"same-account-retry-529,omitempty" json:"same-account-retry-529,omitempty"`
+	SameAccountRetryDelayMS  int    `yaml:"same-account-retry-delay-ms,omitempty" json:"same-account-retry-delay-ms,omitempty"`
+	CacheAffinityEnabled     bool   `yaml:"cache-affinity-enabled,omitempty" json:"cache-affinity-enabled,omitempty"`
+	CacheAffinityAuto        bool   `yaml:"cache-affinity-auto,omitempty" json:"cache-affinity-auto,omitempty"`
+	CacheAffinityAutoProfile string `yaml:"cache-affinity-auto-profile,omitempty" json:"cache-affinity-auto-profile,omitempty"`
+	AccountCapacityProfile   string `yaml:"account-capacity-profile,omitempty" json:"account-capacity-profile,omitempty"`
+	CacheAffinityMinTokens   int    `yaml:"cache-affinity-min-cache-tokens,omitempty" json:"cache-affinity-min-cache-tokens,omitempty"`
+	CacheAffinityLanes       int    `yaml:"cache-affinity-lanes,omitempty" json:"cache-affinity-lanes,omitempty"`
+	CacheAffinityMaxLanes    int    `yaml:"cache-affinity-max-lanes,omitempty" json:"cache-affinity-max-lanes,omitempty"`
+	CacheAffinityWaitMS      int    `yaml:"cache-affinity-wait-ms,omitempty" json:"cache-affinity-wait-ms,omitempty"`
+	CacheAffinityTTLMS       int    `yaml:"cache-affinity-ttl-ms,omitempty" json:"cache-affinity-ttl-ms,omitempty"`
 }
 
 // EffectiveRoutingConfig is the fully-defaulted runtime routing policy.
 type EffectiveRoutingConfig struct {
-	PerAccountRPM           int  `json:"per_account_rpm"`
-	PerAccountConcurrency   int  `json:"per_account_concurrency"`
-	MaxSwitches             int  `json:"max_switches"`
-	SwitchDelayMS           int  `json:"switch_delay_ms"`
-	RateLimitCooldownMS     int  `json:"rate_limit_cooldown_ms"`
-	RateLimitMaxCooldownMS  int  `json:"rate_limit_max_cooldown_ms"`
-	OverloadCooldownMS      int  `json:"overload_cooldown_ms"`
-	OverloadMaxCooldownMS   int  `json:"overload_max_cooldown_ms"`
-	SameAccountRetry429     int  `json:"same_account_retry_429"`
-	SameAccountRetry529     int  `json:"same_account_retry_529"`
-	SameAccountRetryDelayMS int  `json:"same_account_retry_delay_ms"`
-	CacheAffinityEnabled    bool `json:"cache_affinity_enabled"`
-	CacheAffinityAuto       bool `json:"cache_affinity_auto"`
-	CacheAffinityMinTokens  int  `json:"cache_affinity_min_cache_tokens"`
-	CacheAffinityLanes      int  `json:"cache_affinity_lanes"`
-	CacheAffinityMaxLanes   int  `json:"cache_affinity_max_lanes"`
-	CacheAffinityWaitMS     int  `json:"cache_affinity_wait_ms"`
-	CacheAffinityTTLMS      int  `json:"cache_affinity_ttl_ms"`
+	PerAccountRPM            int    `json:"per_account_rpm"`
+	PerAccountConcurrency    int    `json:"per_account_concurrency"`
+	MaxSwitches              int    `json:"max_switches"`
+	SwitchDelayMS            int    `json:"switch_delay_ms"`
+	RateLimitCooldownMS      int    `json:"rate_limit_cooldown_ms"`
+	RateLimitMaxCooldownMS   int    `json:"rate_limit_max_cooldown_ms"`
+	OverloadCooldownMS       int    `json:"overload_cooldown_ms"`
+	OverloadMaxCooldownMS    int    `json:"overload_max_cooldown_ms"`
+	SameAccountRetry429      int    `json:"same_account_retry_429"`
+	SameAccountRetry529      int    `json:"same_account_retry_529"`
+	SameAccountRetryDelayMS  int    `json:"same_account_retry_delay_ms"`
+	CacheAffinityEnabled     bool   `json:"cache_affinity_enabled"`
+	CacheAffinityAuto        bool   `json:"cache_affinity_auto"`
+	CacheAffinityAutoProfile string `json:"cache_affinity_auto_profile"`
+	AccountCapacityProfile   string `json:"account_capacity_profile"`
+	CacheAffinityMinTokens   int    `json:"cache_affinity_min_cache_tokens"`
+	CacheAffinityLanes       int    `json:"cache_affinity_lanes"`
+	CacheAffinityMaxLanes    int    `json:"cache_affinity_max_lanes"`
+	CacheAffinityWaitMS      int    `json:"cache_affinity_wait_ms"`
+	CacheAffinityTTLMS       int    `json:"cache_affinity_ttl_ms"`
 }
 
 // Defaults contains pool-level values inherited by every item.
@@ -402,6 +415,8 @@ func normalizeVirtualCacheMode(mode string) string {
 
 // NormalizeRoutingConfig clamps file-backed pool routing settings.
 func NormalizeRoutingConfig(cfg RoutingConfig) RoutingConfig {
+	cfg.CacheAffinityAutoProfile = normalizeAffinityAutoProfile(cfg.CacheAffinityAutoProfile)
+	cfg.AccountCapacityProfile = normalizeAccountCapacityProfile(cfg.AccountCapacityProfile)
 	if cfg.PerAccountRPM < 0 {
 		cfg.PerAccountRPM = 0
 	}
@@ -453,9 +468,57 @@ func NormalizeRoutingConfig(cfg RoutingConfig) RoutingConfig {
 	return cfg
 }
 
+func normalizeAffinityAutoProfile(profile string) string {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case AffinityAutoProfileCost:
+		return AffinityAutoProfileCost
+	case AffinityAutoProfileBalanced:
+		return AffinityAutoProfileBalanced
+	case AffinityAutoProfileThroughput:
+		return AffinityAutoProfileThroughput
+	default:
+		return ""
+	}
+}
+
+func normalizeAccountCapacityProfile(profile string) string {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case AccountCapacityProfileConservative:
+		return AccountCapacityProfileConservative
+	case AccountCapacityProfileStandard:
+		return AccountCapacityProfileStandard
+	case AccountCapacityProfileAggressive:
+		return AccountCapacityProfileAggressive
+	case AccountCapacityProfileCustom:
+		return AccountCapacityProfileCustom
+	default:
+		return ""
+	}
+}
+
 // EffectiveRouting returns the runtime routing policy with defaults applied.
 func EffectiveRouting(cfg RoutingConfig) EffectiveRoutingConfig {
 	cfg = NormalizeRoutingConfig(cfg)
+	perAccountRPM := cfg.PerAccountRPM
+	perAccountConcurrency := cfg.PerAccountConcurrency
+	if cfg.CacheAffinityAuto && cfg.AccountCapacityProfile != "" && cfg.AccountCapacityProfile != AccountCapacityProfileCustom {
+		perAccountRPM, perAccountConcurrency = defaultCapacityForProfile(cfg.AccountCapacityProfile)
+	}
+	maxSwitches := cfg.MaxSwitches
+	switchDelayMS := cfg.SwitchDelayMS
+	cacheAffinityWaitMS := cfg.CacheAffinityWaitMS
+	if cfg.CacheAffinityAuto && cfg.CacheAffinityAutoProfile != "" {
+		defaultSwitches, defaultSwitchDelayMS, defaultAffinityWaitMS := defaultRouteFallbackForProfile(cfg.CacheAffinityAutoProfile)
+		if maxSwitches <= 0 {
+			maxSwitches = defaultSwitches
+		}
+		if switchDelayMS <= 0 {
+			switchDelayMS = defaultSwitchDelayMS
+		}
+		if cacheAffinityWaitMS <= 0 {
+			cacheAffinityWaitMS = defaultAffinityWaitMS
+		}
+	}
 	rateLimitCooldownMS := cfg.RateLimitCooldownMS
 	if rateLimitCooldownMS <= 0 {
 		rateLimitCooldownMS = int(time.Second / time.Millisecond)
@@ -488,16 +551,15 @@ func EffectiveRouting(cfg RoutingConfig) EffectiveRoutingConfig {
 	}
 	cacheAffinityLanes := cfg.CacheAffinityLanes
 	if cacheAffinityLanes <= 0 {
-		cacheAffinityLanes = 2
+		cacheAffinityLanes = 1
 	}
 	cacheAffinityMaxLanes := cfg.CacheAffinityMaxLanes
 	if cacheAffinityMaxLanes <= 0 {
-		cacheAffinityMaxLanes = 4
+		cacheAffinityMaxLanes = 2
 	}
 	if cacheAffinityMaxLanes < cacheAffinityLanes {
 		cacheAffinityMaxLanes = cacheAffinityLanes
 	}
-	cacheAffinityWaitMS := cfg.CacheAffinityWaitMS
 	if cacheAffinityWaitMS <= 0 {
 		cacheAffinityWaitMS = 250
 	}
@@ -506,48 +568,74 @@ func EffectiveRouting(cfg RoutingConfig) EffectiveRoutingConfig {
 		cacheAffinityTTLMS = int((5 * time.Minute) / time.Millisecond)
 	}
 	return EffectiveRoutingConfig{
-		PerAccountRPM:           cfg.PerAccountRPM,
-		PerAccountConcurrency:   cfg.PerAccountConcurrency,
-		MaxSwitches:             cfg.MaxSwitches,
-		SwitchDelayMS:           cfg.SwitchDelayMS,
-		RateLimitCooldownMS:     rateLimitCooldownMS,
-		RateLimitMaxCooldownMS:  rateLimitMaxCooldownMS,
-		OverloadCooldownMS:      overloadCooldownMS,
-		OverloadMaxCooldownMS:   overloadMaxCooldownMS,
-		SameAccountRetry429:     cfg.SameAccountRetry429,
-		SameAccountRetry529:     cfg.SameAccountRetry529,
-		SameAccountRetryDelayMS: sameAccountRetryDelayMS,
-		CacheAffinityEnabled:    cfg.CacheAffinityEnabled,
-		CacheAffinityAuto:       cfg.CacheAffinityAuto,
-		CacheAffinityMinTokens:  cacheAffinityMinTokens,
-		CacheAffinityLanes:      cacheAffinityLanes,
-		CacheAffinityMaxLanes:   cacheAffinityMaxLanes,
-		CacheAffinityWaitMS:     cacheAffinityWaitMS,
-		CacheAffinityTTLMS:      cacheAffinityTTLMS,
+		PerAccountRPM:            perAccountRPM,
+		PerAccountConcurrency:    perAccountConcurrency,
+		MaxSwitches:              maxSwitches,
+		SwitchDelayMS:            switchDelayMS,
+		RateLimitCooldownMS:      rateLimitCooldownMS,
+		RateLimitMaxCooldownMS:   rateLimitMaxCooldownMS,
+		OverloadCooldownMS:       overloadCooldownMS,
+		OverloadMaxCooldownMS:    overloadMaxCooldownMS,
+		SameAccountRetry429:      cfg.SameAccountRetry429,
+		SameAccountRetry529:      cfg.SameAccountRetry529,
+		SameAccountRetryDelayMS:  sameAccountRetryDelayMS,
+		CacheAffinityEnabled:     cfg.CacheAffinityEnabled,
+		CacheAffinityAuto:        cfg.CacheAffinityAuto,
+		CacheAffinityAutoProfile: cfg.CacheAffinityAutoProfile,
+		AccountCapacityProfile:   cfg.AccountCapacityProfile,
+		CacheAffinityMinTokens:   cacheAffinityMinTokens,
+		CacheAffinityLanes:       cacheAffinityLanes,
+		CacheAffinityMaxLanes:    cacheAffinityMaxLanes,
+		CacheAffinityWaitMS:      cacheAffinityWaitMS,
+		CacheAffinityTTLMS:       cacheAffinityTTLMS,
+	}
+}
+
+func defaultCapacityForProfile(profile string) (int, int) {
+	switch profile {
+	case AccountCapacityProfileConservative:
+		return 10, 2
+	case AccountCapacityProfileAggressive:
+		return 40, 6
+	default:
+		return 20, 3
+	}
+}
+
+func defaultRouteFallbackForProfile(profile string) (int, int, int) {
+	switch profile {
+	case AffinityAutoProfileCost:
+		return 4, 1000, 250
+	case AffinityAutoProfileThroughput:
+		return 8, 400, 120
+	default:
+		return 6, 700, 200
 	}
 }
 
 // RoutingConfigFromEffective converts an API view back to the file shape.
 func RoutingConfigFromEffective(cfg EffectiveRoutingConfig) RoutingConfig {
 	return NormalizeRoutingConfig(RoutingConfig{
-		PerAccountRPM:           cfg.PerAccountRPM,
-		PerAccountConcurrency:   cfg.PerAccountConcurrency,
-		MaxSwitches:             cfg.MaxSwitches,
-		SwitchDelayMS:           cfg.SwitchDelayMS,
-		RateLimitCooldownMS:     cfg.RateLimitCooldownMS,
-		RateLimitMaxCooldownMS:  cfg.RateLimitMaxCooldownMS,
-		OverloadCooldownMS:      cfg.OverloadCooldownMS,
-		OverloadMaxCooldownMS:   cfg.OverloadMaxCooldownMS,
-		SameAccountRetry429:     cfg.SameAccountRetry429,
-		SameAccountRetry529:     cfg.SameAccountRetry529,
-		SameAccountRetryDelayMS: cfg.SameAccountRetryDelayMS,
-		CacheAffinityEnabled:    cfg.CacheAffinityEnabled,
-		CacheAffinityAuto:       cfg.CacheAffinityAuto,
-		CacheAffinityMinTokens:  cfg.CacheAffinityMinTokens,
-		CacheAffinityLanes:      cfg.CacheAffinityLanes,
-		CacheAffinityMaxLanes:   cfg.CacheAffinityMaxLanes,
-		CacheAffinityWaitMS:     cfg.CacheAffinityWaitMS,
-		CacheAffinityTTLMS:      cfg.CacheAffinityTTLMS,
+		PerAccountRPM:            cfg.PerAccountRPM,
+		PerAccountConcurrency:    cfg.PerAccountConcurrency,
+		MaxSwitches:              cfg.MaxSwitches,
+		SwitchDelayMS:            cfg.SwitchDelayMS,
+		RateLimitCooldownMS:      cfg.RateLimitCooldownMS,
+		RateLimitMaxCooldownMS:   cfg.RateLimitMaxCooldownMS,
+		OverloadCooldownMS:       cfg.OverloadCooldownMS,
+		OverloadMaxCooldownMS:    cfg.OverloadMaxCooldownMS,
+		SameAccountRetry429:      cfg.SameAccountRetry429,
+		SameAccountRetry529:      cfg.SameAccountRetry529,
+		SameAccountRetryDelayMS:  cfg.SameAccountRetryDelayMS,
+		CacheAffinityEnabled:     cfg.CacheAffinityEnabled,
+		CacheAffinityAuto:        cfg.CacheAffinityAuto,
+		CacheAffinityAutoProfile: cfg.CacheAffinityAutoProfile,
+		AccountCapacityProfile:   cfg.AccountCapacityProfile,
+		CacheAffinityMinTokens:   cfg.CacheAffinityMinTokens,
+		CacheAffinityLanes:       cfg.CacheAffinityLanes,
+		CacheAffinityMaxLanes:    cfg.CacheAffinityMaxLanes,
+		CacheAffinityWaitMS:      cfg.CacheAffinityWaitMS,
+		CacheAffinityTTLMS:       cfg.CacheAffinityTTLMS,
 	})
 }
 
@@ -871,6 +959,13 @@ func DecodeImportFile(data []byte) (*File, error) {
 	if len(trimmed) == 0 {
 		return nil, fmt.Errorf("import body is empty")
 	}
+	if looksLikeSimpleImport(trimmed) {
+		doc, err := DecodeSimpleImportLines(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		return doc, nil
+	}
 	var doc File
 	if trimmed[0] == '[' {
 		var items []Item
@@ -899,6 +994,21 @@ func DecodeImportFile(data []byte) (*File, error) {
 		return nil, fmt.Errorf("import contains no items")
 	}
 	return &doc, nil
+}
+
+func looksLikeSimpleImport(data []byte) bool {
+	hasAccountLine := false
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.Contains(line, "-----") {
+			return false
+		}
+		hasAccountLine = true
+	}
+	return hasAccountLine
 }
 
 // DecodeSimpleImportLines accepts one apiKey-----workspaceId account per line.
