@@ -27,9 +27,15 @@ func (s *Service) SyncClaudeAPIPoolAuths(ctx context.Context) error {
 			if auth == nil || !claudeapipool.IsAttributesPoolAuth(auth.Attributes) {
 				continue
 			}
-			claudeapipool.DebugLogf("claude api pool sync delete disabled auth=%s", claudeapipool.DebugAuthRef(auth.ID))
+			disabled := auth.Clone()
+			disabled.Disabled = true
+			disabled.Status = coreauth.StatusDisabled
+			disabled.Unavailable = false
+			disabled.NextRetryAfter = time.Time{}
+			disabled.ModelStates = nil
+			claudeapipool.DebugLogf("claude api pool sync disable auth=%s", claudeapipool.DebugAuthRef(auth.ID))
 			claudeapipool.UnregisterAuthDebugLabel(auth.ID)
-			s.emitAuthUpdate(ctx, watcher.AuthUpdate{Action: watcher.AuthUpdateActionDelete, ID: auth.ID})
+			s.emitAuthUpdate(ctx, watcher.AuthUpdate{Action: watcher.AuthUpdateActionModify, ID: disabled.ID, Auth: disabled})
 		}
 		return nil
 	}
