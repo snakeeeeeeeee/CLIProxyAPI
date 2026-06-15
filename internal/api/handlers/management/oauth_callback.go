@@ -41,22 +41,31 @@ func (h *Handler) PostOAuthCallback(c *gin.Context) {
 	errMsg := strings.TrimSpace(req.Error)
 
 	if rawRedirect := strings.TrimSpace(req.RedirectURL); rawRedirect != "" {
-		u, errParse := url.Parse(rawRedirect)
-		if errParse != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid redirect_url"})
-			return
-		}
-		q := u.Query()
-		if state == "" {
-			state = strings.TrimSpace(q.Get("state"))
-		}
-		if code == "" {
-			code = strings.TrimSpace(q.Get("code"))
-		}
-		if errMsg == "" {
-			errMsg = strings.TrimSpace(q.Get("error"))
+		if parsedCode, parsedState, ok := parseManualClaudeCodeOAuthCode(rawRedirect); ok {
+			if code == "" {
+				code = parsedCode
+			}
+			if state == "" {
+				state = parsedState
+			}
+		} else {
+			u, errParse := url.Parse(rawRedirect)
+			if errParse != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid redirect_url"})
+				return
+			}
+			q := u.Query()
+			if state == "" {
+				state = strings.TrimSpace(q.Get("state"))
+			}
+			if code == "" {
+				code = strings.TrimSpace(q.Get("code"))
+			}
 			if errMsg == "" {
-				errMsg = strings.TrimSpace(q.Get("error_description"))
+				errMsg = strings.TrimSpace(q.Get("error"))
+				if errMsg == "" {
+					errMsg = strings.TrimSpace(q.Get("error_description"))
+				}
 			}
 		}
 	}
@@ -104,4 +113,21 @@ func (h *Handler) PostOAuthCallback(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func parseManualClaudeCodeOAuthCode(raw string) (code, state string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.Contains(raw, "://") {
+		return "", "", false
+	}
+	idx := strings.Index(raw, "#")
+	if idx <= 0 || idx == len(raw)-1 {
+		return "", "", false
+	}
+	code = strings.TrimSpace(raw[:idx])
+	state = strings.TrimSpace(raw[idx+1:])
+	if code == "" || state == "" || strings.ContainsAny(code, " \t\r\n") || strings.ContainsAny(state, " \t\r\n") {
+		return "", "", false
+	}
+	return code, state, true
 }

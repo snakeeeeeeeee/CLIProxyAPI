@@ -39,6 +39,7 @@ const (
 	AccountCapacityProfileCustom       = "custom"
 
 	AttrPool       = "claude_api_pool"
+	AttrOAuthPool  = "claude_oauth_pool"
 	AttrPosition   = "claude_api_pool_position"
 	AttrItemHash   = "claude_api_pool_item_hash"
 	AttrModelsJSON = "claude_api_pool_models_json"
@@ -118,6 +119,7 @@ type RoutingConfig struct {
 type EffectiveRoutingConfig struct {
 	PerAccountRPM            int    `json:"per_account_rpm"`
 	PerAccountConcurrency    int    `json:"per_account_concurrency"`
+	StickyBuffer             int    `json:"-"`
 	MaxSwitches              int    `json:"max_switches"`
 	SwitchDelayMS            int    `json:"switch_delay_ms"`
 	RateLimitCooldownMS      int    `json:"rate_limit_cooldown_ms"`
@@ -1092,6 +1094,14 @@ func IsAttributesPoolAuth(attrs map[string]string) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(attrs[AttrPool]), "true")
+}
+
+// IsAttributesClaudePoolAuth reports whether the attributes belong to any Claude pool auth.
+func IsAttributesClaudePoolAuth(attrs map[string]string) bool {
+	if len(attrs) == 0 {
+		return false
+	}
+	return IsAttributesPoolAuth(attrs) || strings.EqualFold(strings.TrimSpace(attrs[AttrOAuthPool]), "true")
 }
 
 // ReplaceItem replaces one one-based position guarded by item hash.

@@ -6,6 +6,8 @@ cli-proxy-api
 config.yaml
 claude-api-pool.yaml
 claude-api-pool.db*
+resource-pools.yaml
+resource-pools.db*
 .env
 
 # Generated content
@@ -24,6 +26,8 @@ objectstore/*
 
 # Static assets
 static/*
+web/*/dist/
+web/*/node_modules/
 
 # Authentication data
 auths/*

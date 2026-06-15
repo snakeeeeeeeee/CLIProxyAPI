@@ -31,6 +31,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/resourcepool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -1677,6 +1678,9 @@ func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
 		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(h.cfg.AuthDir)
 		}
+		if h.cfg.ResourcePools.Enabled {
+			store = resourcepool.NewAuthStore(store, h.configFilePath, h.cfg)
+		}
 	}
 	return store
 }
@@ -1709,6 +1713,13 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	pool := strings.TrimSpace(c.Query("pool"))
+	claudeCodePool := strings.EqualFold(pool, "claude-code")
+	loginProxyURL, bindProxyResourceID, errProxy := h.resolveClaudeCodeOAuthProxy(c)
+	if errProxy != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_proxy", "message": errProxy.Error()})
+		return
+	}
 
 	fmt.Println("Initializing Claude authentication...")
 
@@ -1729,10 +1740,13 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}
 
 	// Initialize Claude auth service
-	anthropicAuth := claude.NewClaudeAuth(h.cfg)
+	anthropicAuth := claude.NewClaudeAuthWithProxyURL(h.cfg, loginProxyURL)
 
-	// Generate authorization URL (then override redirect_uri to reuse server port)
+	// Generate authorization URL.
 	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
+	if claudeCodePool {
+		authURL, state, err = anthropicAuth.GenerateClaudeCodeAuthURL(state, pkceCodes)
+	}
 	if err != nil {
 		log.Errorf("Failed to generate authorization URL: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
@@ -1741,7 +1755,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 	RegisterOAuthSession(state, "anthropic")
 
-	isWebUI := isWebUIRequest(c)
+	isWebUI := isWebUIRequest(c) && !claudeCodePool
 	var forwarder *callbackForwarder
 	if isWebUI {
 		targetURL, errTarget := h.managementCallbackURL("/anthropic/callback")
@@ -1810,16 +1824,25 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			return
 		}
 
-		// Parse code (Claude may append state after '#')
-		rawCode := resultMap["code"]
-		code := strings.Split(rawCode, "#")[0]
+		rawCode := strings.TrimSpace(resultMap["code"])
+		code := rawCode
+		if !claudeCodePool {
+			// Legacy local callback flow may append state after '#'.
+			code = strings.Split(rawCode, "#")[0]
+		}
 
 		// Exchange code for tokens using internal auth service
-		bundle, errExchange := anthropicAuth.ExchangeCodeForTokens(ctx, code, state, pkceCodes)
+		var bundle *claude.ClaudeAuthBundle
+		var errExchange error
+		if claudeCodePool {
+			bundle, errExchange = anthropicAuth.ExchangeClaudeCodeCodeForTokens(ctx, code, resultMap["state"], pkceCodes)
+		} else {
+			bundle, errExchange = anthropicAuth.ExchangeCodeForTokens(ctx, code, state, pkceCodes)
+		}
 		if errExchange != nil {
 			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchange)
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
-			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
+			SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
 			return
 		}
 
@@ -1832,11 +1855,36 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			Storage:  tokenStorage,
 			Metadata: map[string]any{"email": tokenStorage.Email},
 		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
-			return
+		if claudeCodePool {
+			record.Metadata["resource_pool_account"] = true
+			record.Metadata["resource_pool_type"] = "claude-code"
+			if tokenStorage.OrganizationUUID != "" {
+				record.Metadata["org_uuid"] = tokenStorage.OrganizationUUID
+			}
+			if tokenStorage.AccountUUID != "" {
+				record.Metadata["account_uuid"] = tokenStorage.AccountUUID
+			}
+			if bindProxyResourceID != "" {
+				record.Metadata["proxy_resource_id"] = bindProxyResourceID
+			}
+		}
+		savedPath := ""
+		if claudeCodePool {
+			var errRegister error
+			savedPath, errRegister = h.saveClaudeCodeOAuthAccount(ctx, record, tokenStorage.Email, bindProxyResourceID)
+			if errRegister != nil {
+				log.Errorf("Failed to register Claude Code account pool entry: %v", errRegister)
+				SetOAuthSessionError(state, "Failed to register Claude Code account pool entry")
+				return
+			}
+		} else {
+			var errSave error
+			savedPath, errSave = h.saveTokenRecord(ctx, record)
+			if errSave != nil {
+				log.Errorf("Failed to save authentication tokens: %v", errSave)
+				SetOAuthSessionError(state, "Failed to save authentication tokens")
+				return
+			}
 		}
 
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
@@ -1849,6 +1897,108 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) resolveClaudeCodeOAuthProxy(c *gin.Context) (string, string, error) {
+	pool := strings.TrimSpace(c.Query("pool"))
+	if !strings.EqualFold(pool, "claude-code") {
+		return "", "", nil
+	}
+	mode := strings.ToLower(strings.TrimSpace(c.Query("login_proxy")))
+	proxyResourceID := strings.TrimSpace(c.Query("proxy_resource_id"))
+	if proxyResourceID == "" {
+		proxyResourceID = strings.TrimSpace(c.Query("login_proxy_resource_id"))
+	}
+	bindProxyResourceID := strings.TrimSpace(c.Query("bind_proxy_resource_id"))
+	bindExplicitNone := false
+	if bindProxyResourceID == "" {
+		bindProxyResourceID = proxyResourceID
+	} else if strings.EqualFold(bindProxyResourceID, "none") || strings.EqualFold(bindProxyResourceID, "unbound") {
+		bindProxyResourceID = ""
+		bindExplicitNone = true
+	}
+	if mode == "direct" {
+		return "direct", bindProxyResourceID, nil
+	}
+	h.mu.Lock()
+	cfg := h.cfg
+	configPath := h.configFilePath
+	h.mu.Unlock()
+	if cfg == nil || !cfg.ResourcePools.Enabled {
+		return "", "", fmt.Errorf("resource pools disabled")
+	}
+	store, err := resourcepool.Open(configPath, cfg)
+	if err != nil {
+		return "", "", err
+	}
+	defer closeResourcePoolStore(store)
+	ctx := c.Request.Context()
+	if mode == "auto" && proxyResourceID == "" {
+		available, err := store.ListAvailableProxies(ctx)
+		if err != nil {
+			return "", "", err
+		}
+		if len(available) == 0 {
+			return "", "", fmt.Errorf("no available proxy resources")
+		}
+		proxyResourceID = available[0].ID
+		if bindProxyResourceID == "" && !bindExplicitNone {
+			bindProxyResourceID = proxyResourceID
+		}
+	}
+	if proxyResourceID == "" {
+		return "", bindProxyResourceID, nil
+	}
+	proxy, err := store.GetProxy(ctx, proxyResourceID)
+	if err != nil {
+		return "", "", err
+	}
+	if !proxy.Enabled {
+		return "", "", fmt.Errorf("proxy resource is disabled")
+	}
+	if proxy.HealthStatus == resourcepool.HealthUnhealthy {
+		return "", "", fmt.Errorf("proxy resource is unhealthy")
+	}
+	return proxy.ProxyURL, bindProxyResourceID, nil
+}
+
+func (h *Handler) saveClaudeCodeOAuthAccount(ctx context.Context, record *coreauth.Auth, email, proxyResourceID string) (string, error) {
+	h.mu.Lock()
+	cfg := h.cfg
+	configPath := h.configFilePath
+	h.mu.Unlock()
+	if cfg == nil || !cfg.ResourcePools.Enabled {
+		return "", fmt.Errorf("resource pools disabled")
+	}
+	store, err := resourcepool.Open(configPath, cfg)
+	if err != nil {
+		return "", err
+	}
+	defer closeResourcePoolStore(store)
+	if record == nil {
+		return "", fmt.Errorf("auth record is nil")
+	}
+	if h.postAuthHook != nil {
+		if err := h.postAuthHook(ctx, record); err != nil {
+			return "", fmt.Errorf("post-auth hook failed: %w", err)
+		}
+	}
+	account, errRegister := store.RegisterClaudeCodeAccountWithAuth(ctx, record.ID, email, proxyResourceID, record)
+	if errRegister != nil {
+		return "", errRegister
+	}
+	if h.postAuthPersistHook != nil {
+		if errHook := h.postAuthPersistHook(ctx, record); errHook != nil {
+			return "resource-pools.db:" + record.ID, fmt.Errorf("post-auth persist hook failed: %w", errHook)
+		}
+	}
+	h.triggerConfigReload(ctx)
+	resourcepool.PublishAccountChanged(account.ID, "oauth")
+	if proxyResourceID != "" {
+		resourcepool.PublishProxyChanged(proxyResourceID, "bind")
+	}
+	resourcepool.PublishStatsChanged("account")
+	return "resource-pools.db:" + record.ID, nil
 }
 
 func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {

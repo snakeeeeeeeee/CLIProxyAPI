@@ -117,3 +117,200 @@
   - `/v1/models` returned `claude-opus-4-7`
   - one `/v1/messages` request reached upstream but returned `403 Request not allowed`
   - management stats showed affinity key/lanes and failure counters updated after the request
+
+## 2026-06-14
+- Started Resource Pools implementation for Claude Code OAuth accounts plus independent proxy pool.
+- Added `resource-pools` config entry with default `resource-pools.yaml` sanitizer in both file load and byte parsing paths.
+- Added `internal/resourcepool` with YAML initializer defaults, SQLite schema, proxy CRUD/import, available-proxy selector, Claude Code account registration, 1:1 proxy binding rules, account overlay lookup, and proxy health status persistence.
+- Added focused resourcepool tests for YAML import, proxy URL redaction, duplicate import skipping, available proxy filtering, one-to-one binding, and health failure threshold behavior.
+- Verified:
+  - `go test ./internal/resourcepool`
+- Added proxy health checker worker, management APIs, Claude OAuth account-pool registration, runtime auth overlay, Claude OAuth pool routing reuse, and the independent `/account-pool.html` Chinese console.
+- Added local ignored `resource-pools.yaml` and enabled the ignored local `config.yaml` entry so the page is available on the next local server start.
+- Added `.gitignore` entries for local `resource-pools.yaml` and `resource-pools.db*`; `resource-pools.example.yaml` remains the tracked template.
+- Verified the temporary local service with `/tmp/cliproxy-resource-pool-smoke/config.yaml`:
+  - `GET /healthz`
+  - `GET /v0/management/resource-pools/config`
+  - `GET /v0/management/proxy-pool/available`
+  - `POST /v0/management/proxy-pool/resources`
+  - `/account-pool.html` at 1440x900 and 375x812 with no page-level horizontal overflow.
+- Final verification:
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - `go test ./...`
+- Replaced the first embedded resource-pool console implementation with a maintainable standalone React/Vite/TypeScript/Tailwind/TanStack Query/Table source tree under `web/resource-console`.
+- The frontend build emits a single-file HTML artifact copied into `internal/resourcepool/console.html` for Go embed serving at `/account-pool.html`.
+- Upgraded the new frontend toolchain to Vite 8 / React plugin 6; `npm audit --audit-level=high` now reports 0 vulnerabilities.
+- Adjusted the proxy health checker to read its runtime health-check settings from SQLite after first-run YAML import, matching the DB-as-source-of-truth rule.
+- Adjusted resource pool list APIs to return empty arrays instead of JSON null for empty lists.
+- Re-verified:
+  - `npm run build` in `web/resource-console`
+  - `npm audit --audit-level=high` in `web/resource-console`
+  - `go test ./internal/resourcepool`
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - `go test ./...`
+- Browser smoke against a temporary local service:
+  - `/account-pool.html` loads at desktop and 375px mobile widths
+  - no page-level horizontal overflow on account or proxy views
+  - management APIs work with `X-Management-Key`
+- Added resource console shell routing and login integration:
+  - `/account-pool.html#/` is now a resource-pool launcher with separate Claude Code account pool and proxy IP pool entry cards.
+  - `/account-pool.html#/accounts` and `/account-pool.html#/proxies` deep-link to the two management pages.
+  - `/account-pool.html#/login` is the fallback login page when no local key is present or management APIs return 401/403.
+  - The console reads the existing Management Center `cli-proxy-auth` storage format, including the current lightweight obfuscation scheme, plus `managementKey` and the resource console's own storage key.
+  - Kept `/management.html` unchanged to avoid coupling resource-pool changes to the externally downloaded management panel bundle.
+- Re-verified after the shell routing/login update:
+  - `npm run build --prefix web/resource-console`
+  - `npm audit --audit-level=high --prefix web/resource-console`
+  - `go test ./internal/resourcepool`
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - `go test ./...`
+  - Python Playwright smoke on a temporary local service:
+    - no-key `/account-pool.html#/` redirects to `#/login`
+    - keyed `#/`, `#/accounts`, and `#/proxies` load expected Chinese page content
+    - 375px proxy page has no page-level horizontal overflow
+
+## 2026-06-15
+- Updated the resource console OAuth account flow to show a persistent Anthropic OAuth panel with generated URL, copy/open actions, manual callback URL submission, and short status polling through the existing management OAuth callback API.
+- Tightened resource console management-key discovery so no-key access initializes into the fallback login route instead of scanning arbitrary localStorage keys.
+- Verified frontend type-check and resource console production build after the OAuth wizard update.
+- Fixed the resource console mobile shell so the top navigation and management-key controls wrap vertically instead of creating page-level horizontal overflow.
+- Final verification for the OAuth wizard update:
+  - `npm run type-check --prefix web/resource-console`
+  - `npm run build --prefix web/resource-console`
+  - `npm audit --audit-level=high --prefix web/resource-console`
+  - `go test ./internal/resourcepool`
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - `go test ./...`
+  - Browser smoke against temporary local service: no-key `account-pool.html#` redirects to `#/login`; keyed account page opens; OAuth modal shows generated Anthropic URL, copy/open buttons, callback URL input, and submit callback button; 375px page has no horizontal overflow after cache-busted reload.
+- Started UX fix for proxy selection and proxy pool batch operations:
+  - Confirmed current OAuth flow used a native select for "指定代理", which cannot show status/latency cleanly.
+  - Chosen design: compact modal table for choosing available proxies, plus a proxy pool selection column and batch action bar backed by one batch API endpoint.
+- Finished proxy selection and batch operations update:
+  - Added `/v0/management/proxy-pool/batch` for test/enable/disable/unbind/delete.
+  - Replaced OAuth "指定代理" select with a modal table showing only available proxies, health status, latency, exit IP, and last test time.
+  - Reused the same compact proxy table in account binding.
+  - Added proxy pool row selection plus batch test/enable/disable/unbind/delete/clear actions.
+  - Rebuilt the embedded console HTML.
+- Verification:
+  - `npm run type-check --prefix web/resource-console`
+  - `npm run build --prefix web/resource-console`
+  - `go test ./internal/api/handlers/management ./internal/resourcepool`
+  - `go build -o test-output ./cmd/server && rm test-output`
+  - `go test ./...`
+  - Temporary local API smoke confirmed `/v0/management/proxy-pool/available` and `/v0/management/proxy-pool/batch`.
+  - Static embedded HTML check confirmed the new selector/batch UI text is present.
+  - Browser automation could not run because Playwright's bundled Chromium is not installed and system Chrome headless exits in this environment.
+- Started Claude Code Account Pool dedicated API/dashboard implementation:
+  - Target public API prefix is `/claude-acc-pool/v1`, separate from global `/v1`.
+  - Dedicated routes must only select `claude_oauth_pool=true` accounts.
+  - SQLite will store account-pool config, model aliases, and related dashboard controls.
+  - UI will stay in `web/resource-console` and keep the current data-dense operations dashboard style.
+- Continuing implementation after backend dedicated API/config/model/scoped-routing work:
+  - Backend management and public route changes are present in the working tree.
+  - Remaining work is the resource console API layer, dashboard UI, builds, and verification.
+- Added resource console API bindings and Claude Code account pool dashboard controls:
+  - Config/stats/models management endpoints.
+  - Public API info block, runtime metrics, base config, virtual cache, routing protection, model management, and account batch actions.
+  - `npm run type-check --prefix web/resource-console` passed.
+  - `npm run build --prefix web/resource-console` passed and refreshed `internal/resourcepool/console.html`.
+- Finished final verification for the dedicated API/dashboard update:
+  - Fixed `/account-pool.html` so it remains available when the old `/management.html` control panel is disabled; it still hides when Home mode is enabled.
+  - Added an API regression test for the independent resource console route.
+  - `npm run type-check --prefix web/resource-console` passed.
+  - `npm run build --prefix web/resource-console` passed and refreshed `internal/resourcepool/console.html`.
+- Implemented Claude Code Account Pool clean input token display mode:
+  - Added `usage.clean-input-tokens` config with default off and default estimated overhead of 1909 tokens.
+  - Added profile fingerprint generation covering built-in Claude Code profile, static prompt, billing template, headers, and betas.
+  - Added SQLite calibration table and store APIs keyed by `model + profile_fingerprint`.
+  - Added management APIs to list usage calibrations and manually calibrate a model with a minimal `count_tokens` request through a usable OAuth account.
+  - Added runtime auth overlay attributes for clean mode, fingerprint, default overhead, and calibrated overhead map.
+  - Added Claude response/SSE usage rewrite after virtual cache rewrite and before translation, scoped only to `claude_oauth_pool=true`.
+  - Added a resource-pool usage plugin so the Usage tab stores display-facing clean input token counts while internal reporter/quota/routing still see true upstream usage.
+  - Added resource console Config tab panel for the clean input token switch, fingerprint display, model calibration status, and per-model calibration action.
+  - Rebuilt embedded `internal/resourcepool/console.html`.
+- Verification:
+  - `go test ./internal/resourcepool ./internal/runtime/executor -run 'TestStoreUsageCalibrationAndAuthOverlay|TestStoreSavesClaudeCodePoolConfig|TestClaudeExecutor_CleanInputTokens|TestClaudeExecutor_ClaudeCodeAccountPoolUsesBuiltinFullProfile'`
+  - `go build -o test-output ./cmd/server && rm -f test-output`
+  - `npm run type-check --prefix web/resource-console`
+  - `npm run build --prefix web/resource-console`
+  - `go test ./...`
+  - `go build -o test-output ./cmd/server && rm test-output` passed.
+  - `go test ./internal/api ./internal/resourcepool ./sdk/cliproxy/auth ./internal/api/handlers/management` passed.
+  - `go test ./...` passed.
+  - Temporary smoke service confirmed `/account-pool.html`, `/claude-acc-pool/v1/models`, unknown alias 400, and unchanged `/v1/models`.
+  - Browser check confirmed account dashboard sections render and 375/768/1024/1440 widths have no page-level horizontal overflow.
+- Added SSE live-refresh for the resource console:
+  - New `/v0/management/resource-pools/events` SSE endpoint streams lightweight `proxy_changed`, `account_changed`, `model_changed`, `config_changed`, and `stats_changed` events.
+  - EventSource uses a query `key` only for this SSE route because browser EventSource cannot send `X-Management-Key`.
+  - Proxy health checks, proxy/account/model/config management mutations, and OAuth account registration now publish resource-pool events.
+  - Resource console invalidates matching TanStack Query caches on events while keeping the 30-second stats polling fallback.
+  - Added SSE handler test for query-key auth and event delivery.
+- Verification for SSE update:
+  - `npm run type-check --prefix web/resource-console` passed.
+  - `npm run build --prefix web/resource-console` passed and refreshed `internal/resourcepool/console.html`.
+  - `go test ./internal/resourcepool ./internal/api/handlers/management ./internal/api` passed.
+  - `go build -o test-output ./cmd/server && rm test-output` passed.
+  - `go test ./...` passed.
+- Improved Claude Code OAuth callback handling after a local callback retry issue:
+  - The resource console now auto-polls OAuth status after generating an Anthropic auth URL, so local browser redirects to `/anthropic/callback` can complete without manually submitting the same callback URL.
+  - Manual callback submission skips the extra POST when the pasted URL is already the local `/anthropic/callback` URL that the server should have received.
+  - Anthropic token exchange failures now keep the underlying error detail in the OAuth status instead of only returning `Failed to exchange authorization code for tokens`.
+- Verification for OAuth callback UX update:
+  - `npm run type-check --prefix web/resource-console` passed.
+  - `npm run build --prefix web/resource-console` passed and refreshed `internal/resourcepool/console.html`.
+  - `go test ./internal/api/handlers/management ./internal/api ./internal/resourcepool` passed.
+  - `go build -o test-output ./cmd/server && rm test-output` passed.
+  - `go test ./...` passed.
+- Added Claude Code account quota snapshots:
+  - Uses Anthropic OAuth usage endpoint with `Authorization: Bearer <access_token>` and `anthropic-beta: oauth-2025-04-20`.
+  - Stores latest per-account quota snapshot in `resource-pools.db` table `claude_code_account_quota`.
+  - Adds manual refresh API `POST /v0/management/claude-code-account-pool/accounts/:id/quota/refresh`.
+  - Adds batch action `refresh-quota` for selected Claude Code accounts.
+  - Adds a background quota refresher controlled by `account-quota` in `resource-pools.yaml`, defaulting to enabled, `5m`, concurrency `2`.
+  - Resource console now shows quota windows on account cards and a compact quota column in the troubleshooting table.
+  - Plan/billing expiry is still not implemented because the OAuth usage endpoint does not expose it.
+- Verification for quota update:
+  - `npm run type-check --prefix web/resource-console` passed.
+  - `npm run build --prefix web/resource-console` passed and refreshed `internal/resourcepool/console.html`.
+  - `go test ./internal/resourcepool ./internal/api/handlers/management ./internal/api` passed.
+  - `go build -o test-output ./cmd/server && rm test-output` passed.
+- Continued Claude Code pure account pool enhancement phases 1-3:
+  - Added default Claude Code profile `2.1.177`, SQLite-backed profile config, auth overlay attributes, and dedicated account-pool executor body/header injection.
+  - Added SQLite tables and store APIs for per-account capacity, model-level health, routing events, and usage ledger summary.
+  - Added management APIs for profile, capacity, model status, routing events, and usage summary.
+  - Added runtime result hook for dedicated account-pool observability.
+  - Fixed a SQLite single-connection deadlock by hydrating account runtime data only after query rows are closed.
+  - Verification so far:
+    - `go test ./internal/resourcepool` passed.
+    - `go test ./internal/api/handlers/management ./sdk/cliproxy/auth ./internal/runtime/executor ./internal/api` passed.
+  - `go test ./...` passed.
+- Started sub2api comparison for Claude OAuth/account testing:
+  - User reported sub2api accepts pasted Claude OAuth code in `code#state` form and can test higher-end models while the new account pool sees Anthropic `rate_limit_error` for Opus/Sonnet.
+  - Investigation target is OAuth code parsing/token exchange and the actual Claude Code request shape used for account/model tests.
+- Finished sub2api alignment fixes for Claude Code account pool:
+  - Claude Code account-pool OAuth now uses the platform callback style (`https://platform.claude.com/oauth/code/callback`) and token endpoint (`https://platform.claude.com/v1/oauth/token`) instead of the legacy local callback OAuth constants.
+  - Manual OAuth callback submission now accepts either a full callback URL or the compact `code#state` form.
+  - OAuth token metadata now preserves `org_uuid` and `account_uuid`; refresh paths keep these fields when returned.
+  - New Claude Code account pool identities now generate Claude Code legacy `metadata.user_id` format instead of plain UUIDs.
+  - Management account tests and model fetching now set Claude Code-style headers/betas and the test body includes the Claude Code system prompt plus `metadata.user_id`.
+  - Resource console copy now asks for "回调 URL 或 code#state" and no longer implies the account-pool flow will auto-return to localhost.
+- Verification:
+  - `npm run type-check --prefix web/resource-console` passed.
+  - `npm run build --prefix web/resource-console` passed and refreshed `internal/resourcepool/console.html`.
+  - `go test ./internal/auth/claude ./internal/api/handlers/management ./internal/resourcepool` passed.
+  - `go build -o test-output ./cmd/server && rm test-output` passed.
+  - `go test ./...` passed.
+
+- Completed Claude Code pure account pool enhancement phases 1-3:
+  - Added Claude Code request-shape profile storage and runtime injection for the dedicated `/claude-acc-pool/v1` path, including CLI-like headers, beta list, billing/system blocks, and account-bound `metadata.user_id`.
+  - Added per-account capacity settings, model-level health snapshots, sticky buffer routing behavior, routing events, and lightweight usage ledger statistics for observability only.
+  - Added resource console sections for Claude Code profile, capacity/model health, routing events, and usage ledger while keeping the UI Chinese and separate from `/management.html`.
+  - Confirmed sticky buffer now affects routing: ordinary requests stay on base concurrency/RPM limits while sticky/affinity requests may use the configured buffer.
+- Verification for Claude Code pure account pool enhancement:
+  - `npm run type-check --prefix web/resource-console` passed.
+  - `npm run build --prefix web/resource-console` passed and refreshed `internal/resourcepool/console.html`.
+  - `go build -o test-output ./cmd/server && rm -f test-output` passed.
+  - `go test ./internal/claudeapipool ./sdk/cliproxy/auth` passed after sticky-buffer routing coverage.
+  - `go test ./internal/resourcepool ./internal/runtime/executor ./internal/api/handlers/management ./internal/api` passed.
+  - `go test ./...` passed.
+  - Temporary local smoke service on `127.0.0.1:18317` returned 200 for `/account-pool.html`, `/v0/management/resource-pools/config`, `/v0/management/claude-code-account-pool/profile`, and `/claude-acc-pool/v1/models`; the service was stopped afterward.

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/resourcepool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -105,5 +106,56 @@ func (s *Service) SyncClaudeAPIPoolAuths(ctx context.Context) error {
 		rt.CacheAffinityLanes,
 		rt.CacheAffinityMaxLanes,
 	)
+	return nil
+}
+
+// SyncResourcePoolAuths reloads SQLite-backed Claude Code account-pool auths
+// and applies the resulting runtime auths.
+func (s *Service) SyncResourcePoolAuths(ctx context.Context) error {
+	if s == nil || s.coreManager == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	configPath := s.configPath
+	s.cfgMu.RUnlock()
+	if cfg == nil || !cfg.ResourcePools.Enabled {
+		for _, auth := range s.coreManager.List() {
+			if auth == nil || !resourcepool.IsClaudeCodeAccountPoolAuth(auth.Attributes) {
+				continue
+			}
+			s.emitAuthUpdate(ctx, watcher.AuthUpdate{Action: watcher.AuthUpdateActionDelete, ID: auth.ID})
+		}
+		return nil
+	}
+	auths, err := resourcepool.ListStoredAuths(ctx, configPath, cfg)
+	if err != nil {
+		return err
+	}
+	next := make(map[string]*coreauth.Auth, len(auths))
+	for _, auth := range auths {
+		if auth == nil || auth.ID == "" {
+			continue
+		}
+		next[auth.ID] = auth
+	}
+	for _, auth := range s.coreManager.List() {
+		if auth == nil || !resourcepool.IsClaudeCodeAccountPoolAuth(auth.Attributes) {
+			continue
+		}
+		if _, ok := next[auth.ID]; !ok {
+			s.emitAuthUpdate(ctx, watcher.AuthUpdate{Action: watcher.AuthUpdateActionDelete, ID: auth.ID})
+		}
+	}
+	for _, auth := range next {
+		action := watcher.AuthUpdateActionAdd
+		if _, ok := s.coreManager.GetByID(auth.ID); ok {
+			action = watcher.AuthUpdateActionModify
+		}
+		s.emitAuthUpdate(ctx, watcher.AuthUpdate{Action: action, ID: auth.ID, Auth: auth})
+	}
 	return nil
 }

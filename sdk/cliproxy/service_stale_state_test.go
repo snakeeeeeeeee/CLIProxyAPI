@@ -2,11 +2,15 @@ package cliproxy
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/resourcepool"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
@@ -145,5 +149,87 @@ func TestSyncClaudeAPIPoolAuths_DisabledPoolRemovesRuntimePoolAuths(t *testing.T
 	}
 	if gotLegacy.Disabled || gotLegacy.Status == coreauth.StatusDisabled {
 		t.Fatalf("legacy auth should not be disabled, got disabled=%v status=%s", gotLegacy.Disabled, gotLegacy.Status)
+	}
+}
+
+func TestSyncResourcePoolAuthsUpdatesCleanInputRuntimeAttributes(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	initPath := filepath.Join(dir, "resource-pools.yaml")
+	if err := os.WriteFile(initPath, []byte("database-path: resource-pools.db\n"), 0o600); err != nil {
+		t.Fatalf("write resource-pools.yaml: %v", err)
+	}
+	cfg := &internalconfig.Config{
+		ResourcePools: internalconfig.ResourcePoolsConfig{
+			Enabled:    true,
+			ConfigFile: "resource-pools.yaml",
+		},
+	}
+	service := &Service{
+		cfg:         cfg,
+		configPath:  configPath,
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	ctx := context.Background()
+	store, err := resourcepool.Open(configPath, cfg)
+	if err != nil {
+		t.Fatalf("open resource pool store: %v", err)
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+	auth := &coreauth.Auth{
+		ID:       "claude-user@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":         "claude",
+			"email":        "user@example.com",
+			"access_token": "access-token",
+		},
+	}
+	if _, err := store.RegisterClaudeCodeAccountWithAuth(ctx, auth.ID, "user@example.com", "", auth); err != nil {
+		t.Fatalf("register account: %v", err)
+	}
+	cleanDisabled := false
+	if _, err := store.SaveClaudeCodePoolConfig(ctx, resourcepool.ClaudeCodePoolConfig{
+		Usage: resourcepool.ClaudeCodeUsageConfig{CleanInputTokens: &cleanDisabled},
+	}); err != nil {
+		t.Fatalf("save disabled config: %v", err)
+	}
+	if err := service.SyncResourcePoolAuths(ctx); err != nil {
+		t.Fatalf("initial SyncResourcePoolAuths() error = %v", err)
+	}
+	runtimeAuth, ok := service.coreManager.GetByID(auth.ID)
+	if !ok || runtimeAuth == nil {
+		t.Fatalf("runtime auth %q not found", auth.ID)
+	}
+	if got := runtimeAuth.Attributes[resourcepool.AttrCleanInputTokens]; got != "false" {
+		t.Fatalf("initial clean input attr = %q, want false", got)
+	}
+
+	cleanEnabled := true
+	if _, err := store.SaveClaudeCodePoolConfig(ctx, resourcepool.ClaudeCodePoolConfig{
+		Usage: resourcepool.ClaudeCodeUsageConfig{
+			CleanInputTokens:           &cleanEnabled,
+			SystemPromptOverheadTokens: 1909,
+		},
+	}); err != nil {
+		t.Fatalf("save enabled config: %v", err)
+	}
+	if err := service.SyncResourcePoolAuths(ctx); err != nil {
+		t.Fatalf("second SyncResourcePoolAuths() error = %v", err)
+	}
+	runtimeAuth, ok = service.coreManager.GetByID(auth.ID)
+	if !ok || runtimeAuth == nil {
+		t.Fatalf("runtime auth %q not found after sync", auth.ID)
+	}
+	if got := runtimeAuth.Attributes[resourcepool.AttrCleanInputTokens]; got != "true" {
+		t.Fatalf("clean input attr = %q, want true", got)
+	}
+	if got := runtimeAuth.Attributes[resourcepool.AttrCleanInputDefaultOverhead]; got != "1909" {
+		t.Fatalf("default overhead attr = %q, want 1909", got)
+	}
+	if got := runtimeAuth.Attributes[resourcepool.AttrProfileFingerprint]; got == "" {
+		t.Fatal("profile fingerprint attr is empty")
 	}
 }

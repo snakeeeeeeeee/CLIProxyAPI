@@ -336,6 +336,11 @@ func snapshotCoreAuths(cfg *config.Config, configPath string, authDir string, pa
 		out = append(out, auths...)
 	}
 
+	resourcePoolSynth := synthesizer.NewResourcePoolSynthesizer()
+	if auths, err := resourcePoolSynth.Synthesize(ctx); err == nil {
+		out = append(out, auths...)
+	}
+
 	fileSynth := synthesizer.NewFileSynthesizer()
 	if auths, err := fileSynth.Synthesize(ctx); err == nil {
 		out = append(out, auths...)

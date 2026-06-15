@@ -12,10 +12,12 @@ import (
 	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/resourcepool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
@@ -227,6 +229,9 @@ func (b *Builder) Build() (*Service, error) {
 	coreManager := b.coreManager
 	if coreManager == nil {
 		tokenStore := sdkAuth.GetTokenStore()
+		if b.cfg != nil && b.cfg.ResourcePools.Enabled {
+			tokenStore = resourcepool.NewAuthStore(tokenStore, b.configPath, b.cfg)
+		}
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
 			dirSetter.SetBaseDir(b.cfg.AuthDir)
 		}
@@ -260,7 +265,12 @@ func (b *Builder) Build() (*Service, error) {
 			})
 		}
 
-		coreManager = coreauth.NewManager(tokenStore, selector, nil)
+		var hook coreauth.Hook
+		if b.cfg != nil && b.cfg.ResourcePools.Enabled {
+			hook = resourcepool.RuntimeHook{ConfigPath: b.configPath, Config: b.cfg}
+			usage.RegisterNamedPlugin("resourcepool:claude-code-usage-ledger", resourcepool.UsagePlugin{ConfigPath: b.configPath, Config: b.cfg})
+		}
+		coreManager = coreauth.NewManager(tokenStore, selector, hook)
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())

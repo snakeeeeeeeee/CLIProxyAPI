@@ -1,5 +1,7 @@
 package helps
 
+import "strings"
+
 // Claude Code system prompt static sections (extracted from Claude Code v2.1.63).
 // These sections are sent as system[] blocks to Anthropic's API.
 // The structure and content must match real Claude Code to pass server-side validation.
@@ -63,3 +65,14 @@ If you can say it in one sentence, don't use three. Prefer short, direct sentenc
 // ClaudeCodeSystemReminderSection corresponds to getSystemRemindersSection() in prompts.ts.
 const ClaudeCodeSystemReminderSection = `- Tool results and user messages may include <system-reminder> tags. <system-reminder> tags contain useful information and reminders. They are automatically added by the system, and bear no direct relation to the specific tool results or user messages in which they appear.
 - The conversation has unlimited context through automatic summarization.`
+
+// ClaudeCodeStaticPrompt returns the built-in static Claude Code prompt block.
+func ClaudeCodeStaticPrompt() string {
+	return strings.Join([]string{
+		ClaudeCodeIntro,
+		ClaudeCodeSystem,
+		ClaudeCodeDoingTasks,
+		ClaudeCodeToneAndStyle,
+		ClaudeCodeOutputEfficiency,
+	}, "\n\n")
+}

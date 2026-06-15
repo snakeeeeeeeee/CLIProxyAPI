@@ -15,6 +15,8 @@ const (
 
 var defaultRouting = newPoolRouter()
 var defaultRoutingPolicy = EffectiveRouting(RoutingConfig{})
+var scopedRouters = map[string]*poolRouter{}
+var scopedRoutingPolicies = map[string]EffectiveRoutingConfig{}
 
 var routingPolicyMu sync.RWMutex
 
@@ -85,14 +87,98 @@ func CurrentRoutingConfig() EffectiveRoutingConfig {
 	return defaultRoutingPolicy
 }
 
+// SetScopedRoutingConfig updates a named pool routing policy without affecting the default pool.
+func SetScopedRoutingConfig(scope string, cfg EffectiveRoutingConfig) {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		SetRoutingConfig(cfg)
+		return
+	}
+	routingPolicyMu.Lock()
+	defer routingPolicyMu.Unlock()
+	if scopedRouters == nil {
+		scopedRouters = make(map[string]*poolRouter)
+	}
+	if scopedRouters[scope] == nil {
+		scopedRouters[scope] = newPoolRouter()
+	}
+	if scopedRoutingPolicies == nil {
+		scopedRoutingPolicies = make(map[string]EffectiveRoutingConfig)
+	}
+	scopedRoutingPolicies[scope] = normalizeEffectiveRoutingConfig(cfg)
+}
+
+// CurrentScopedRoutingConfig returns a named pool policy, falling back to the default pool policy.
+func CurrentScopedRoutingConfig(scope string) EffectiveRoutingConfig {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return CurrentRoutingConfig()
+	}
+	routingPolicyMu.RLock()
+	defer routingPolicyMu.RUnlock()
+	if scopedRoutingPolicies != nil {
+		if cfg, ok := scopedRoutingPolicies[scope]; ok {
+			return cfg
+		}
+	}
+	return defaultRoutingPolicy
+}
+
+func scopedRouterAndPolicy(scope string) (*poolRouter, EffectiveRoutingConfig) {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return defaultRouting, CurrentRoutingConfig()
+	}
+	routingPolicyMu.RLock()
+	router := scopedRouters[scope]
+	policy, ok := scopedRoutingPolicies[scope]
+	routingPolicyMu.RUnlock()
+	if router != nil && ok {
+		return router, policy
+	}
+	return defaultRouting, CurrentRoutingConfig()
+}
+
 // TryAcquireRoute reserves local capacity for one upstream pool request.
 func TryAcquireRoute(authID, model string) (*RouteLease, bool) {
-	return defaultRouting.tryAcquire(authID, model, CurrentRoutingConfig(), time.Now())
+	return defaultRouting.tryAcquire(authID, model, CurrentRoutingConfig(), false, time.Now())
+}
+
+// TryAcquireScopedRoute reserves local capacity for a named pool request.
+func TryAcquireScopedRoute(scope, authID, model string) (*RouteLease, bool) {
+	router, policy := scopedRouterAndPolicy(scope)
+	return router.tryAcquire(authID, model, policy, false, time.Now())
+}
+
+// TryAcquireScopedRouteWithPolicy reserves local capacity using a per-auth policy override.
+func TryAcquireScopedRouteWithPolicy(scope, authID, model string, override EffectiveRoutingConfig) (*RouteLease, bool) {
+	return TryAcquireScopedRouteWithPolicyOptions(scope, authID, model, override, false)
+}
+
+// TryAcquireScopedRouteWithPolicyOptions reserves local capacity with optional sticky buffer usage.
+func TryAcquireScopedRouteWithPolicyOptions(scope, authID, model string, override EffectiveRoutingConfig, sticky bool) (*RouteLease, bool) {
+	router, policy := scopedRouterAndPolicy(scope)
+	if override.PerAccountRPM > 0 {
+		policy.PerAccountRPM = override.PerAccountRPM
+	}
+	if override.PerAccountConcurrency > 0 {
+		policy.PerAccountConcurrency = override.PerAccountConcurrency
+	}
+	if override.StickyBuffer > 0 {
+		policy.StickyBuffer = override.StickyBuffer
+	}
+	return router.tryAcquire(authID, model, policy, sticky, time.Now())
 }
 
 // NoteRouteResult updates local pool routing state from an upstream status.
 func NoteRouteResult(authID, model string, statusCode int, retryAfter *time.Duration) {
 	defaultRouting.noteResult(authID, model, statusCode, retryAfter, CurrentRoutingConfig(), time.Now())
+}
+
+// NoteScopedRouteResult updates local route state for a named pool.
+func NoteScopedRouteResult(scope, authID, model string, statusCode int, retryAfter *time.Duration) {
+	router, policy := scopedRouterAndPolicy(scope)
+	router.noteResult(authID, model, statusCode, retryAfter, policy, time.Now())
 }
 
 // RouteStatusFor returns local route pressure for one auth/model.
@@ -105,6 +191,24 @@ func AggregateRouteStatus(authID string) RouteStatus {
 	return defaultRouting.aggregateStatus(authID, CurrentRoutingConfig(), time.Now())
 }
 
+// AggregateScopedRouteStatus returns local route pressure for a named pool.
+func AggregateScopedRouteStatus(scope, authID string) RouteStatus {
+	router, policy := scopedRouterAndPolicy(scope)
+	return router.aggregateStatus(authID, policy, time.Now())
+}
+
+// AggregateScopedRouteStatusWithPolicy returns route pressure using a per-auth policy override.
+func AggregateScopedRouteStatusWithPolicy(scope, authID string, override EffectiveRoutingConfig) RouteStatus {
+	router, policy := scopedRouterAndPolicy(scope)
+	if override.PerAccountRPM > 0 {
+		policy.PerAccountRPM = override.PerAccountRPM
+	}
+	if override.PerAccountConcurrency > 0 {
+		policy.PerAccountConcurrency = override.PerAccountConcurrency
+	}
+	return router.aggregateStatus(authID, policy, time.Now())
+}
+
 // ResetRouteCooling clears local pool limiter/cooldown state.
 func ResetRouteCooling(authID string) {
 	defaultRouting.reset(authID)
@@ -115,9 +219,24 @@ func CooldownForStatus(statusCode int, backoffLevel int, retryAfter *time.Durati
 	return cooldownForStatus(statusCode, backoffLevel, retryAfter, CurrentRoutingConfig())
 }
 
+// CooldownForScopedStatus returns pool-specific cooldown for a named pool.
+func CooldownForScopedStatus(scope string, statusCode int, backoffLevel int, retryAfter *time.Duration) (time.Duration, int, bool) {
+	_, policy := scopedRouterAndPolicy(scope)
+	return cooldownForStatus(statusCode, backoffLevel, retryAfter, policy)
+}
+
 // CrossAccountAttempts returns the max credential attempts implied by max-switches.
 func CrossAccountAttempts() int {
 	cfg := CurrentRoutingConfig()
+	if cfg.MaxSwitches <= 0 {
+		return 0
+	}
+	return cfg.MaxSwitches + 1
+}
+
+// ScopedCrossAccountAttempts returns cross-account attempts for a named pool.
+func ScopedCrossAccountAttempts(scope string) int {
+	cfg := CurrentScopedRoutingConfig(scope)
 	if cfg.MaxSwitches <= 0 {
 		return 0
 	}
@@ -140,9 +259,34 @@ func SameAccountRetry(statusCode int) (int, time.Duration) {
 	return attempts, time.Duration(cfg.SameAccountRetryDelayMS) * time.Millisecond
 }
 
+// ScopedSameAccountRetry returns same-account retry settings for a named pool.
+func ScopedSameAccountRetry(scope string, statusCode int) (int, time.Duration) {
+	cfg := CurrentScopedRoutingConfig(scope)
+	attempts := 0
+	switch statusCode {
+	case StatusTooManyRequests:
+		attempts = cfg.SameAccountRetry429
+	case StatusOverloaded:
+		attempts = cfg.SameAccountRetry529
+	}
+	if attempts <= 0 {
+		return 0, 0
+	}
+	return attempts, time.Duration(cfg.SameAccountRetryDelayMS) * time.Millisecond
+}
+
 // SwitchDelay returns the configured delay before trying another pool account.
 func SwitchDelay() time.Duration {
 	cfg := CurrentRoutingConfig()
+	if cfg.SwitchDelayMS <= 0 {
+		return 0
+	}
+	return time.Duration(cfg.SwitchDelayMS) * time.Millisecond
+}
+
+// ScopedSwitchDelay returns switch delay for a named pool.
+func ScopedSwitchDelay(scope string) time.Duration {
+	cfg := CurrentScopedRoutingConfig(scope)
 	if cfg.SwitchDelayMS <= 0 {
 		return 0
 	}
@@ -156,7 +300,7 @@ func newPoolRouter() *poolRouter {
 	}
 }
 
-func (r *poolRouter) tryAcquire(authID, model string, policy EffectiveRoutingConfig, now time.Time) (*RouteLease, bool) {
+func (r *poolRouter) tryAcquire(authID, model string, policy EffectiveRoutingConfig, sticky bool, now time.Time) (*RouteLease, bool) {
 	if r == nil {
 		return nil, true
 	}
@@ -185,26 +329,30 @@ func (r *poolRouter) tryAcquire(authID, model string, policy EffectiveRoutingCon
 		)
 		return nil, false
 	}
-	if policy.PerAccountConcurrency > 0 && accountState.InFlight >= int64(policy.PerAccountConcurrency) {
+	concurrencyLimit := routeConcurrencyLimit(policy, sticky)
+	if concurrencyLimit > 0 && accountState.InFlight >= int64(concurrencyLimit) {
 		DebugLogf(
-			"claude api pool route denied auth=%s model=%s reason=concurrency inflight=%d concurrency_limit=%d rpm_used=%d rpm_limit=%d",
+			"claude api pool route denied auth=%s model=%s reason=concurrency sticky=%t inflight=%d concurrency_limit=%d rpm_used=%d rpm_limit=%d",
 			debugAuthRef(authID),
 			model,
+			sticky,
 			accountState.InFlight,
-			policy.PerAccountConcurrency,
+			concurrencyLimit,
 			len(accountState.RecentStarts),
-			policy.PerAccountRPM,
+			routeRPMLimit(policy, sticky),
 		)
 		return nil, false
 	}
-	if policy.PerAccountRPM > 0 && len(accountState.RecentStarts) >= policy.PerAccountRPM {
+	rpmLimit := routeRPMLimit(policy, sticky)
+	if rpmLimit > 0 && len(accountState.RecentStarts) >= rpmLimit {
 		DebugLogf(
-			"claude api pool route denied auth=%s model=%s reason=rpm inflight=%d rpm_used=%d rpm_limit=%d",
+			"claude api pool route denied auth=%s model=%s reason=rpm sticky=%t inflight=%d rpm_used=%d rpm_limit=%d",
 			debugAuthRef(authID),
 			model,
+			sticky,
 			accountState.InFlight,
 			len(accountState.RecentStarts),
-			policy.PerAccountRPM,
+			rpmLimit,
 		)
 		return nil, false
 	}
@@ -212,13 +360,14 @@ func (r *poolRouter) tryAcquire(authID, model string, policy EffectiveRoutingCon
 	accountState.RecentStarts = append(accountState.RecentStarts, now)
 	accountState.UpdatedAt = now
 	DebugLogf(
-		"claude api pool route acquired auth=%s model=%s inflight=%d concurrency_limit=%d rpm_used=%d rpm_limit=%d",
+		"claude api pool route acquired auth=%s model=%s sticky=%t inflight=%d concurrency_limit=%d rpm_used=%d rpm_limit=%d",
 		debugAuthRef(authID),
 		model,
+		sticky,
 		accountState.InFlight,
-		policy.PerAccountConcurrency,
+		concurrencyLimit,
 		len(accountState.RecentStarts),
-		policy.PerAccountRPM,
+		rpmLimit,
 	)
 	return &RouteLease{router: r, key: accountKey}, true
 }
@@ -457,15 +606,15 @@ func (r *poolRouter) pruneRecentStartsLocked(state *routeState, now time.Time) {
 
 func statusFromRouteStates(accountState, modelState *routeState, policy EffectiveRoutingConfig, now time.Time) RouteStatus {
 	status := RouteStatus{
-		RPMLimit: policy.PerAccountRPM,
+		RPMLimit: routeRPMLimit(policy, true),
 	}
 	if accountState != nil {
 		status.InFlight = accountState.InFlight
 		status.RPMUsed = len(accountState.RecentStarts)
-		if policy.PerAccountConcurrency > 0 && accountState.InFlight >= int64(policy.PerAccountConcurrency) {
+		if limit := routeConcurrencyLimit(policy, true); limit > 0 && accountState.InFlight >= int64(limit) {
 			status.Unavailable = true
 		}
-		if policy.PerAccountRPM > 0 && len(accountState.RecentStarts) >= policy.PerAccountRPM {
+		if status.RPMLimit > 0 && len(accountState.RecentStarts) >= status.RPMLimit {
 			status.Unavailable = true
 		}
 	}
@@ -515,7 +664,27 @@ func cooldownForStatus(statusCode int, backoffLevel int, retryAfter *time.Durati
 }
 
 func normalizeEffectiveRoutingConfig(cfg EffectiveRoutingConfig) EffectiveRoutingConfig {
-	return EffectiveRouting(RoutingConfigFromEffective(cfg))
+	normalized := EffectiveRouting(RoutingConfigFromEffective(cfg))
+	if cfg.StickyBuffer > 0 {
+		normalized.StickyBuffer = cfg.StickyBuffer
+	}
+	return normalized
+}
+
+func routeConcurrencyLimit(policy EffectiveRoutingConfig, sticky bool) int {
+	limit := policy.PerAccountConcurrency
+	if sticky && policy.StickyBuffer > 0 {
+		limit += policy.StickyBuffer
+	}
+	return limit
+}
+
+func routeRPMLimit(policy EffectiveRoutingConfig, sticky bool) int {
+	limit := policy.PerAccountRPM
+	if sticky && policy.StickyBuffer > 0 {
+		limit += policy.StickyBuffer
+	}
+	return limit
 }
 
 func routeKey(authID, model string) string {

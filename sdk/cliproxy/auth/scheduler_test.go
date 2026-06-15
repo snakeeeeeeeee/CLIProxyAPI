@@ -445,6 +445,51 @@ func TestManager_PickNextMixed_ClaudeAPIPoolFiltersNonPoolAuths(t *testing.T) {
 	}
 }
 
+func TestManager_PickNext_ClaudeAccountPoolScopeFiltersOAuthPoolAuths(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["claude"] = schedulerTestExecutor{}
+	manager.executors["gemini"] = schedulerTestExecutor{}
+
+	oauthPool := &Auth{
+		ID:       "claude-oauth-pool",
+		Provider: "claude",
+		Attributes: map[string]string{
+			claudeapipool.AttrOAuthPool: "true",
+		},
+	}
+	for _, auth := range []*Auth{
+		{ID: "claude-legacy", Provider: "claude"},
+		{ID: "claude-api-pool", Provider: "claude", Attributes: map[string]string{claudeapipool.AttrPool: "true"}},
+		oauthPool,
+		{ID: "gemini-a", Provider: "gemini"},
+	} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.PoolScopeMetadataKey: cliproxyexecutor.PoolScopeClaudeAccountPool,
+	}}
+	got, _, errPick := manager.pickNext(context.Background(), "claude", "", opts, nil)
+	if errPick != nil {
+		t.Fatalf("pickNext() error = %v", errPick)
+	}
+	if got == nil || got.ID != oauthPool.ID {
+		t.Fatalf("pickNext() auth = %#v, want oauth pool auth", got)
+	}
+
+	gotMixed, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"gemini", "claude"}, "", opts, nil)
+	if errPick != nil {
+		t.Fatalf("pickNextMixed() error = %v", errPick)
+	}
+	if provider != "claude" || gotMixed == nil || gotMixed.ID != oauthPool.ID {
+		t.Fatalf("pickNextMixed() provider/auth = %q/%#v, want claude/%s", provider, gotMixed, oauthPool.ID)
+	}
+}
+
 func TestManager_PickNextMixed_DisallowFreeAuthSkipsCodexFreePlan(t *testing.T) {
 	t.Parallel()
 

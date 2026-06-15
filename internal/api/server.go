@@ -5,12 +5,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -35,6 +37,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/resourcepool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -43,6 +46,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
@@ -181,6 +185,14 @@ func (s *Server) SetClaudeAPIPoolSync(sync func(context.Context) error) {
 		return
 	}
 	s.mgmt.SetClaudeAPIPoolSync(sync)
+}
+
+// SetResourcePoolSync registers the runtime sync callback used by resource-pool management handlers.
+func (s *Server) SetResourcePoolSync(sync func(context.Context) error) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.SetResourcePoolSync(sync)
 }
 
 // Server represents the main API server.
@@ -415,7 +427,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" || path == "/account-pool.html" {
 				c.Next()
 				return
 			}
@@ -444,6 +456,7 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/account-pool.html", s.serveResourcePoolConsole)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -469,6 +482,18 @@ func (s *Server) setupRoutes() {
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
+	}
+
+	claudeAccountPool := s.engine.Group("/claude-acc-pool/v1")
+	claudeAccountPool.Use(AuthMiddleware(s.accessManager))
+	claudeAccountPool.Use(s.claudeAccountPoolMiddleware())
+	{
+		claudeAccountPool.GET("/models", s.claudeAccountPoolModelsHandler)
+		claudeAccountPool.POST("/chat/completions", openaiHandlers.ChatCompletions)
+		claudeAccountPool.POST("/messages", claudeCodeHandlers.ClaudeMessages)
+		claudeAccountPool.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
+		claudeAccountPool.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
+		claudeAccountPool.POST("/responses", openaiResponsesHandlers.Responses)
 	}
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
@@ -615,6 +640,125 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	s.engine.GET(trimmed, conditionalAuth, finalHandler)
 }
 
+func (s *Server) claudeAccountPoolMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request != nil {
+			c.Request = c.Request.WithContext(handlers.WithPoolScope(c.Request.Context(), coreexecutor.PoolScopeClaudeAccountPool))
+		}
+		if c.Request == nil || c.Request.Method == http.MethodGet {
+			c.Next()
+			return
+		}
+		if err := s.rewriteClaudeAccountPoolModel(c); err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": gin.H{
+					"message": err.Error(),
+					"type":    "invalid_request_error",
+					"code":    "model_not_found",
+				},
+			})
+			return
+		}
+		c.Next()
+	}
+}
+
+func (s *Server) rewriteClaudeAccountPoolModel(c *gin.Context) error {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return fmt.Errorf("read request body: %w", err)
+	}
+	_ = c.Request.Body.Close()
+	if len(bytes.TrimSpace(body)) == 0 {
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		return fmt.Errorf("invalid json body")
+	}
+	requestedModel, _ := payload["model"].(string)
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		return fmt.Errorf("model is required")
+	}
+	upstream, ok, err := s.resolveClaudeAccountPoolModel(c.Request.Context(), requestedModel)
+	if err != nil {
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		return err
+	}
+	if !ok {
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		return fmt.Errorf("model %q is not enabled in Claude Code account pool", requestedModel)
+	}
+	payload["model"] = upstream
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		return fmt.Errorf("rewrite request body: %w", err)
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(rewritten))
+	c.Request.ContentLength = int64(len(rewritten))
+	c.Request.Header.Set("Content-Length", fmt.Sprint(len(rewritten)))
+	return nil
+}
+
+func (s *Server) resolveClaudeAccountPoolModel(ctx context.Context, requested string) (string, bool, error) {
+	if s == nil || s.cfg == nil || !s.cfg.ResourcePools.Enabled {
+		return "", false, fmt.Errorf("resource pools disabled")
+	}
+	store, err := resourcepool.Open(s.configFilePath, s.cfg)
+	if err != nil {
+		return "", false, err
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+	return store.ResolveModelAlias(ctx, requested)
+}
+
+func (s *Server) claudeAccountPoolModelsHandler(c *gin.Context) {
+	if s == nil || s.cfg == nil || !s.cfg.ResourcePools.Enabled {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource pools disabled"})
+		return
+	}
+	store, err := resourcepool.Open(s.configFilePath, s.cfg)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "open_failed", "message": err.Error()})
+		return
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+	models, err := store.ListModels(c.Request.Context(), true)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list_failed", "message": err.Error()})
+		return
+	}
+	data := make([]gin.H, 0, len(models))
+	for _, model := range models {
+		name := strings.TrimSpace(model.Alias)
+		if name == "" {
+			name = strings.TrimSpace(model.Name)
+		}
+		if name == "" {
+			continue
+		}
+		data = append(data, gin.H{
+			"id":       name,
+			"object":   "model",
+			"created":  model.UpdatedAt.Unix(),
+			"owned_by": "claude-acc-pool",
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"object": "list", "data": data})
+}
+
 func (s *Server) registerManagementRoutes() {
 	if s == nil || s.engine == nil || s.mgmt == nil {
 		return
@@ -758,6 +902,48 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/claude-api-pool/items/:position/reset-cooling", s.mgmt.ResetClaudeAPIPoolCooling)
 		mgmt.POST("/claude-api-pool/reset-cooling", s.mgmt.ResetClaudeAPIPoolCooling)
 		mgmt.POST("/claude-api-pool/ledger/clear", s.mgmt.ClearClaudeAPIPoolLedger)
+
+		mgmt.GET("/resource-pools/events", s.mgmt.StreamResourcePoolEvents)
+		mgmt.GET("/resource-pools/config", s.mgmt.GetResourcePoolConfig)
+		mgmt.GET("/claude-code-account-pool/config", s.mgmt.GetClaudeCodePoolConfig)
+		mgmt.PUT("/claude-code-account-pool/config", s.mgmt.PutClaudeCodePoolConfig)
+		mgmt.PATCH("/claude-code-account-pool/config", s.mgmt.PutClaudeCodePoolConfig)
+		mgmt.GET("/claude-code-account-pool/profile", s.mgmt.GetClaudeCodeProfile)
+		mgmt.PUT("/claude-code-account-pool/profile", s.mgmt.PutClaudeCodeProfile)
+		mgmt.PATCH("/claude-code-account-pool/profile", s.mgmt.PutClaudeCodeProfile)
+		mgmt.GET("/claude-code-account-pool/stats", s.mgmt.GetClaudeCodePoolStats)
+		mgmt.GET("/claude-code-account-pool/routing-events", s.mgmt.ListClaudeCodeRoutingEvents)
+		mgmt.GET("/claude-code-account-pool/usage", s.mgmt.GetClaudeCodeUsageSummary)
+		mgmt.GET("/claude-code-account-pool/usage-calibrations", s.mgmt.ListClaudeCodeUsageCalibrations)
+		mgmt.POST("/claude-code-account-pool/usage-calibrations/calibrate", s.mgmt.CalibrateClaudeCodeUsage)
+		mgmt.GET("/claude-code-account-pool/models", s.mgmt.ListClaudeCodePoolModels)
+		mgmt.POST("/claude-code-account-pool/models", s.mgmt.CreateClaudeCodePoolModel)
+		mgmt.POST("/claude-code-account-pool/models/fetch", s.mgmt.FetchClaudeCodePoolModels)
+		mgmt.PATCH("/claude-code-account-pool/models/:id", s.mgmt.PatchClaudeCodePoolModel)
+		mgmt.DELETE("/claude-code-account-pool/models/:id", s.mgmt.DeleteClaudeCodePoolModel)
+		mgmt.GET("/proxy-pool/resources", s.mgmt.ListProxyResources)
+		mgmt.GET("/proxy-pool/available", s.mgmt.ListAvailableProxyResources)
+		mgmt.POST("/proxy-pool/resources", s.mgmt.CreateProxyResource)
+		mgmt.POST("/proxy-pool/import", s.mgmt.ImportProxyResources)
+		mgmt.POST("/proxy-pool/batch", s.mgmt.BatchProxyResources)
+		mgmt.PATCH("/proxy-pool/resources/:id", s.mgmt.PatchProxyResource)
+		mgmt.DELETE("/proxy-pool/resources/:id", s.mgmt.DeleteProxyResource)
+		mgmt.POST("/proxy-pool/resources/:id/test", s.mgmt.TestProxyResource)
+		mgmt.POST("/proxy-pool/resources/:id/unbind", s.mgmt.UnbindProxyResource)
+
+		mgmt.GET("/claude-code-account-pool/accounts", s.mgmt.ListClaudeCodeAccounts)
+		mgmt.POST("/claude-code-account-pool/accounts/import-auth", s.mgmt.ImportClaudeAuthToAccountPool)
+		mgmt.POST("/claude-code-account-pool/accounts/batch", s.mgmt.BatchClaudeCodeAccounts)
+		mgmt.PATCH("/claude-code-account-pool/accounts/:id", s.mgmt.PatchClaudeCodeAccount)
+		mgmt.PATCH("/claude-code-account-pool/accounts/:id/capacity", s.mgmt.PatchClaudeCodeAccountCapacity)
+		mgmt.GET("/claude-code-account-pool/accounts/:id/model-status", s.mgmt.ListClaudeCodeAccountModelStatus)
+		mgmt.DELETE("/claude-code-account-pool/accounts/:id", s.mgmt.DeleteClaudeCodeAccount)
+		mgmt.POST("/claude-code-account-pool/accounts/:id/test", s.mgmt.TestClaudeCodeAccount)
+		mgmt.POST("/claude-code-account-pool/accounts/:id/quota/refresh", s.mgmt.RefreshClaudeCodeAccountQuota)
+		mgmt.POST("/claude-code-account-pool/accounts/:id/bind-proxy", s.mgmt.BindClaudeCodeAccountProxy)
+		mgmt.POST("/claude-code-account-pool/accounts/:id/unbind-proxy", s.mgmt.UnbindClaudeCodeAccountProxy)
+		mgmt.POST("/claude-code-account-pool/accounts/:id/reset-cooling", s.mgmt.ResetClaudeCodeAccountCooling)
+		mgmt.GET("/claude-code-account-pool/auth-url", s.mgmt.RequestClaudeCodeAccountPoolAuthURL)
 
 		mgmt.GET("/codex-api-key", s.mgmt.GetCodexKeys)
 		mgmt.PUT("/codex-api-key", s.mgmt.PutCodexKeys)
@@ -939,6 +1125,16 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	}
 
 	c.File(filePath)
+}
+
+func (s *Server) serveResourcePoolConsole(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.Home.Enabled {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.String(http.StatusOK, resourcepool.ConsoleHTML)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {

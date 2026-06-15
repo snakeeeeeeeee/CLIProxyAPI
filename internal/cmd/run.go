@@ -13,6 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/resourcepool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
 	log "github.com/sirupsen/logrus"
@@ -52,6 +53,12 @@ func StartServiceWithPluginHost(cfg *config.Config, configPath string, localPass
 			keepAliveCancel()
 		}))
 	}
+	resourcepool.StartHealthChecker(runCtx, configPath, func() *config.Config {
+		return cfg
+	})
+	resourcepool.StartAccountQuotaRefresher(runCtx, configPath, func() *config.Config {
+		return cfg
+	})
 
 	service, err := builder.Build()
 	if err != nil {
@@ -95,6 +102,12 @@ func StartServiceBackgroundWithPluginHost(cfg *config.Config, configPath string,
 
 	ctx, cancelFn := context.WithCancel(context.Background())
 	doneCh := make(chan struct{})
+	resourcepool.StartHealthChecker(ctx, configPath, func() *config.Config {
+		return cfg
+	})
+	resourcepool.StartAccountQuotaRefresher(ctx, configPath, func() *config.Config {
+		return cfg
+	})
 
 	service, err := builder.Build()
 	if err != nil {

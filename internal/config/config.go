@@ -101,6 +101,9 @@ type Config struct {
 	// ClaudeAPIPool controls the optional SQLite-backed Claude API account pool.
 	ClaudeAPIPool ClaudeAPIPoolConfig `yaml:"claude-api-pool" json:"claude-api-pool"`
 
+	// ResourcePools controls the optional SQLite-backed Claude Code account and proxy pools.
+	ResourcePools ResourcePoolsConfig `yaml:"resource-pools" json:"resource-pools"`
+
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
 
@@ -338,6 +341,12 @@ type RoutingConfig struct {
 // ClaudeAPIPoolConfig toggles the fixed Claude API pool store.
 type ClaudeAPIPoolConfig struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
+}
+
+// ResourcePoolsConfig toggles the resource pool subsystem and points to its YAML initializer.
+type ResourcePoolsConfig struct {
+	Enabled    bool   `yaml:"enabled" json:"enabled"`
+	ConfigFile string `yaml:"config-file,omitempty" json:"config-file,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -795,6 +804,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	}
 	cfg.SanitizeClaudeAPIPool()
+	cfg.SanitizeResourcePools()
 
 	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
 	if cfg.Pprof.Addr == "" {
@@ -898,6 +908,17 @@ func (cfg *Config) SanitizePayloadRules() {
 func (cfg *Config) SanitizeClaudeAPIPool() {
 	if cfg == nil {
 		return
+	}
+}
+
+// SanitizeResourcePools applies minimal defaults for the resource pools subsystem.
+func (cfg *Config) SanitizeResourcePools() {
+	if cfg == nil {
+		return
+	}
+	cfg.ResourcePools.ConfigFile = strings.TrimSpace(cfg.ResourcePools.ConfigFile)
+	if cfg.ResourcePools.Enabled && cfg.ResourcePools.ConfigFile == "" {
+		cfg.ResourcePools.ConfigFile = "resource-pools.yaml"
 	}
 }
 

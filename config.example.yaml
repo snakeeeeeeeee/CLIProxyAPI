@@ -123,6 +123,13 @@ disable-cooling: false
 claude-api-pool:
   enabled: false
 
+# Optional Claude Code OAuth account pool and independent proxy resource pool.
+# The main config only points to the initializer. Runtime data is stored in SQLite.
+# resource-pools.yaml is imported only when resource-pools.db is empty.
+resource-pools:
+  enabled: false
+  config-file: "resource-pools.yaml"
+
 # disable-image-generation supports: false (default), true, "chat", or "passthrough".
 # - true: disable image_generation everywhere (also returns 404 for /v1/images/generations and /v1/images/edits).
 # - "chat": disable image_generation injection on non-images endpoints, but keep /v1/images/generations and /v1/images/edits enabled.

@@ -291,6 +291,44 @@ func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
 		}
 	})
+
+	t.Run("resource pool console returns 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/account-pool.html", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+	})
+}
+
+func TestResourcePoolConsoleIndependentFromManagementControlPanel(t *testing.T) {
+	server := newTestServer(t)
+	server.cfg.RemoteManagement.DisableControlPanel = true
+
+	t.Run("management control panel disabled", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+	})
+
+	t.Run("resource pool console still served", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/account-pool.html", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		if contentType := rr.Header().Get("Content-Type"); !strings.Contains(contentType, "text/html") {
+			t.Fatalf("content type = %q, want text/html", contentType)
+		}
+		if !strings.Contains(rr.Body.String(), "root") {
+			t.Fatalf("resource console body did not look like html")
+		}
+	})
 }
 
 func TestAmpProviderModelRoutes(t *testing.T) {

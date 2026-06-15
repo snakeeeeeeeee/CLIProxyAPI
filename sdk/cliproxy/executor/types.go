@@ -27,6 +27,10 @@ const ServiceTierMetadataKey = "service_tier"
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
+	// PoolScopeMetadataKey constrains auth selection to a named pool scope.
+	PoolScopeMetadataKey = "pool_scope"
+	// PoolScopeClaudeAccountPool is the dedicated Claude Code OAuth account pool.
+	PoolScopeClaudeAccountPool = "claude-acc-pool"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.

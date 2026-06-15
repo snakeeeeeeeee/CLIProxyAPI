@@ -1485,6 +1485,7 @@ func (s *Service) Run(ctx context.Context) error {
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
 	if s.server != nil {
 		s.server.SetClaudeAPIPoolSync(s.SyncClaudeAPIPoolAuths)
+		s.server.SetResourcePoolSync(s.SyncResourcePoolAuths)
 	}
 	s.syncPluginRuntimeConfig(ctx)
 	if homeEnabled {

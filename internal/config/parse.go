@@ -49,6 +49,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	}
 	cfg.SanitizeClaudeAPIPool()
+	cfg.SanitizeResourcePools()
 
 	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
 	if cfg.Pprof.Addr == "" {

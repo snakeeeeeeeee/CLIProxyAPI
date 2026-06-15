@@ -57,6 +57,7 @@ type Handler struct {
 	pluginReleaseCacheMu   sync.Mutex
 	pluginReleaseCache     map[string]pluginReleaseCacheEntry
 	claudeAPIPoolSync      func(context.Context) error
+	resourcePoolSync       func(context.Context) error
 }
 
 // NewHandler creates a new management handler instance.
@@ -195,6 +196,11 @@ func (h *Handler) SetClaudeAPIPoolSync(sync func(context.Context) error) {
 	h.claudeAPIPoolSync = sync
 }
 
+// SetResourcePoolSync registers a callback that applies resource-pool SQLite changes to runtime auths.
+func (h *Handler) SetResourcePoolSync(sync func(context.Context) error) {
+	h.resourcePoolSync = sync
+}
+
 // SetPostAuthPersistHook registers a hook to be called after auth persistence.
 func (h *Handler) SetPostAuthPersistHook(hook coreauth.PostAuthHook) {
 	h.postAuthPersistHook = hook
@@ -225,6 +231,9 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		}
 		if provided == "" {
 			provided = c.GetHeader("X-Management-Key")
+		}
+		if provided == "" && c.Request != nil && c.Request.URL != nil && c.Request.URL.Path == "/v0/management/resource-pools/events" {
+			provided = c.Query("key")
 		}
 
 		allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)

@@ -64,6 +64,7 @@ const (
 var apiErrorLogSensitiveValuePattern = regexp.MustCompile(`(?i)\b(authorization|x-api-key|api-key|apikey|api_key|token|secret)\b(\s*[:=]\s*"?)(?:Bearer\s+)?([^"\s,;}\]]+)`)
 
 type pinnedAuthContextKey struct{}
+type poolScopeContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
 type disallowFreeAuthContextKey struct{}
@@ -101,6 +102,18 @@ func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, pinnedAuthContextKey{}, authID)
+}
+
+// WithPoolScope returns a child context that constrains auth selection to a pool scope.
+func WithPoolScope(ctx context.Context, scope string) context.Context {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, poolScopeContextKey{}, scope)
 }
 
 // WithSelectedAuthIDCallback returns a child context that receives the selected auth ID.
@@ -346,6 +359,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
+	if poolScope := poolScopeFromContext(ctx); poolScope != "" {
+		meta[coreexecutor.PoolScopeMetadataKey] = poolScope
+	}
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
 		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
 	}
@@ -402,6 +418,21 @@ func pinnedAuthIDFromContext(ctx context.Context) string {
 		return ""
 	}
 	raw := ctx.Value(pinnedAuthContextKey{})
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
+	}
+}
+
+func poolScopeFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	raw := ctx.Value(poolScopeContextKey{})
 	switch v := raw.(type) {
 	case string:
 		return strings.TrimSpace(v)
@@ -737,7 +768,7 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 
 func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
-	providers, normalizedModel, errMsg := h.getRequestDetailsWithOptions(modelName, allowImageModel)
+	providers, normalizedModel, errMsg := h.getRequestDetailsForContext(ctx, modelName, allowImageModel)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
@@ -794,7 +825,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
-	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetailsForContext(ctx, modelName, false)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
@@ -863,7 +894,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
-	providers, normalizedModel, errMsg := h.getRequestDetailsWithOptions(modelName, allowImageModel)
+	providers, normalizedModel, errMsg := h.getRequestDetailsForContext(ctx, modelName, allowImageModel)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
@@ -1195,6 +1226,17 @@ func statusFromError(err error) int {
 
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
 	return h.getRequestDetailsWithOptions(modelName, false)
+}
+
+func (h *BaseAPIHandler) getRequestDetailsForContext(ctx context.Context, modelName string, allowImageModel bool) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+	if poolScopeFromContext(ctx) == coreexecutor.PoolScopeClaudeAccountPool {
+		modelName = strings.TrimSpace(modelName)
+		if modelName == "" {
+			return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("model is required")}
+		}
+		return []string{"claude"}, modelName, nil
+	}
+	return h.getRequestDetailsWithOptions(modelName, allowImageModel)
 }
 
 func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowImageModel bool) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {

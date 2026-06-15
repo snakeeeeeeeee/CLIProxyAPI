@@ -22,10 +22,13 @@ import (
 
 // OAuth configuration constants for Claude/Anthropic
 const (
-	AuthURL     = "https://claude.ai/oauth/authorize"
-	TokenURL    = "https://api.anthropic.com/v1/oauth/token"
-	ClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-	RedirectURI = "http://localhost:54545/callback"
+	AuthURL                = "https://claude.ai/oauth/authorize"
+	TokenURL               = "https://api.anthropic.com/v1/oauth/token"
+	ClaudeCodeTokenURL     = "https://platform.claude.com/v1/oauth/token"
+	ClientID               = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	RedirectURI            = "http://localhost:54545/callback"
+	ClaudeCodeRedirectURI  = "https://platform.claude.com/oauth/code/callback"
+	ClaudeCodeBrowserScope = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
 	claudeRefreshMinBackoff = 5 * time.Second
 	claudeRefreshMaxBackoff = 5 * time.Minute
@@ -207,6 +210,28 @@ func (o *ClaudeAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string
 	return authURL, state, nil
 }
 
+// GenerateClaudeCodeAuthURL creates the Claude Code OAuth URL used by the
+// official browser/platform code callback flow.
+func (o *ClaudeAuth) GenerateClaudeCodeAuthURL(state string, pkceCodes *PKCECodes) (string, string, error) {
+	if pkceCodes == nil {
+		return "", "", fmt.Errorf("PKCE codes are required")
+	}
+
+	params := url.Values{
+		"code":                  {"true"},
+		"client_id":             {ClientID},
+		"response_type":         {"code"},
+		"redirect_uri":          {ClaudeCodeRedirectURI},
+		"scope":                 {ClaudeCodeBrowserScope},
+		"code_challenge":        {pkceCodes.CodeChallenge},
+		"code_challenge_method": {"S256"},
+		"state":                 {state},
+	}
+
+	authURL := fmt.Sprintf("%s?%s", AuthURL, params.Encode())
+	return authURL, state, nil
+}
+
 // parseCodeAndState extracts the authorization code and state from the callback response.
 // It handles the parsing of the code parameter which may contain additional fragments.
 //
@@ -301,10 +326,12 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 
 	// Create token data
 	tokenData := ClaudeTokenData{
-		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
-		Email:        tokenResp.Account.EmailAddress,
-		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+		AccessToken:      tokenResp.AccessToken,
+		RefreshToken:     tokenResp.RefreshToken,
+		Email:            tokenResp.Account.EmailAddress,
+		OrganizationUUID: tokenResp.Organization.UUID,
+		AccountUUID:      tokenResp.Account.UUID,
+		Expire:           time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}
 
 	// Create auth bundle
@@ -314,6 +341,95 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	}
 
 	return bundle, nil
+}
+
+// ExchangeClaudeCodeCodeForTokens exchanges a Claude Code OAuth authorization
+// code using the platform callback endpoint. It accepts either a plain code plus
+// state or the compact "code#state" form returned by some Claude Code tooling.
+func (o *ClaudeAuth) ExchangeClaudeCodeCodeForTokens(ctx context.Context, code, state string, pkceCodes *PKCECodes) (*ClaudeAuthBundle, error) {
+	return o.exchangeCodeForTokens(ctx, code, state, pkceCodes, ClaudeCodeTokenURL, ClaudeCodeRedirectURI, true)
+}
+
+func (o *ClaudeAuth) exchangeCodeForTokens(ctx context.Context, code, state string, pkceCodes *PKCECodes, tokenURL, redirectURI string, omitFallbackState bool) (*ClaudeAuthBundle, error) {
+	if pkceCodes == nil {
+		return nil, fmt.Errorf("PKCE codes are required for token exchange")
+	}
+	newCode, newState := o.parseCodeAndState(code)
+	if strings.TrimSpace(newCode) == "" {
+		return nil, fmt.Errorf("authorization code is required")
+	}
+	reqBody := map[string]interface{}{
+		"code":          newCode,
+		"grant_type":    "authorization_code",
+		"client_id":     ClientID,
+		"redirect_uri":  redirectURI,
+		"code_verifier": pkceCodes.CodeVerifier,
+	}
+	if newState != "" {
+		reqBody["state"] = newState
+	} else if !omitFallbackState && strings.TrimSpace(state) != "" {
+		reqBody["state"] = strings.TrimSpace(state)
+	} else if omitFallbackState && strings.TrimSpace(state) != "" {
+		reqBody["state"] = strings.TrimSpace(state)
+	}
+	bundle, err := o.doTokenExchange(ctx, tokenURL, reqBody)
+	if err != nil {
+		return nil, err
+	}
+	return bundle, nil
+}
+
+func (o *ClaudeAuth) doTokenExchange(ctx context.Context, tokenURL string, reqBody map[string]interface{}) (*ClaudeAuthBundle, error) {
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", tokenURL, strings.NewReader(string(jsonBody)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", "axios/1.13.6")
+
+	resp, err := o.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("token exchange request failed: %w", err)
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("failed to close response body: %v", errClose)
+		}
+	}()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read token response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp tokenResponse
+	if err = json.Unmarshal(body, &tokenResp); err != nil {
+		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	tokenData := ClaudeTokenData{
+		AccessToken:      tokenResp.AccessToken,
+		RefreshToken:     tokenResp.RefreshToken,
+		Email:            tokenResp.Account.EmailAddress,
+		OrganizationUUID: tokenResp.Organization.UUID,
+		AccountUUID:      tokenResp.Account.UUID,
+		Expire:           time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+	}
+
+	return &ClaudeAuthBundle{
+		TokenData:   tokenData,
+		LastRefresh: time.Now().Format(time.RFC3339),
+	}, nil
 }
 
 // RefreshTokens refreshes the access token using the refresh token.
@@ -418,10 +534,12 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 	clearClaudeRefreshBlockedUntil(refreshToken)
 
 	return &ClaudeTokenData{
-		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
-		Email:        tokenResp.Account.EmailAddress,
-		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+		AccessToken:      tokenResp.AccessToken,
+		RefreshToken:     tokenResp.RefreshToken,
+		Email:            tokenResp.Account.EmailAddress,
+		OrganizationUUID: tokenResp.Organization.UUID,
+		AccountUUID:      tokenResp.Account.UUID,
+		Expire:           time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}, nil
 }
 
@@ -436,11 +554,13 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 //   - *ClaudeTokenStorage: A new token storage instance
 func (o *ClaudeAuth) CreateTokenStorage(bundle *ClaudeAuthBundle) *ClaudeTokenStorage {
 	storage := &ClaudeTokenStorage{
-		AccessToken:  bundle.TokenData.AccessToken,
-		RefreshToken: bundle.TokenData.RefreshToken,
-		LastRefresh:  bundle.LastRefresh,
-		Email:        bundle.TokenData.Email,
-		Expire:       bundle.TokenData.Expire,
+		AccessToken:      bundle.TokenData.AccessToken,
+		RefreshToken:     bundle.TokenData.RefreshToken,
+		LastRefresh:      bundle.LastRefresh,
+		Email:            bundle.TokenData.Email,
+		OrganizationUUID: bundle.TokenData.OrganizationUUID,
+		AccountUUID:      bundle.TokenData.AccountUUID,
+		Expire:           bundle.TokenData.Expire,
 	}
 
 	return storage
@@ -498,5 +618,11 @@ func (o *ClaudeAuth) UpdateTokenStorage(storage *ClaudeTokenStorage, tokenData *
 	storage.RefreshToken = tokenData.RefreshToken
 	storage.LastRefresh = time.Now().Format(time.RFC3339)
 	storage.Email = tokenData.Email
+	if strings.TrimSpace(tokenData.OrganizationUUID) != "" {
+		storage.OrganizationUUID = strings.TrimSpace(tokenData.OrganizationUUID)
+	}
+	if strings.TrimSpace(tokenData.AccountUUID) != "" {
+		storage.AccountUUID = strings.TrimSpace(tokenData.AccountUUID)
+	}
 	storage.Expire = tokenData.Expire
 }

@@ -1,0 +1,39 @@
+database-path: "resource-pools.db"
+
+proxy-health:
+  enabled: true
+  interval: "5m"
+  timeout: "10s"
+  concurrency: 8
+  failure-threshold: 3
+  test-url: "https://api.anthropic.com/"
+  optional-exit-ip-url: "https://api.ipify.org?format=json"
+
+account-quota:
+  enabled: true
+  interval: "5m"
+  concurrency: 2
+
+claude-code-pool:
+  enabled: true
+  pure-mode: true
+  cloak:
+    mode: "auto"
+    strict-mode: false
+    sensitive-words: []
+  per-account-rpm: 6
+  per-account-concurrency: 1
+  max-switches: 2
+  switch-delay-ms: 1000
+  rate-limit-cooldown-ms: 300000
+  rate-limit-max-cooldown-ms: 7200000
+  overload-cooldown-ms: 120000
+  overload-max-cooldown-ms: 1800000
+  same-account-retry-429: 0
+  same-account-retry-529: 1
+  same-account-retry-delay-ms: 3000
+  session-affinity: true
+  session-affinity-ttl: "1h"
+
+# Optional first-run proxy import. After resource-pools.db has data, SQLite wins.
+proxies: []
