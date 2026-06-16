@@ -119,6 +119,30 @@ type Result struct {
 	Error *Error
 }
 
+// RouteEvent captures Claude pool route decisions before and after execution.
+type RouteEvent struct {
+	RequestID       string
+	Provider        string
+	Scope           string
+	AuthID          string
+	Model           string
+	RequestedModel  string
+	ProxyResourceID string
+	Sticky          bool
+	SessionKey      string
+	InFlight        int64
+	Concurrency     int
+	RPMUsed         int
+	RPMLimit        int
+	CapacityUsed    int
+	CapacityLimit   int
+	Decision        string
+	Reason          string
+	StatusCode      int
+	Error           string
+	CreatedAt       time.Time
+}
+
 type claudePoolAffinitySelectionContextKey struct{}
 type claudePoolScopeContextKey struct{}
 
@@ -150,6 +174,8 @@ type Hook interface {
 	OnAuthUpdated(ctx context.Context, auth *Auth)
 	// OnResult fires when execution result is recorded.
 	OnResult(ctx context.Context, result Result)
+	// OnRouteEvent fires when Claude pool local routing makes a decision.
+	OnRouteEvent(ctx context.Context, event RouteEvent)
 }
 
 // NoopHook provides optional hook defaults.
@@ -163,6 +189,9 @@ func (NoopHook) OnAuthUpdated(context.Context, *Auth) {}
 
 // OnResult implements Hook.
 func (NoopHook) OnResult(context.Context, Result) {}
+
+// OnRouteEvent implements Hook.
+func (NoopHook) OnRouteEvent(context.Context, RouteEvent) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
@@ -515,7 +544,7 @@ func poolScopeFromMetadata(meta map[string]any) string {
 }
 
 func isClaudeAccountPoolScopedAuth(auth *Auth) bool {
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+	if auth == nil {
 		return false
 	}
 	attrs := auth.Attributes
@@ -1152,10 +1181,10 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 }
 
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
-	return m.wrapStreamResultWithLease(ctx, auth, provider, resultModel, headers, buffered, remaining, nil)
+	return m.wrapStreamResultWithLease(ctx, auth, provider, resultModel, coreusage.RequestedModelAliasFromContext(ctx), headers, buffered, remaining, nil)
 }
 
-func (m *Manager) wrapStreamResultWithLease(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, lease *claudeapipool.RouteLease) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResultWithLease(ctx context.Context, auth *Auth, provider, resultModel, requestedModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, lease *claudeapipool.RouteLease) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer func() {
@@ -1174,6 +1203,7 @@ func (m *Manager) wrapStreamResultWithLease(ctx context.Context, auth *Auth, pro
 					rerr.HTTPStatus = se.StatusCode()
 				}
 				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				m.emitClaudePoolRouteEvent(ctx, auth, provider, resultModel, requestedModel, "upstream_error", routeEventReasonFromStatus(rerr.HTTPStatus), rerr.HTTPStatus, rerr.Message)
 			}
 			if !forward {
 				return false
@@ -1204,6 +1234,7 @@ func (m *Manager) wrapStreamResultWithLease(ctx context.Context, auth *Auth, pro
 		}
 		if !failed {
 			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			m.emitClaudePoolRouteEvent(ctx, auth, provider, resultModel, requestedModel, "success", "", http.StatusOK, "")
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -1221,9 +1252,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		lease, acquired := acquireClaudePoolRouteWithAffinity(ctx, auth, resultModel, claudePoolAffinitySelectionFromContext(ctx))
 		if !acquired {
+			m.emitClaudePoolRouteEvent(ctx, auth, provider, resultModel, routeModel, "rejected", "pool_route_limited", 0, "claude api pool account is locally rate limited")
 			lastErr = &Error{Code: "pool_route_limited", Message: "claude api pool account is locally rate limited", Retryable: true}
 			continue
 		}
+		m.emitClaudePoolRouteEvent(ctx, auth, provider, resultModel, routeModel, "selected", "", 0, "")
 		execReq := req
 		execReq.Model = execModel
 		execOpts := opts
@@ -1256,6 +1289,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
+			m.emitClaudePoolRouteEvent(ctx, auth, provider, resultModel, routeModel, "upstream_error", routeEventReasonFromStatus(rerr.HTTPStatus), rerr.HTTPStatus, rerr.Message)
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
@@ -1280,6 +1314,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
+				m.emitClaudePoolRouteEvent(ctx, auth, provider, resultModel, routeModel, "upstream_error", routeEventReasonFromStatus(rerr.HTTPStatus), rerr.HTTPStatus, rerr.Message)
 				if lease != nil {
 					lease.Release()
 				}
@@ -1294,6 +1329,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
+				m.emitClaudePoolRouteEvent(ctx, auth, provider, resultModel, routeModel, "upstream_error", routeEventReasonFromStatus(rerr.HTTPStatus), rerr.HTTPStatus, rerr.Message)
 				if lease != nil {
 					lease.Release()
 				}
@@ -1308,6 +1344,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
+			m.emitClaudePoolRouteEvent(ctx, auth, provider, resultModel, routeModel, "upstream_error", routeEventReasonFromStatus(rerr.HTTPStatus), rerr.HTTPStatus, rerr.Message)
 			if lease != nil {
 				lease.Release()
 			}
@@ -1319,6 +1356,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
 			m.MarkResult(ctx, result)
+			m.emitClaudePoolRouteEvent(ctx, auth, provider, resultModel, routeModel, "upstream_error", "empty_stream", 0, emptyErr.Message)
 			if idx < len(execModels)-1 {
 				if lease != nil {
 					lease.Release()
@@ -1338,7 +1376,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResultWithLease(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, lease), nil
+		return m.wrapStreamResultWithLease(ctx, auth.Clone(), provider, resultModel, routeModel, streamResult.Headers, buffered, remaining, lease), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -1940,9 +1978,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			lease, acquired := acquireClaudePoolRouteWithAffinity(execCtx, auth, resultModel, affinitySelection)
 			if !acquired {
+				m.emitClaudePoolRouteEvent(execCtx, auth, provider, resultModel, routeModel, "rejected", "pool_route_limited", 0, "claude api pool account is locally rate limited")
 				authErr = &Error{Code: "pool_route_limited", Message: "claude api pool account is locally rate limited", Retryable: true}
 				continue
 			}
+			m.emitClaudePoolRouteEvent(execCtx, auth, provider, resultModel, routeModel, "selected", "", 0, "")
 			attempted[auth.ID] = struct{}{}
 			execReq := req
 			execReq.Model = upstreamModel
@@ -1978,6 +2018,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
+				m.emitClaudePoolRouteEvent(execCtx, auth, provider, resultModel, routeModel, "upstream_error", routeEventReasonFromStatus(result.Error.HTTPStatus), result.Error.HTTPStatus, result.Error.Message)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -1985,6 +2026,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			m.emitClaudePoolRouteEvent(execCtx, auth, provider, resultModel, routeModel, "success", "", http.StatusOK, "")
 			return resp, nil
 		}
 		if authErr != nil {
@@ -2071,9 +2113,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			lease, acquired := acquireClaudePoolRouteWithAffinity(execCtx, auth, resultModel, affinitySelection)
 			if !acquired {
+				m.emitClaudePoolRouteEvent(execCtx, auth, provider, resultModel, routeModel, "rejected", "pool_route_limited", 0, "claude api pool account is locally rate limited")
 				authErr = &Error{Code: "pool_route_limited", Message: "claude api pool account is locally rate limited", Retryable: true}
 				continue
 			}
+			m.emitClaudePoolRouteEvent(execCtx, auth, provider, resultModel, routeModel, "selected", "", 0, "")
 			attempted[auth.ID] = struct{}{}
 			execReq := req
 			execReq.Model = upstreamModel
@@ -2109,6 +2153,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
+				m.emitClaudePoolRouteEvent(execCtx, auth, provider, resultModel, routeModel, "upstream_error", routeEventReasonFromStatus(result.Error.HTTPStatus), result.Error.HTTPStatus, result.Error.Message)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -2116,6 +2161,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			m.emitClaudePoolRouteEvent(execCtx, auth, provider, resultModel, routeModel, "success", "", http.StatusOK, "")
 			return resp, nil
 		}
 		if authErr != nil {
@@ -2946,12 +2992,19 @@ func acquireClaudePoolRoute(auth *Auth, model string) (*claudeapipool.RouteLease
 }
 
 func acquireClaudePoolRouteForScope(scope string, auth *Auth, model string, selection claudeapipool.AffinitySelection) (*claudeapipool.RouteLease, bool) {
-	if auth == nil || !claudeapipool.IsAttributesClaudePoolAuth(auth.Attributes) {
+	if auth == nil {
 		return nil, true
 	}
-	if strings.TrimSpace(scope) == cliproxyexecutor.PoolScopeClaudeAccountPool {
+	scope = inferredClaudeAccountPoolScope(scope, auth)
+	if scope == cliproxyexecutor.PoolScopeClaudeAccountPool {
+		if !isClaudeAccountPoolScopedAuth(auth) {
+			return nil, true
+		}
 		override := claudeAccountPoolRoutingOverride(auth)
 		return claudeapipool.TryAcquireScopedRouteWithPolicyOptions(scope, auth.ID, model, override, isStickyClaudeAccountPoolRequest(scope, selection))
+	}
+	if !claudeapipool.IsAttributesClaudePoolAuth(auth.Attributes) {
+		return nil, true
 	}
 	if strings.TrimSpace(scope) != "" {
 		return claudeapipool.TryAcquireScopedRoute(scope, auth.ID, model)
@@ -2997,17 +3050,106 @@ func acquireClaudePoolRouteWithAffinity(ctx context.Context, auth *Auth, model s
 	return lease, ok
 }
 
+func (m *Manager) emitClaudePoolRouteEvent(ctx context.Context, auth *Auth, provider, resultModel, requestedModel, decision, reason string, statusCode int, message string) {
+	if m == nil || auth == nil {
+		return
+	}
+	scope := inferredClaudeAccountPoolScope(claudePoolScopeFromContext(ctx), auth)
+	if scope != cliproxyexecutor.PoolScopeClaudeAccountPool {
+		return
+	}
+	if !isClaudeAccountPoolScopedAuth(auth) {
+		return
+	}
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		requestedModel = coreusage.RequestedModelAliasFromContext(ctx)
+	}
+	if requestedModel == "" {
+		requestedModel = resultModel
+	}
+	override := claudeAccountPoolRoutingOverride(auth)
+	status := claudeapipool.AggregateScopedRouteStatusWithPolicy(scope, auth.ID, override)
+	selection := claudePoolAffinitySelectionFromContext(ctx)
+	concurrency := override.PerAccountConcurrency
+	if concurrency <= 0 {
+		concurrency = claudeapipool.CurrentScopedRoutingConfig(scope).PerAccountConcurrency
+	}
+	event := RouteEvent{
+		RequestID:       logging.GetRequestID(ctx),
+		Provider:        strings.TrimSpace(provider),
+		Scope:           scope,
+		AuthID:          auth.ID,
+		Model:           strings.TrimSpace(resultModel),
+		RequestedModel:  requestedModel,
+		ProxyResourceID: strings.TrimSpace(auth.Attributes["proxy_resource_id"]),
+		Sticky:          selection.Active && strings.TrimSpace(selection.AuthID) != "",
+		SessionKey:      strings.TrimSpace(selection.Key),
+		InFlight:        status.InFlight,
+		Concurrency:     concurrency,
+		RPMUsed:         status.RPMUsed,
+		RPMLimit:        status.RPMLimit,
+		CapacityUsed:    int(status.InFlight),
+		CapacityLimit:   concurrency,
+		Decision:        strings.TrimSpace(decision),
+		Reason:          strings.TrimSpace(reason),
+		StatusCode:      statusCode,
+		Error:           strings.TrimSpace(message),
+		CreatedAt:       time.Now(),
+	}
+	m.hook.OnRouteEvent(ctx, event)
+}
+
+func routeEventReasonFromStatus(statusCode int) string {
+	switch statusCode {
+	case claudeapipool.StatusTooManyRequests:
+		return "rate_limited"
+	case claudeapipool.StatusOverloaded:
+		return "overloaded"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	}
+	if statusCode >= http.StatusInternalServerError {
+		return "upstream_5xx"
+	}
+	if statusCode >= http.StatusBadRequest {
+		return "upstream_4xx"
+	}
+	return ""
+}
+
 func shouldRetrySameClaudePoolAuth(auth *Auth, err error, attempt int) bool {
 	return shouldRetrySameClaudePoolAuthForScope("", auth, err, attempt)
 }
 
 func shouldRetrySameClaudePoolAuthForScope(scope string, auth *Auth, err error, attempt int) bool {
-	if auth == nil || !claudeapipool.IsAttributesClaudePoolAuth(auth.Attributes) || err == nil || attempt < 0 {
+	if auth == nil || err == nil || attempt < 0 {
+		return false
+	}
+	scope = inferredClaudeAccountPoolScope(scope, auth)
+	if scope == cliproxyexecutor.PoolScopeClaudeAccountPool {
+		if !isClaudeAccountPoolScopedAuth(auth) {
+			return false
+		}
+	} else if !claudeapipool.IsAttributesClaudePoolAuth(auth.Attributes) {
 		return false
 	}
 	status := statusCodeFromError(err)
 	maxAttempts, _ := claudeapipool.ScopedSameAccountRetry(scope, status)
 	return maxAttempts > 0 && attempt < maxAttempts
+}
+
+func inferredClaudeAccountPoolScope(scope string, auth *Auth) string {
+	scope = strings.TrimSpace(scope)
+	if scope != "" {
+		return scope
+	}
+	if isClaudeAccountPoolScopedAuth(auth) {
+		return cliproxyexecutor.PoolScopeClaudeAccountPool
+	}
+	return ""
 }
 
 func sameClaudePoolRetryDelay(err error) time.Duration {
@@ -3028,14 +3170,7 @@ func waitForClaudePoolSwitchDelay(ctx context.Context) error {
 }
 
 func contextWithClaudePoolScope(ctx context.Context, opts cliproxyexecutor.Options) context.Context {
-	scope := poolScopeFromMetadata(opts.Metadata)
-	if strings.TrimSpace(scope) == "" {
-		return ctx
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, claudePoolScopeContextKey{}, strings.TrimSpace(scope))
+	return ContextWithClaudePoolScope(ctx, poolScopeFromMetadata(opts.Metadata))
 }
 
 func claudePoolScopeFromContext(ctx context.Context) string {

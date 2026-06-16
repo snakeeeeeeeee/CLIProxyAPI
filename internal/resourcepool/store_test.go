@@ -189,6 +189,48 @@ func TestStoreConfigSQLiteWinsAfterInitialImport(t *testing.T) {
 	}
 }
 
+func TestTraceConfigDefaultsAndYAML(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	initPath := filepath.Join(dir, "resource-pools.yaml")
+	if err := os.WriteFile(initPath, []byte(`
+database-path: resource-pools.db
+trace:
+  enabled: true
+  dump-dir: traces/custom
+  redact-user-content: false
+`), 0o644); err != nil {
+		t.Fatalf("write resource-pools.yaml: %v", err)
+	}
+	doc, err := LoadConfigFile(initPath)
+	if err != nil {
+		t.Fatalf("LoadConfigFile() error = %v", err)
+	}
+	effective := EffectiveTrace(doc.Trace)
+	if !effective.Enabled || effective.DumpDir != "traces/custom" || effective.RedactUserContent {
+		t.Fatalf("effective trace = %+v, want enabled custom dir redact=false", effective)
+	}
+	store, err := Open(configPath, &config.Config{ResourcePools: config.ResourcePoolsConfig{Enabled: true, ConfigFile: "resource-pools.yaml"}})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+	stored, err := store.GetConfig(context.Background())
+	if err != nil {
+		t.Fatalf("GetConfig() error = %v", err)
+	}
+	effective = EffectiveTrace(stored.Trace)
+	if !effective.Enabled || effective.DumpDir != "traces/custom" || effective.RedactUserContent {
+		t.Fatalf("stored effective trace = %+v, want enabled custom dir redact=false", effective)
+	}
+	defaultTrace := EffectiveTrace(TraceConfig{})
+	if defaultTrace.Enabled || defaultTrace.DumpDir != "traces/ours" || !defaultTrace.RedactUserContent {
+		t.Fatalf("default trace = %+v, want disabled traces/ours redact=true", defaultTrace)
+	}
+}
+
 func TestStoreEmptyListsReturnNonNilSlices(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -601,6 +643,60 @@ func TestListStoredAuthsAppliesClaudeCodePoolCloakAttributes(t *testing.T) {
 	}
 	if attrs["cloak_sensitive_words"] != "Cursor,Windsurf" {
 		t.Fatalf("cloak_sensitive_words = %q, want Cursor,Windsurf", attrs["cloak_sensitive_words"])
+	}
+}
+
+func TestClaudeCodeProfileSnapshotPromoteDisabled(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	trace := `{"request":{"headers":{"User-Agent":"claude-cli/9.9.9 (external, sdk-cli)","anthropic-version":"2023-06-01","x-app":"cli","x-stainless-runtime":"node","x-stainless-lang":"js","x-stainless-retry-count":"0","x-stainless-timeout":"600","anthropic-beta":"claude-code-20250219,context-management-2025-06-27"},"body":{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=9.9.9.abc; cc_entrypoint=sdk-cli; cch=00000;"},{"type":"text","text":"You are a Claude agent."}],"tools":[]}}}`
+	snapshot, err := BuildClaudeCodeProfileSnapshot("phistory", "9.9.9", `{"version":"9.9.9"}`, trace, "prompt baseline")
+	if err != nil {
+		t.Fatalf("BuildClaudeCodeProfileSnapshot() error = %v", err)
+	}
+	saved, err := store.UpsertClaudeCodeProfileSnapshot(ctx, *snapshot)
+	if err != nil {
+		t.Fatalf("UpsertClaudeCodeProfileSnapshot() error = %v", err)
+	}
+	if saved.NormalizedProfile == nil || saved.NormalizedProfile.UserAgent != "claude-cli/9.9.9 (external, sdk-cli)" {
+		t.Fatalf("normalized profile = %+v, want trace user-agent", saved.NormalizedProfile)
+	}
+	diff, err := store.RefreshClaudeCodeProfileSnapshotDiff(ctx, saved.ID)
+	if err != nil {
+		t.Fatalf("RefreshClaudeCodeProfileSnapshotDiff() error = %v", err)
+	}
+	if diff.WarnCount == 0 {
+		t.Fatalf("diff warn count = 0, want drift from current profile")
+	}
+	before, err := store.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig() before promote error = %v", err)
+	}
+	doc, promoted, err := store.PromoteClaudeCodeProfileSnapshot(ctx, saved.ID)
+	if err == nil || !strings.Contains(err.Error(), "reference-only") {
+		t.Fatalf("PromoteClaudeCodeProfileSnapshot() error = %v, want reference-only error", err)
+	}
+	if doc != nil {
+		t.Fatalf("PromoteClaudeCodeProfileSnapshot() doc = %+v, want nil", doc)
+	}
+	if promoted == nil || promoted.ID != saved.ID {
+		t.Fatalf("PromoteClaudeCodeProfileSnapshot() snapshot = %+v, want saved snapshot", promoted)
+	}
+	after, err := store.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig() after promote error = %v", err)
+	}
+	beforeEffective := EffectiveClaudeCodeProfile(before.Profile)
+	afterEffective := EffectiveClaudeCodeProfile(after.Profile)
+	if afterEffective.Version != beforeEffective.Version || afterEffective.UserAgent != beforeEffective.UserAgent {
+		t.Fatalf("effective profile changed after disabled promote: before=%+v after=%+v", beforeEffective, afterEffective)
+	}
+	reloaded, err := store.GetClaudeCodeProfileSnapshot(ctx, saved.ID)
+	if err != nil {
+		t.Fatalf("GetClaudeCodeProfileSnapshot() error = %v", err)
+	}
+	if reloaded.Promoted || reloaded.PromotedAt != nil || reloaded.Status == "promoted" {
+		t.Fatalf("snapshot promoted marker = %+v, want unchanged reference snapshot", reloaded)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
@@ -22,6 +23,80 @@ func (h RuntimeHook) OnAuthRegistered(context.Context, *coreauth.Auth) {}
 
 // OnAuthUpdated implements coreauth.Hook.
 func (h RuntimeHook) OnAuthUpdated(context.Context, *coreauth.Auth) {}
+
+// OnRouteEvent implements coreauth.Hook.
+func (h RuntimeHook) OnRouteEvent(ctx context.Context, event coreauth.RouteEvent) {
+	if h.Config == nil || !h.Config.ResourcePools.Enabled || !strings.EqualFold(event.Provider, "claude") {
+		return
+	}
+	if strings.TrimSpace(event.Scope) != coreexecutor.PoolScopeClaudeAccountPool {
+		return
+	}
+	if strings.TrimSpace(event.AuthID) == "" {
+		return
+	}
+	store, err := Open(h.ConfigPath, h.Config)
+	if err != nil {
+		return
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+	account, err := store.GetAccountByAuthID(ctx, event.AuthID)
+	if err != nil || account == nil {
+		return
+	}
+	routingEvent := RoutingEvent{
+		RequestID:       event.RequestID,
+		AccountID:       account.ID,
+		AuthID:          event.AuthID,
+		Model:           event.Model,
+		RequestedModel:  event.RequestedModel,
+		ProxyResourceID: event.ProxyResourceID,
+		Sticky:          event.Sticky,
+		SessionKey:      event.SessionKey,
+		CapacityUsed:    event.CapacityUsed,
+		CapacityLimit:   event.CapacityLimit,
+		Decision:        event.Decision,
+		Reason:          event.Reason,
+		StatusCode:      event.StatusCode,
+		Error:           event.Error,
+		CreatedAt:       event.CreatedAt,
+	}
+	_ = store.RecordRoutingEvent(ctx, routingEvent)
+	level := "info"
+	switch event.Decision {
+	case "rejected":
+		level = "warn"
+	case "upstream_error":
+		level = "error"
+	case "selected":
+		level = "debug"
+	}
+	_ = WriteAccountPoolLog(ctx, h.ConfigPath, h.Config, AccountPoolLogEntry{
+		Time:            event.CreatedAt,
+		Level:           level,
+		Event:           "route_" + strings.TrimSpace(event.Decision),
+		RequestID:       event.RequestID,
+		Model:           event.Model,
+		RequestedModel:  event.RequestedModel,
+		AccountID:       account.ID,
+		AuthID:          event.AuthID,
+		ProxyResourceID: event.ProxyResourceID,
+		Sticky:          event.Sticky,
+		SessionKey:      event.SessionKey,
+		InFlight:        event.InFlight,
+		Concurrency:     event.Concurrency,
+		RPMUsed:         event.RPMUsed,
+		RPMLimit:        event.RPMLimit,
+		Decision:        event.Decision,
+		Reason:          event.Reason,
+		StatusCode:      event.StatusCode,
+		Error:           event.Error,
+	})
+	PublishAccountChanged(account.ID, "route")
+	PublishStatsChanged(coreexecutor.PoolScopeClaudeAccountPool)
+}
 
 // OnResult implements coreauth.Hook.
 func (h RuntimeHook) OnResult(ctx context.Context, result coreauth.Result) {
@@ -55,6 +130,19 @@ func (h RuntimeHook) OnResult(ctx context.Context, result coreauth.Result) {
 		statusCode = statusCodeFromAccountResult(false, message)
 	}
 	_ = store.MarkAccountModelResult(ctx, account.ID, result.Model, statusCode, message)
+	if !result.Success {
+		_ = WriteAccountPoolLog(ctx, h.ConfigPath, h.Config, AccountPoolLogEntry{
+			Level:      "warn",
+			Event:      "account_result",
+			Model:      result.Model,
+			AccountID:  account.ID,
+			AuthID:     result.AuthID,
+			StatusCode: statusCode,
+			Decision:   "result",
+			Reason:     "mark_result",
+			Error:      message,
+		})
+	}
 	PublishAccountChanged(account.ID, "result")
 	PublishStatsChanged(coreexecutor.PoolScopeClaudeAccountPool)
 }
@@ -109,7 +197,12 @@ func (p UsagePlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 			statusCode = http.StatusBadGateway
 		}
 	}
+	rawTotal := record.Detail.TotalTokens
+	if rawTotal <= 0 {
+		rawTotal = record.Detail.InputTokens + record.Detail.OutputTokens + record.Detail.CacheReadTokens + record.Detail.CacheCreationTokens
+	}
 	_ = store.RecordUsageLedger(ctx, UsageLedgerEntry{
+		RequestID:           logging.GetRequestID(ctx),
 		APIKeyPreview:       previewAPIKey(record.APIKey),
 		AccountID:           account.ID,
 		AuthID:              record.AuthID,
@@ -120,8 +213,36 @@ func (p UsagePlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 		OutputTokens:        record.Detail.OutputTokens,
 		CacheReadTokens:     record.Detail.CacheReadTokens,
 		CacheCreationTokens: record.Detail.CacheCreationTokens,
+		RawInputTokens:      record.Detail.InputTokens,
+		RawTotalTokens:      rawTotal,
 		Success:             !record.Failed,
 		CreatedAt:           record.RequestedAt,
+	})
+	level := "info"
+	event := "usage_success"
+	errorMessage := ""
+	if record.Failed {
+		level = "error"
+		event = "usage_failure"
+		errorMessage = strings.TrimSpace(record.Fail.Body)
+	}
+	_ = WriteAccountPoolLog(ctx, p.ConfigPath, p.Config, AccountPoolLogEntry{
+		Time:            record.RequestedAt,
+		Level:           level,
+		Event:           event,
+		RequestID:       logging.GetRequestID(ctx),
+		Model:           record.Model,
+		RequestedModel:  record.Alias,
+		AccountID:       account.ID,
+		AuthID:          record.AuthID,
+		StatusCode:      statusCode,
+		LatencyMS:       record.Latency.Milliseconds(),
+		InputTokens:     record.Detail.InputTokens,
+		OutputTokens:    record.Detail.OutputTokens,
+		CacheReadTokens: record.Detail.CacheReadTokens,
+		CacheCreate:     record.Detail.CacheCreationTokens,
+		TotalTokens:     rawTotal,
+		Error:           errorMessage,
 	})
 	PublishStatsChanged(coreexecutor.PoolScopeClaudeAccountPool)
 }

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -141,6 +142,84 @@ func (h *Handler) PutClaudeCodeProfile(c *gin.Context) {
 		"error":     "profile_locked",
 		"message":   "Claude Code request profile is built in and not editable at runtime",
 		"effective": resourcepool.EffectiveClaudeCodeProfile(resourcepool.ClaudeCodeProfile{}),
+	})
+}
+
+func (h *Handler) ListClaudeCodeProfileSnapshots(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	items, err := store.ListClaudeCodeProfileSnapshots(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list_failed", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+func (h *Handler) GetClaudeCodeProfileSnapshot(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	item, err := store.GetClaudeCodeProfileSnapshot(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		if resourcepool.IsProfileSnapshotNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "load_failed", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"item": item})
+}
+
+func (h *Handler) FetchClaudeCodeProfileSnapshot(c *gin.Context) {
+	var body resourcepool.ClaudeCodeProfileSnapshotFetchRequest
+	if err := c.ShouldBindJSON(&body); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	item, err := store.FetchClaudeCodeProfileSnapshot(c.Request.Context(), body)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "fetch_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishConfigChanged("profile_snapshot_fetch")
+	c.JSON(http.StatusOK, gin.H{"item": item})
+}
+
+func (h *Handler) DiffClaudeCodeProfileSnapshot(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	diff, err := store.RefreshClaudeCodeProfileSnapshotDiff(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		if resourcepool.IsProfileSnapshotNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "diff_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishConfigChanged("profile_snapshot_diff")
+	c.JSON(http.StatusOK, gin.H{"diff": diff})
+}
+
+func (h *Handler) PromoteClaudeCodeProfileSnapshot(c *gin.Context) {
+	c.JSON(http.StatusMethodNotAllowed, gin.H{
+		"error":   "profile_snapshot_reference_only",
+		"message": "Profile snapshots are reference-only and cannot be applied to production traffic",
 	})
 }
 
@@ -429,25 +508,155 @@ func (h *Handler) GetClaudeCodePoolStats(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "list_failed", "message": err.Error()})
 		return
 	}
-	authIDs := make([]string, 0, len(accounts))
-	statuses := make([]claudeapipool.RouteStatus, 0, len(accounts))
+	stats := resourcepool.AccountPoolStats{WindowSeconds: int64(time.Hour.Seconds()), AccountCount: len(accounts)}
 	for _, account := range accounts {
 		if strings.TrimSpace(account.AuthID) == "" {
 			continue
 		}
-		authIDs = append(authIDs, account.AuthID)
-		statuses = append(statuses, claudeapipool.AggregateScopedRouteStatus(coreexecutor.PoolScopeClaudeAccountPool, account.AuthID))
-	}
-	stats := claudeapipool.RuntimeStats(authIDs, statuses)
-	stats.AccountCount = len(accounts)
-	available := 0
-	for _, account := range accounts {
 		if account.Enabled && account.HasAuthData {
-			available++
+			stats.AvailableAccounts++
+		}
+		status := claudeapipool.AggregateScopedRouteStatus(coreexecutor.PoolScopeClaudeAccountPool, account.AuthID)
+		stats.InFlight += status.InFlight
+		stats.RPMUsed += status.RPMUsed
+		stats.RPMLimit += status.RPMLimit
+		if status.Cooling || status.Unavailable {
+			stats.CoolingAccounts++
 		}
 	}
-	stats.AvailableAccounts = available
+	activeKeys, warmLanes := claudeapipool.AffinityStats()
+	stats.ActiveAffinityKeys = activeKeys
+	stats.WarmLanes = warmLanes
+	usage, errUsage := store.UsageSummary(c.Request.Context(), time.Hour, 20)
+	if errUsage != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "usage_failed", "message": errUsage.Error()})
+		return
+	}
+	stats.RequestCount = usage.RequestCount
+	stats.SuccessCount = usage.SuccessCount
+	stats.FailureCount = usage.FailureCount
+	stats.SuccessRate = usage.SuccessRate
+	stats.InputTokens = usage.InputTokens
+	stats.OutputTokens = usage.OutputTokens
+	stats.CacheReadTokens = usage.CacheReadTokens
+	stats.CacheCreationTokens = usage.CacheCreationTokens
+	stats.RawInputTokens = usage.RawInputTokens
+	stats.RawTotalTokens = usage.RawTotalTokens
+	if totalCache := usage.CacheReadTokens + usage.CacheCreationTokens; totalCache > 0 {
+		stats.RealCacheRatio = float64(usage.CacheReadTokens) * 100 / float64(totalCache)
+	}
+	rejects, errRejects := store.CountLocalRoutingRejects(c.Request.Context(), time.Hour)
+	if errRejects != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "routing_failed", "message": errRejects.Error()})
+		return
+	}
+	stats.LocalRejectCount = rejects
+	recentErrors, errErrors := store.ListRecentRoutingErrors(c.Request.Context(), 10)
+	if errErrors != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "routing_failed", "message": errErrors.Error()})
+		return
+	}
+	stats.RecentErrors = recentErrors
 	c.JSON(http.StatusOK, gin.H{"stats": stats})
+}
+
+func (h *Handler) GetClaudeCodePoolLogConfig(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	doc, err := store.GetConfig(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "load_failed", "message": err.Error()})
+		return
+	}
+	effective := resourcepool.EffectiveAccountPoolLog(doc.ClaudeCode.Log)
+	c.JSON(http.StatusOK, gin.H{"raw": doc.ClaudeCode.Log, "effective": effective})
+}
+
+func (h *Handler) PutClaudeCodePoolLogConfig(c *gin.Context) {
+	var body resourcepool.AccountPoolLogConfig
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	doc, err := store.SaveClaudeCodePoolLogConfig(c.Request.Context(), body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "save_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishConfigChanged("account_pool_log")
+	resourcepool.PublishStatsChanged("account_pool_log")
+	c.JSON(http.StatusOK, gin.H{"raw": doc.ClaudeCode.Log, "effective": resourcepool.EffectiveAccountPoolLog(doc.ClaudeCode.Log)})
+}
+
+func (h *Handler) ListClaudeCodePoolLogs(c *gin.Context) {
+	h.mu.Lock()
+	cfg := h.cfg
+	configPath := h.configFilePath
+	h.mu.Unlock()
+	if cfg == nil || !cfg.ResourcePools.Enabled {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource pools disabled"})
+		return
+	}
+	logs, err := resourcepool.ReadAccountPoolLogs(c.Request.Context(), configPath, cfg, parsePositiveQueryInt(c, "limit", 200))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": logs})
+}
+
+func (h *Handler) ClearClaudeCodePoolLogs(c *gin.Context) {
+	h.mu.Lock()
+	cfg := h.cfg
+	configPath := h.configFilePath
+	h.mu.Unlock()
+	if cfg == nil || !cfg.ResourcePools.Enabled {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource pools disabled"})
+		return
+	}
+	if err := resourcepool.ClearAccountPoolLogs(c.Request.Context(), configPath, cfg); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "clear_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishStatsChanged("account_pool_logs")
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handler) DownloadClaudeCodePoolLog(c *gin.Context) {
+	h.mu.Lock()
+	cfg := h.cfg
+	configPath := h.configFilePath
+	h.mu.Unlock()
+	if cfg == nil || !cfg.ResourcePools.Enabled {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource pools disabled"})
+		return
+	}
+	path, err := resourcepool.AccountPoolLogFilePath(c.Request.Context(), configPath, cfg)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "path_failed", "message": err.Error()})
+		return
+	}
+	if strings.TrimSpace(path) == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "log_not_configured"})
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "log_not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "stat_failed", "message": err.Error()})
+		return
+	}
+	c.FileAttachment(path, "account-pool.log")
 }
 
 func (h *Handler) ListClaudeCodeRoutingEvents(c *gin.Context) {
@@ -666,7 +875,7 @@ func (h *Handler) countClaudeCodeUsageCalibrationTokens(ctx context.Context, aut
 	if err != nil {
 		return 0, err
 	}
-	applyClaudeCodeManagementHeaders(req, auth, false, userID)
+	applyClaudeCodeManagementHeaders(req, auth, false, userID, model)
 	resp, err := h.authManager.HttpRequest(ctx, auth, req)
 	if err != nil {
 		return 0, err
@@ -859,7 +1068,7 @@ func (h *Handler) fetchModelsFromClaudeCodeAccount(ctx context.Context, store *r
 	if err != nil {
 		return nil, err
 	}
-	applyClaudeCodeManagementHeaders(req, auth, false, claudeCodeManagementUserID(auth))
+	applyClaudeCodeManagementHeaders(req, auth, false, claudeCodeManagementUserID(auth), "")
 	resp, err := h.authManager.HttpRequest(ctx, auth, req)
 	if err != nil {
 		return nil, err
@@ -950,7 +1159,7 @@ func (h *Handler) testClaudeCodeAccount(ctx context.Context, store *resourcepool
 		account, _ = store.MarkAccountTestResult(ctx, account.ID, false, err.Error())
 		return account, "", err
 	}
-	applyClaudeCodeManagementHeaders(req, auth, false, userID)
+	applyClaudeCodeManagementHeaders(req, auth, false, userID, model)
 	resp, err := h.authManager.HttpRequest(ctx, auth, req)
 	if err != nil {
 		message := err.Error()
@@ -1004,8 +1213,8 @@ func resolveClaudeCodeAccountTestModel(ctx context.Context, store *resourcepool.
 }
 
 const (
-	claudeCodeManagementVersion         = "2.1.177"
-	claudeCodeManagementUserAgent       = "claude-cli/" + claudeCodeManagementVersion + " (external, cli)"
+	claudeCodeManagementVersion         = resourcepool.DefaultClaudeCodeProfileVersion
+	claudeCodeManagementUserAgent       = "claude-cli/" + claudeCodeManagementVersion + " (external, sdk-cli)"
 	claudeCodeManagementIdentityPrompt  = "You are Claude Code, Anthropic's official CLI for Claude."
 	claudeCodeManagementFingerprintSalt = "59cf53e54c78"
 	claudeCodeManagementCCHSeed         = 0x6E52736AC806831E
@@ -1094,7 +1303,7 @@ func signClaudeCodeManagementBody(body []byte) []byte {
 	return bytes.Replace(body, placeholder, []byte("cch="+cch+";"), 1)
 }
 
-func applyClaudeCodeManagementHeaders(req *http.Request, auth *coreauth.Auth, stream bool, userID string) {
+func applyClaudeCodeManagementHeaders(req *http.Request, auth *coreauth.Auth, stream bool, userID string, model string) {
 	if req == nil {
 		return
 	}
@@ -1109,13 +1318,50 @@ func applyClaudeCodeManagementHeaders(req *http.Request, auth *coreauth.Auth, st
 	req.Header.Set("user-agent", claudeCodeManagementUserAgent)
 	req.Header.Set("x-app", "cli")
 	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11")
-	req.Header.Set("anthropic-dangerous-direct-browser-access", "true")
+	req.Header.Set("anthropic-beta", strings.Join(claudeCodeManagementBetasForModel(model), ","))
 	req.Header.Set("x-stainless-runtime", "node")
 	req.Header.Set("x-stainless-lang", "js")
 	req.Header.Set("x-stainless-retry-count", "0")
 	req.Header.Set("x-stainless-timeout", "600")
 	req.Header.Set("x-claude-code-session-id", claudeCodeManagementSessionID(auth, userID))
+}
+
+func claudeCodeManagementBetasForModel(model string) []string {
+	modelLower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(modelLower, "haiku"):
+		return []string{
+			"interleaved-thinking-2025-05-14",
+			"thinking-token-count-2026-05-13",
+			"context-management-2025-06-27",
+			"prompt-caching-scope-2026-01-05",
+			"claude-code-20250219",
+			"advisor-tool-2026-03-01",
+		}
+	case strings.Contains(modelLower, "opus"):
+		return []string{
+			"claude-code-20250219",
+			"context-1m-2025-08-07",
+			"interleaved-thinking-2025-05-14",
+			"thinking-token-count-2026-05-13",
+			"context-management-2025-06-27",
+			"prompt-caching-scope-2026-01-05",
+			"mid-conversation-system-2026-04-07",
+			"advisor-tool-2026-03-01",
+			"effort-2025-11-24",
+		}
+	default:
+		return []string{
+			"claude-code-20250219",
+			"context-1m-2025-08-07",
+			"interleaved-thinking-2025-05-14",
+			"thinking-token-count-2026-05-13",
+			"context-management-2025-06-27",
+			"prompt-caching-scope-2026-01-05",
+			"advisor-tool-2026-03-01",
+			"effort-2025-11-24",
+		}
+	}
 }
 
 func claudeCodeManagementUserID(auth *coreauth.Auth) string {

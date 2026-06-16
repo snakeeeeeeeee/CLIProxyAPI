@@ -486,6 +486,57 @@ LIMIT ?
 	return out, nil
 }
 
+// ListRecentRoutingErrors returns recent local or upstream routing failures.
+func (s *Store) ListRecentRoutingErrors(ctx context.Context, limit int) ([]RoutingEvent, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, request_id, account_id, auth_id, model, requested_model, proxy_resource_id, sticky, session_key,
+       capacity_used, capacity_limit, decision, reason, status_code, error, created_at
+FROM claude_code_routing_events
+WHERE decision IN ('rejected', 'upstream_error') OR status_code >= 400 OR TRIM(error) <> ''
+ORDER BY id DESC
+LIMIT ?
+`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list recent claude code routing errors: %w", err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	out := make([]RoutingEvent, 0)
+	for rows.Next() {
+		event, err := scanRoutingEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recent claude code routing errors: %w", err)
+	}
+	return out, nil
+}
+
+// CountLocalRoutingRejects counts recent account-pool local rejections.
+func (s *Store) CountLocalRoutingRejects(ctx context.Context, window time.Duration) (int64, error) {
+	if window <= 0 {
+		window = defaultUsageWindow
+	}
+	since := dbTime(time.Now().Add(-window))
+	var count int64
+	row := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM claude_code_routing_events
+WHERE created_at >= ? AND decision = 'rejected'
+`, since)
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count claude code local routing rejects: %w", err)
+	}
+	return count, nil
+}
+
 // RecordUsageLedger stores a lightweight request accounting row.
 func (s *Store) RecordUsageLedger(ctx context.Context, entry UsageLedgerEntry) error {
 	if s == nil || s.db == nil {
@@ -496,12 +547,12 @@ func (s *Store) RecordUsageLedger(ctx context.Context, entry UsageLedgerEntry) e
 	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO claude_code_usage_ledger(request_id, api_key_preview, account_id, auth_id, model, requested_model,
-	status_code, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, estimated_cost, success, created_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	status_code, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, raw_input_tokens, raw_total_tokens, estimated_cost, success, created_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, strings.TrimSpace(entry.RequestID), strings.TrimSpace(entry.APIKeyPreview), strings.TrimSpace(entry.AccountID), strings.TrimSpace(entry.AuthID),
-		strings.TrimSpace(entry.Model), strings.TrimSpace(entry.RequestedModel), entry.StatusCode, nonNegativeInt64(entry.InputTokens),
-		nonNegativeInt64(entry.OutputTokens), nonNegativeInt64(entry.CacheReadTokens), nonNegativeInt64(entry.CacheCreationTokens),
-		entry.EstimatedCost, boolInt(entry.Success), dbTime(entry.CreatedAt))
+	strings.TrimSpace(entry.Model), strings.TrimSpace(entry.RequestedModel), entry.StatusCode, nonNegativeInt64(entry.InputTokens),
+	nonNegativeInt64(entry.OutputTokens), nonNegativeInt64(entry.CacheReadTokens), nonNegativeInt64(entry.CacheCreationTokens),
+	nonNegativeInt64(entry.RawInputTokens), nonNegativeInt64(entry.RawTotalTokens), entry.EstimatedCost, boolInt(entry.Success), dbTime(entry.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("record claude code usage ledger: %w", err)
 	}
@@ -521,11 +572,14 @@ func (s *Store) UsageSummary(ctx context.Context, window time.Duration, limit in
 	row := s.db.QueryRowContext(ctx, `
 SELECT COUNT(*), COALESCE(SUM(success), 0), COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0),
        COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-       COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0), COALESCE(SUM(estimated_cost), 0)
+       COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0),
+       COALESCE(SUM(CASE WHEN raw_input_tokens > 0 THEN raw_input_tokens ELSE input_tokens END), 0),
+       COALESCE(SUM(CASE WHEN raw_total_tokens > 0 THEN raw_total_tokens ELSE input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens END), 0),
+       COALESCE(SUM(estimated_cost), 0)
 FROM claude_code_usage_ledger
 WHERE created_at >= ?
 `, since)
-	if err := row.Scan(&summary.RequestCount, &summary.SuccessCount, &summary.FailureCount, &summary.InputTokens, &summary.OutputTokens, &summary.CacheReadTokens, &summary.CacheCreationTokens, &summary.EstimatedCost); err != nil {
+	if err := row.Scan(&summary.RequestCount, &summary.SuccessCount, &summary.FailureCount, &summary.InputTokens, &summary.OutputTokens, &summary.CacheReadTokens, &summary.CacheCreationTokens, &summary.RawInputTokens, &summary.RawTotalTokens, &summary.EstimatedCost); err != nil {
 		return summary, fmt.Errorf("summarize claude code usage ledger: %w", err)
 	}
 	summary.SuccessRate = ratioPercent(summary.SuccessCount, summary.RequestCount)
@@ -535,6 +589,10 @@ WHERE created_at >= ?
 		return summary, err
 	}
 	summary.ByModel, err = s.usageSummaryItems(ctx, since, "model")
+	if err != nil {
+		return summary, err
+	}
+	summary.ByRequestedModel, err = s.usageSummaryItems(ctx, since, "requested_model")
 	if err != nil {
 		return summary, err
 	}
@@ -549,7 +607,10 @@ func (s *Store) usageSummaryItems(ctx context.Context, since, column string) ([]
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
 SELECT %s, COUNT(*), COALESCE(SUM(success), 0), COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0),
        COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-       COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0), COALESCE(SUM(estimated_cost), 0)
+       COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0),
+       COALESCE(SUM(CASE WHEN raw_input_tokens > 0 THEN raw_input_tokens ELSE input_tokens END), 0),
+       COALESCE(SUM(CASE WHEN raw_total_tokens > 0 THEN raw_total_tokens ELSE input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens END), 0),
+       COALESCE(SUM(estimated_cost), 0)
 FROM claude_code_usage_ledger
 WHERE created_at >= ? AND TRIM(%s) <> ''
 GROUP BY %s
@@ -565,7 +626,7 @@ LIMIT 20
 	out := make([]UsageSummaryItem, 0)
 	for rows.Next() {
 		var item UsageSummaryItem
-		if err := rows.Scan(&item.Key, &item.RequestCount, &item.SuccessCount, &item.FailureCount, &item.InputTokens, &item.OutputTokens, &item.CacheReadTokens, &item.CacheCreationTokens, &item.EstimatedCost); err != nil {
+		if err := rows.Scan(&item.Key, &item.RequestCount, &item.SuccessCount, &item.FailureCount, &item.InputTokens, &item.OutputTokens, &item.CacheReadTokens, &item.CacheCreationTokens, &item.RawInputTokens, &item.RawTotalTokens, &item.EstimatedCost); err != nil {
 			return nil, fmt.Errorf("scan claude code usage by %s: %w", column, err)
 		}
 		item.SuccessRate = ratioPercent(item.SuccessCount, item.RequestCount)
@@ -580,7 +641,10 @@ LIMIT 20
 func (s *Store) listRecentUsage(ctx context.Context, limit int) ([]UsageLedgerEntry, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, request_id, api_key_preview, account_id, auth_id, model, requested_model, status_code,
-       input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, estimated_cost, success, created_at
+       input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+       CASE WHEN raw_input_tokens > 0 THEN raw_input_tokens ELSE input_tokens END,
+       CASE WHEN raw_total_tokens > 0 THEN raw_total_tokens ELSE input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens END,
+       estimated_cost, success, created_at
 FROM claude_code_usage_ledger
 ORDER BY id DESC
 LIMIT ?
@@ -709,6 +773,8 @@ func scanUsageLedgerEntry(rows interface {
 		&entry.OutputTokens,
 		&entry.CacheReadTokens,
 		&entry.CacheCreationTokens,
+		&entry.RawInputTokens,
+		&entry.RawTotalTokens,
 		&entry.EstimatedCost,
 		&success,
 		&createdRaw,
@@ -754,23 +820,20 @@ func (s *Store) hydrateAccountRuntime(ctx context.Context, account *ClaudeCodeAc
 	if capacity, err := s.GetAccountCapacity(ctx, account.ID); err == nil {
 		account.Capacity = capacity
 		status := claudeapipool.AggregateScopedRouteStatus(coreexecutor.PoolScopeClaudeAccountPool, account.AuthID)
-		limit := capacity.BaseRPM + capacity.StickyBuffer
-		used := status.RPMUsed
-		if int(status.InFlight) > used {
-			used = int(status.InFlight)
-		}
 		bufferUsed := 0
-		if used > capacity.BaseRPM {
-			bufferUsed = used - capacity.BaseRPM
+		if status.RPMUsed > capacity.BaseRPM {
+			bufferUsed = status.RPMUsed - capacity.BaseRPM
 		}
+		capacityLimit := capacity.ConcurrencyLimit
+		capacityUsed := int(status.InFlight)
 		runtime := &AccountRuntimeCapacity{
 			AccountID:        account.ID,
 			BaseRPM:          capacity.BaseRPM,
 			ConcurrencyLimit: capacity.ConcurrencyLimit,
 			MaxSessions:      capacity.MaxSessions,
 			StickyBuffer:     capacity.StickyBuffer,
-			CapacityUsed:     used,
-			CapacityLimit:    limit,
+			CapacityUsed:     capacityUsed,
+			CapacityLimit:    capacityLimit,
 			InFlight:         status.InFlight,
 			RPMUsed:          status.RPMUsed,
 			RPMLimit:         status.RPMLimit,

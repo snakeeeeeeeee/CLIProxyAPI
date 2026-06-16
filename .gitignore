@@ -13,11 +13,14 @@ resource-pools.db*
 # Generated content
 bin/*
 logs/*
+acc-pool-logs/
 conv/*
 temp/*
 refs/*
+traces/
 plugins/*
 examples/plugin/bin/*
+*.nohup.log
 
 # Storage backends
 pgstore/*

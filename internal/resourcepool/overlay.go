@@ -365,6 +365,7 @@ func applyClaudeCodeProfileAttributes(auth *coreauth.Auth, profile EffectiveClau
 	if auth.Attributes == nil {
 		auth.Attributes = make(map[string]string)
 	}
+	auth.Attributes[AttrProfileManaged] = "true"
 	auth.Attributes[AttrProfileVersion] = strings.TrimSpace(profile.Version)
 	auth.Attributes[AttrProfileUserAgent] = strings.TrimSpace(profile.UserAgent)
 	auth.Attributes[AttrProfileSystemPrompt] = strings.TrimSpace(profile.SystemPrompt)

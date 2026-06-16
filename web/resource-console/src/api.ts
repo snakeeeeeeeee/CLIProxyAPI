@@ -200,8 +200,29 @@ export interface ClaudeCodePoolEffectiveConfig {
   pure_mode: boolean;
   cloak: CloakEffectiveConfig;
   usage: UsageEffectiveConfig;
+  log: AccountPoolLogEffectiveConfig;
   virtual_cache: VirtualCacheEffectiveConfig;
   routing: RoutingEffectiveConfig;
+}
+
+export interface AccountPoolLogEffectiveConfig {
+  enabled: boolean;
+  level: "debug" | "info" | "warn" | "error" | string;
+  dir: string;
+  max_size_mb: number;
+  max_backups: number;
+  redact: boolean;
+}
+
+export interface AccountPoolLogRawConfig {
+  enabled?: boolean;
+  level?: string;
+  dir?: string;
+  max_size_mb?: number;
+  "max-size-mb"?: number;
+  max_backups?: number;
+  "max-backups"?: number;
+  redact?: boolean;
 }
 
 export interface ClaudeCodePoolRawConfig {
@@ -216,6 +237,7 @@ export interface ClaudeCodePoolRawConfig {
     clean_input_tokens?: boolean;
     system_prompt_overhead_tokens?: number;
   };
+  log?: AccountPoolLogRawConfig;
   virtual_cache?: {
     enabled?: boolean;
     mode?: string;
@@ -277,6 +299,40 @@ export interface ClaudeCodeProfileResponse {
     Pick<ClaudeCodeProfile, "updated_from" | "updated_at">;
 }
 
+export interface ClaudeCodeProfileSnapshot {
+  id: string;
+  source: string;
+  version: string;
+  status: string;
+  meta_json?: string;
+  trace_jsonl?: string;
+  prompt_md?: string;
+  normalized_profile_json?: string;
+  normalized_profile?: ClaudeCodeProfile;
+  prompt_hash?: string;
+  trace_hash?: string;
+  diff_report?: string;
+  fatal_count: number;
+  warn_count: number;
+  promoted: boolean;
+  last_error?: string;
+  fetched_at?: string;
+  promoted_at?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface ClaudeCodeProfileSnapshotDiff {
+  snapshot_id: string;
+  version: string;
+  current_version: string;
+  profile_fingerprint: string;
+  fatal_count: number;
+  warn_count: number;
+  report: string;
+  issues: string[];
+}
+
 export interface AffinityAutoPlan {
   enabled: boolean;
   effective_lanes: number;
@@ -300,16 +356,17 @@ export interface ClaudeCodePoolStats {
   request_count: number;
   success_count: number;
   failure_count: number;
-  status_429: number;
-  status_529: number;
-  status_5xx: number;
   success_rate: number;
   real_cache_ratio: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
   input_tokens: number;
   output_tokens: number;
-  affinity_auto_plan: AffinityAutoPlan;
+  raw_input_tokens: number;
+  raw_total_tokens: number;
+  local_reject_count: number;
+  recent_errors?: RoutingEvent[];
+  affinity_auto_plan?: AffinityAutoPlan;
 }
 
 export interface ClaudeCodeModel {
@@ -363,6 +420,8 @@ export interface UsageLedgerEntry {
   output_tokens?: number;
   cache_read_tokens?: number;
   cache_creation_tokens?: number;
+  raw_input_tokens?: number;
+  raw_total_tokens?: number;
   estimated_cost?: number;
   success: boolean;
   created_at: string;
@@ -378,6 +437,8 @@ export interface UsageSummaryItem {
   output_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
+  raw_input_tokens: number;
+  raw_total_tokens: number;
   estimated_cost: number;
 }
 
@@ -391,10 +452,47 @@ export interface UsageSummary {
   output_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
+  raw_input_tokens: number;
+  raw_total_tokens: number;
   estimated_cost: number;
   by_account: UsageSummaryItem[];
   by_model: UsageSummaryItem[];
+  by_requested_model: UsageSummaryItem[];
   recent: UsageLedgerEntry[];
+}
+
+export interface AccountPoolLogEntry {
+  ts: string;
+  level: string;
+  event: string;
+  request_id?: string;
+  path?: string;
+  model?: string;
+  requested_model?: string;
+  account_id?: string;
+  auth_id?: string;
+  proxy_resource_id?: string;
+  sticky?: boolean;
+  session_key?: string;
+  in_flight?: number;
+  concurrency_limit?: number;
+  rpm_used?: number;
+  rpm_limit?: number;
+  decision?: string;
+  reason?: string;
+  status_code?: number;
+  latency_ms?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+  total_tokens?: number;
+  error?: string;
+}
+
+export interface AccountPoolLogLine {
+  line: string;
+  entry?: AccountPoolLogEntry;
 }
 
 export interface UsageCalibration {
@@ -540,11 +638,42 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return data as T;
 }
 
+async function download(path: string): Promise<Blob> {
+  const key = getManagementKey().trim();
+  const headers = new Headers();
+  if (key) {
+    headers.set("X-Management-Key", key);
+  }
+  const response = await fetch(`/v0/management${path}`, { headers });
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`;
+    try {
+      const payload = (await response.json()) as { message?: string; error?: string };
+      message = payload.message || payload.error || message;
+    } catch {
+      // Keep the status message when the download endpoint returns a non-JSON body.
+    }
+    throw new ManagementAPIError(message, response.status);
+  }
+  return response.blob();
+}
+
 export const api = {
   config: () => request<ResourcePoolConfig>("/resource-pools/config"),
   accounts: () => request<{ items: AccountRow[] }>("/claude-code-account-pool/accounts"),
   poolConfig: () => request<ClaudeCodePoolConfigResponse>("/claude-code-account-pool/config"),
   poolProfile: () => request<ClaudeCodeProfileResponse>("/claude-code-account-pool/profile"),
+  profileSnapshots: () => request<{ items: ClaudeCodeProfileSnapshot[] }>("/claude-code-account-pool/profile-snapshots"),
+  profileSnapshot: (id: string) => request<{ item: ClaudeCodeProfileSnapshot }>(`/claude-code-account-pool/profile-snapshots/${id}`),
+  fetchProfileSnapshot: (version?: string, latest = false) =>
+    request<{ item: ClaudeCodeProfileSnapshot }>("/claude-code-account-pool/profile-snapshots/fetch", {
+      method: "POST",
+      body: JSON.stringify({ version: version || "", latest })
+    }),
+  diffProfileSnapshot: (id: string) =>
+    request<{ diff: ClaudeCodeProfileSnapshotDiff }>(`/claude-code-account-pool/profile-snapshots/${id}/diff`, {
+      method: "POST"
+    }),
   savePoolConfig: (payload: ClaudeCodePoolRawConfig) =>
     request<ClaudeCodePoolConfigResponse>("/claude-code-account-pool/config", {
       method: "PUT",
@@ -553,6 +682,15 @@ export const api = {
   poolStats: () => request<{ stats: ClaudeCodePoolStats }>("/claude-code-account-pool/stats"),
   routingEvents: () => request<{ items: RoutingEvent[] }>("/claude-code-account-pool/routing-events?limit=80"),
   usageSummary: () => request<{ summary: UsageSummary }>("/claude-code-account-pool/usage?window=1h&limit=80"),
+  poolLogConfig: () => request<{ raw: AccountPoolLogRawConfig; effective: AccountPoolLogEffectiveConfig }>("/claude-code-account-pool/log-config"),
+  savePoolLogConfig: (payload: AccountPoolLogRawConfig) =>
+    request<{ raw: AccountPoolLogRawConfig; effective: AccountPoolLogEffectiveConfig }>("/claude-code-account-pool/log-config", {
+      method: "PUT",
+      body: JSON.stringify(payload)
+  }),
+  poolLogs: () => request<{ items: AccountPoolLogLine[] }>("/claude-code-account-pool/logs?limit=120"),
+  clearPoolLogs: () => request<{ status: string }>("/claude-code-account-pool/logs/clear", { method: "POST" }),
+  downloadPoolLogs: () => download("/claude-code-account-pool/logs/download"),
   usageCalibrations: () => request<UsageCalibrationResponse>("/claude-code-account-pool/usage-calibrations"),
   calibrateUsage: (model: string, accountID?: string) =>
     request<{ item: UsageCalibration; warning?: string }>("/claude-code-account-pool/usage-calibrations/calibrate", {

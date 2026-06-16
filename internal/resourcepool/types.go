@@ -12,7 +12,7 @@ import (
 const (
 	DefaultConfigFileName           = "resource-pools.yaml"
 	DefaultDBFileName               = "resource-pools.db"
-	DefaultClaudeCodeProfileVersion = "2.1.177"
+	DefaultClaudeCodeProfileVersion = "2.1.178"
 	DefaultCleanInputOverheadTokens = 1909
 
 	HealthUnknown   = "unknown"
@@ -31,6 +31,7 @@ const (
 	AttrProfileSystemPrompt        = "claude_code_profile_system_prompt"
 	AttrProfileBillingBlockEnabled = "claude_code_profile_billing_block_enabled"
 	AttrProfileMetadataUserIDMode  = "claude_code_profile_metadata_user_id_mode"
+	AttrProfileManaged             = "claude_code_profile_managed"
 
 	AttrCapacityBaseRPM          = "claude_code_capacity_base_rpm"
 	AttrCapacityConcurrencyLimit = "claude_code_capacity_concurrency_limit"
@@ -57,6 +58,7 @@ type ConfigFile struct {
 	DatabasePath string                 `yaml:"database-path,omitempty" json:"database_path,omitempty"`
 	ProxyHealth  ProxyHealthConfig      `yaml:"proxy-health,omitempty" json:"proxy_health,omitempty"`
 	AccountQuota AccountQuotaConfig     `yaml:"account-quota,omitempty" json:"account_quota,omitempty"`
+	Trace        TraceConfig            `yaml:"trace,omitempty" json:"trace,omitempty"`
 	ClaudeCode   ClaudeCodePoolConfig   `yaml:"claude-code-pool,omitempty" json:"claude_code_pool,omitempty"`
 	Profile      ClaudeCodeProfile      `yaml:"claude-code-profile,omitempty" json:"claude_code_profile,omitempty"`
 	Proxies      []ProxyResourceSeed    `yaml:"proxies,omitempty" json:"proxies,omitempty"`
@@ -81,6 +83,40 @@ type AccountQuotaConfig struct {
 	Concurrency int    `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
 }
 
+// TraceConfig controls local redacted Claude Code request trace dumps.
+type TraceConfig struct {
+	Enabled           *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	DumpDir           string `yaml:"dump-dir,omitempty" json:"dump_dir,omitempty"`
+	RedactUserContent *bool  `yaml:"redact-user-content,omitempty" json:"redact_user_content,omitempty"`
+}
+
+// AccountPoolLogConfig controls dedicated Claude Code account-pool JSONL diagnostics.
+type AccountPoolLogConfig struct {
+	Enabled    *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Level      string `yaml:"level,omitempty" json:"level,omitempty"`
+	Dir        string `yaml:"dir,omitempty" json:"dir,omitempty"`
+	MaxSizeMB  int    `yaml:"max-size-mb,omitempty" json:"max_size_mb,omitempty"`
+	MaxBackups int    `yaml:"max-backups,omitempty" json:"max_backups,omitempty"`
+	Redact     *bool  `yaml:"redact,omitempty" json:"redact,omitempty"`
+}
+
+// EffectiveAccountPoolLogConfig is the normalized runtime view of account-pool logging.
+type EffectiveAccountPoolLogConfig struct {
+	Enabled    bool   `json:"enabled"`
+	Level      string `json:"level"`
+	Dir        string `json:"dir"`
+	MaxSizeMB  int    `json:"max_size_mb"`
+	MaxBackups int    `json:"max_backups"`
+	Redact     bool   `json:"redact"`
+}
+
+// EffectiveTraceConfig is the normalized runtime trace dump policy.
+type EffectiveTraceConfig struct {
+	Enabled           bool   `json:"enabled"`
+	DumpDir           string `json:"dump_dir"`
+	RedactUserContent bool   `json:"redact_user_content"`
+}
+
 // EffectiveProxyHealthConfig is the normalized runtime health-check policy.
 type EffectiveProxyHealthConfig struct {
 	Enabled           bool          `json:"enabled"`
@@ -100,6 +136,7 @@ type ClaudeCodePoolConfig struct {
 	PureMode                *bool                            `yaml:"pure-mode,omitempty" json:"pure_mode,omitempty"`
 	Cloak                   *config.CloakConfig              `yaml:"cloak,omitempty" json:"cloak,omitempty"`
 	Usage                   ClaudeCodeUsageConfig            `yaml:"usage,omitempty" json:"usage,omitempty"`
+	Log                     AccountPoolLogConfig             `yaml:"log,omitempty" json:"log,omitempty"`
 	VirtualCache            claudeapipool.VirtualCacheConfig `yaml:"virtual-cache,omitempty" json:"virtual_cache,omitempty"`
 	Routing                 claudeapipool.RoutingConfig      `yaml:"routing,omitempty" json:"routing,omitempty"`
 	PerAccountRPM           int                              `yaml:"per-account-rpm,omitempty" json:"per_account_rpm,omitempty"`
@@ -129,6 +166,7 @@ type EffectiveClaudeCodePoolConfig struct {
 	PureMode     bool                                      `json:"pure_mode"`
 	Cloak        EffectiveCloakConfig                      `json:"cloak"`
 	Usage        EffectiveClaudeCodeUsageConfig            `json:"usage"`
+	Log          EffectiveAccountPoolLogConfig             `json:"log"`
 	VirtualCache claudeapipool.EffectiveVirtualCacheConfig `json:"virtual_cache"`
 	Routing      claudeapipool.EffectiveRoutingConfig      `json:"routing"`
 }
@@ -177,6 +215,50 @@ type EffectiveClaudeCodeProfileConfig struct {
 	UpdatedAt           *time.Time        `json:"updated_at,omitempty"`
 	Locked              bool              `json:"locked"`
 	SystemPromptMode    string            `json:"system_prompt_mode"`
+}
+
+// ClaudeCodeProfileSnapshot stores a versioned request-shape baseline fetched
+// from an external source such as Phistory.
+type ClaudeCodeProfileSnapshot struct {
+	ID                    string             `json:"id"`
+	Source                string             `json:"source"`
+	Version               string             `json:"version"`
+	Status                string             `json:"status"`
+	MetaJSON              string             `json:"meta_json,omitempty"`
+	TraceJSONL            string             `json:"trace_jsonl,omitempty"`
+	PromptMD              string             `json:"prompt_md,omitempty"`
+	NormalizedProfileJSON string             `json:"normalized_profile_json,omitempty"`
+	NormalizedProfile     *ClaudeCodeProfile `json:"normalized_profile,omitempty"`
+	PromptHash            string             `json:"prompt_hash,omitempty"`
+	TraceHash             string             `json:"trace_hash,omitempty"`
+	DiffReport            string             `json:"diff_report,omitempty"`
+	FatalCount            int                `json:"fatal_count"`
+	WarnCount             int                `json:"warn_count"`
+	Promoted              bool               `json:"promoted"`
+	LastError             string             `json:"last_error,omitempty"`
+	FetchedAt             *time.Time         `json:"fetched_at,omitempty"`
+	PromotedAt            *time.Time         `json:"promoted_at,omitempty"`
+	CreatedAt             time.Time          `json:"created_at,omitempty"`
+	UpdatedAt             time.Time          `json:"updated_at,omitempty"`
+}
+
+// ClaudeCodeProfileSnapshotFetchRequest controls a profile baseline fetch.
+type ClaudeCodeProfileSnapshotFetchRequest struct {
+	Version string `json:"version,omitempty"`
+	Latest  bool   `json:"latest,omitempty"`
+	Source  string `json:"source,omitempty"`
+}
+
+// ClaudeCodeProfileSnapshotDiff summarizes current-profile drift from a snapshot.
+type ClaudeCodeProfileSnapshotDiff struct {
+	SnapshotID         string   `json:"snapshot_id"`
+	Version            string   `json:"version"`
+	CurrentVersion     string   `json:"current_version"`
+	ProfileFingerprint string   `json:"profile_fingerprint"`
+	FatalCount         int      `json:"fatal_count"`
+	WarnCount          int      `json:"warn_count"`
+	Report             string   `json:"report"`
+	Issues             []string `json:"issues"`
 }
 
 // AccountCapacityConfig is the persisted lightweight local capacity model.
@@ -267,6 +349,8 @@ type UsageLedgerEntry struct {
 	OutputTokens        int64     `json:"output_tokens,omitempty"`
 	CacheReadTokens     int64     `json:"cache_read_tokens,omitempty"`
 	CacheCreationTokens int64     `json:"cache_creation_tokens,omitempty"`
+	RawInputTokens      int64     `json:"raw_input_tokens,omitempty"`
+	RawTotalTokens      int64     `json:"raw_total_tokens,omitempty"`
 	EstimatedCost       float64   `json:"estimated_cost,omitempty"`
 	Success             bool      `json:"success"`
 	CreatedAt           time.Time `json:"created_at"`
@@ -283,9 +367,12 @@ type UsageSummary struct {
 	OutputTokens        int64              `json:"output_tokens"`
 	CacheReadTokens     int64              `json:"cache_read_tokens"`
 	CacheCreationTokens int64              `json:"cache_creation_tokens"`
+	RawInputTokens      int64              `json:"raw_input_tokens"`
+	RawTotalTokens      int64              `json:"raw_total_tokens"`
 	EstimatedCost       float64            `json:"estimated_cost"`
 	ByAccount           []UsageSummaryItem `json:"by_account"`
 	ByModel             []UsageSummaryItem `json:"by_model"`
+	ByRequestedModel    []UsageSummaryItem `json:"by_requested_model"`
 	Recent              []UsageLedgerEntry `json:"recent"`
 }
 
@@ -300,7 +387,35 @@ type UsageSummaryItem struct {
 	OutputTokens        int64   `json:"output_tokens"`
 	CacheReadTokens     int64   `json:"cache_read_tokens"`
 	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	RawInputTokens      int64   `json:"raw_input_tokens"`
+	RawTotalTokens      int64   `json:"raw_total_tokens"`
 	EstimatedCost       float64 `json:"estimated_cost"`
+}
+
+// AccountPoolStats is the unified management view for Claude Code account-pool operations.
+type AccountPoolStats struct {
+	WindowSeconds       int64          `json:"window_seconds"`
+	AccountCount        int            `json:"account_count"`
+	AvailableAccounts   int            `json:"available_accounts"`
+	CoolingAccounts     int            `json:"cooling_accounts"`
+	InFlight            int64          `json:"in_flight"`
+	RPMUsed             int            `json:"rpm_used"`
+	RPMLimit            int            `json:"rpm_limit"`
+	ActiveAffinityKeys  int            `json:"active_affinity_keys"`
+	WarmLanes           int            `json:"warm_lanes"`
+	RequestCount        int64          `json:"request_count"`
+	SuccessCount        int64          `json:"success_count"`
+	FailureCount        int64          `json:"failure_count"`
+	SuccessRate         float64        `json:"success_rate"`
+	RealCacheRatio      float64        `json:"real_cache_ratio"`
+	InputTokens         int64          `json:"input_tokens"`
+	OutputTokens        int64          `json:"output_tokens"`
+	CacheReadTokens     int64          `json:"cache_read_tokens"`
+	CacheCreationTokens int64          `json:"cache_creation_tokens"`
+	RawInputTokens      int64          `json:"raw_input_tokens"`
+	RawTotalTokens      int64          `json:"raw_total_tokens"`
+	LocalRejectCount    int64          `json:"local_reject_count"`
+	RecentErrors        []RoutingEvent `json:"recent_errors,omitempty"`
 }
 
 // UsageCalibration stores prompt/profile overhead calibration for one model/profile pair.

@@ -163,6 +163,8 @@ CREATE TABLE IF NOT EXISTS claude_code_usage_ledger (
 	output_tokens INTEGER NOT NULL DEFAULT 0,
 	cache_read_tokens INTEGER NOT NULL DEFAULT 0,
 	cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+	raw_input_tokens INTEGER NOT NULL DEFAULT 0,
+	raw_total_tokens INTEGER NOT NULL DEFAULT 0,
 	estimated_cost REAL NOT NULL DEFAULT 0,
 	success INTEGER NOT NULL DEFAULT 0,
 	created_at TEXT NOT NULL
@@ -185,6 +187,31 @@ CREATE TABLE IF NOT EXISTS claude_code_usage_calibrations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_claude_code_usage_calibrations_updated ON claude_code_usage_calibrations(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS claude_code_profile_snapshots (
+	id TEXT PRIMARY KEY,
+	source TEXT NOT NULL DEFAULT 'phistory',
+	version TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'fetched',
+	meta_json TEXT NOT NULL DEFAULT '{}',
+	trace_jsonl TEXT NOT NULL DEFAULT '',
+	prompt_md TEXT NOT NULL DEFAULT '',
+	normalized_profile_json TEXT NOT NULL DEFAULT '{}',
+	prompt_hash TEXT NOT NULL DEFAULT '',
+	trace_hash TEXT NOT NULL DEFAULT '',
+	diff_report TEXT NOT NULL DEFAULT '',
+	fatal_count INTEGER NOT NULL DEFAULT 0,
+	warn_count INTEGER NOT NULL DEFAULT 0,
+	promoted INTEGER NOT NULL DEFAULT 0,
+	last_error TEXT NOT NULL DEFAULT '',
+	fetched_at TEXT,
+	promoted_at TEXT,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_claude_code_profile_snapshots_source_version ON claude_code_profile_snapshots(source, version);
+CREATE INDEX IF NOT EXISTS idx_claude_code_profile_snapshots_updated ON claude_code_profile_snapshots(updated_at DESC);
 `
 
 // Store wraps the SQLite resource pool database.
@@ -383,6 +410,8 @@ func migrateSQLiteStore(db *sql.DB) error {
 		output_tokens INTEGER NOT NULL DEFAULT 0,
 		cache_read_tokens INTEGER NOT NULL DEFAULT 0,
 		cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+		raw_input_tokens INTEGER NOT NULL DEFAULT 0,
+		raw_total_tokens INTEGER NOT NULL DEFAULT 0,
 		estimated_cost REAL NOT NULL DEFAULT 0,
 		success INTEGER NOT NULL DEFAULT 0,
 		created_at TEXT NOT NULL
@@ -403,8 +432,38 @@ func migrateSQLiteStore(db *sql.DB) error {
 		PRIMARY KEY(model, profile_fingerprint)
 	);
 	CREATE INDEX IF NOT EXISTS idx_claude_code_usage_calibrations_updated ON claude_code_usage_calibrations(updated_at DESC);
+
+	CREATE TABLE IF NOT EXISTS claude_code_profile_snapshots (
+		id TEXT PRIMARY KEY,
+		source TEXT NOT NULL DEFAULT 'phistory',
+		version TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'fetched',
+		meta_json TEXT NOT NULL DEFAULT '{}',
+		trace_jsonl TEXT NOT NULL DEFAULT '',
+		prompt_md TEXT NOT NULL DEFAULT '',
+		normalized_profile_json TEXT NOT NULL DEFAULT '{}',
+		prompt_hash TEXT NOT NULL DEFAULT '',
+		trace_hash TEXT NOT NULL DEFAULT '',
+		diff_report TEXT NOT NULL DEFAULT '',
+		fatal_count INTEGER NOT NULL DEFAULT 0,
+		warn_count INTEGER NOT NULL DEFAULT 0,
+		promoted INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		fetched_at TEXT,
+		promoted_at TEXT,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_claude_code_profile_snapshots_source_version ON claude_code_profile_snapshots(source, version);
+	CREATE INDEX IF NOT EXISTS idx_claude_code_profile_snapshots_updated ON claude_code_profile_snapshots(updated_at DESC);
 	`); err != nil {
 		return fmt.Errorf("migrate claude code account observability tables: %w", err)
+	}
+	if err := ensureColumn(db, "claude_code_usage_ledger", "raw_input_tokens", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "claude_code_usage_ledger", "raw_total_tokens", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -524,6 +583,10 @@ func (s *Store) GetConfig(ctx context.Context) (*ConfigFile, error) {
 			if err := json.Unmarshal([]byte(value), &doc.AccountQuota); err != nil {
 				return nil, fmt.Errorf("decode account quota config: %w", err)
 			}
+		case "trace_json":
+			if err := json.Unmarshal([]byte(value), &doc.Trace); err != nil {
+				return nil, fmt.Errorf("decode trace config: %w", err)
+			}
 		case "claude_code_pool_json":
 			if err := json.Unmarshal([]byte(value), &doc.ClaudeCode); err != nil {
 				return nil, fmt.Errorf("decode claude code pool config: %w", err)
@@ -555,6 +618,7 @@ func savePoolConfigTx(ctx context.Context, tx *sql.Tx, doc *ConfigFile) error {
 		"database_path":            doc.DatabasePath,
 		"proxy_health_json":        doc.ProxyHealth,
 		"account_quota_json":       doc.AccountQuota,
+		"trace_json":               doc.Trace,
 		"claude_code_pool_json":    doc.ClaudeCode,
 		"claude_code_profile_json": doc.Profile,
 		"pool_config_json":         doc.PoolConfig,
@@ -606,6 +670,34 @@ func (s *Store) SaveClaudeCodePoolConfig(ctx context.Context, cfg ClaudeCodePool
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit save claude code pool config: %w", err)
+	}
+	return s.GetConfig(ctx)
+}
+
+// SaveClaudeCodePoolLogConfig persists only the account-pool log settings.
+func (s *Store) SaveClaudeCodePoolLogConfig(ctx context.Context, cfg AccountPoolLogConfig) (*ConfigFile, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("resource pool store is nil")
+	}
+	doc, err := s.GetConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	doc.ClaudeCode.Log = cfg
+	normalizeConfigFile(doc)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin save claude code pool log config: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	if err := savePoolConfigTx(ctx, tx, doc); err != nil {
+		return nil, err
+	}
+	if err := insertEventTx(ctx, tx, "account_pool.log_config", "claude code account pool log config updated", nil); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit save claude code pool log config: %w", err)
 	}
 	return s.GetConfig(ctx)
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"gopkg.in/yaml.v3"
 )
@@ -78,6 +79,8 @@ func LoadConfigFile(path string) (*ConfigFile, error) {
 func defaultConfigFile() *ConfigFile {
 	proxyHealthEnabled := true
 	accountQuotaEnabled := true
+	traceEnabled := false
+	traceRedactUserContent := true
 	claudeCodeEnabled := true
 	pureMode := true
 	cleanInputTokens := false
@@ -102,6 +105,11 @@ func defaultConfigFile() *ConfigFile {
 			Interval:    "5m",
 			Concurrency: 2,
 		},
+		Trace: TraceConfig{
+			Enabled:           &traceEnabled,
+			DumpDir:           "traces/ours",
+			RedactUserContent: &traceRedactUserContent,
+		},
 		Profile: defaultClaudeCodeProfile(),
 		ClaudeCode: ClaudeCodePoolConfig{
 			Enabled:  &claudeCodeEnabled,
@@ -113,6 +121,14 @@ func defaultConfigFile() *ConfigFile {
 			Usage: ClaudeCodeUsageConfig{
 				CleanInputTokens:           &cleanInputTokens,
 				SystemPromptOverheadTokens: DefaultCleanInputOverheadTokens,
+			},
+			Log: AccountPoolLogConfig{
+				Enabled:    boolPtr(true),
+				Level:      "info",
+				Dir:        "acc-pool-logs",
+				MaxSizeMB:  50,
+				MaxBackups: 3,
+				Redact:     boolPtr(true),
 			},
 			VirtualCache: claudeapipool.VirtualCacheConfig{
 				Enabled:                 &virtualCacheEnabled,
@@ -138,6 +154,10 @@ func defaultConfigFile() *ConfigFile {
 		},
 		PoolConfig: map[string]interface{}{},
 	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func defaultClaudeCodeRoutingConfig() claudeapipool.RoutingConfig {
@@ -169,10 +189,9 @@ func defaultClaudeCodeProfile() ClaudeCodeProfile {
 	billingBlockEnabled := true
 	return ClaudeCodeProfile{
 		Version:   DefaultClaudeCodeProfileVersion,
-		UserAgent: "claude-cli/" + DefaultClaudeCodeProfileVersion + " (external, cli)",
+		UserAgent: "claude-cli/" + DefaultClaudeCodeProfileVersion + " (external, sdk-cli)",
 		Headers: map[string]string{
-			"Anthropic-Version":                         "2023-06-01",
-			"Anthropic-Dangerous-Direct-Browser-Access": "true",
+			"Anthropic-Version":       "2023-06-01",
 			"X-App":                   "cli",
 			"X-Stainless-Retry-Count": "0",
 			"X-Stainless-Runtime":     "node",
@@ -181,17 +200,19 @@ func defaultClaudeCodeProfile() ClaudeCodeProfile {
 		},
 		Betas: []string{
 			"claude-code-20250219",
-			"oauth-2025-04-20",
+			"context-1m-2025-08-07",
 			"interleaved-thinking-2025-05-14",
-			"prompt-caching-scope-2026-01-05",
-			"effort-2025-11-24",
+			"thinking-token-count-2026-05-13",
 			"context-management-2025-06-27",
-			"extended-cache-ttl-2025-04-11",
+			"prompt-caching-scope-2026-01-05",
+			"mid-conversation-system-2026-04-07",
+			"advisor-tool-2026-03-01",
+			"effort-2025-11-24",
 		},
-		SystemPrompt:        "You are Claude Code, Anthropic's official CLI for Claude.",
+		SystemPrompt:        helps.ClaudeCodeStaticPrompt(),
 		BillingBlockEnabled: &billingBlockEnabled,
 		MetadataUserIDMode:  "account",
-		UpdatedFrom:         "builtin",
+		UpdatedFrom:         "builtin-trace-baseline",
 		Locked:              true,
 		SystemPromptMode:    "builtin_full_claude_code",
 	}
@@ -240,6 +261,16 @@ func normalizeConfigFile(doc *ConfigFile) {
 	}
 	if doc.AccountQuota.Concurrency <= 0 {
 		doc.AccountQuota.Concurrency = defaults.AccountQuota.Concurrency
+	}
+	if doc.Trace.Enabled == nil {
+		doc.Trace.Enabled = defaults.Trace.Enabled
+	}
+	doc.Trace.DumpDir = strings.TrimSpace(doc.Trace.DumpDir)
+	if doc.Trace.DumpDir == "" {
+		doc.Trace.DumpDir = defaults.Trace.DumpDir
+	}
+	if doc.Trace.RedactUserContent == nil {
+		doc.Trace.RedactUserContent = defaults.Trace.RedactUserContent
 	}
 	doc.Profile = normalizeClaudeCodeProfile(doc.Profile)
 	if doc.ClaudeCode.Enabled == nil {
@@ -308,9 +339,54 @@ func normalizeConfigFile(doc *ConfigFile) {
 
 func normalizeClaudeCodeProfile(profile ClaudeCodeProfile) ClaudeCodeProfile {
 	defaults := defaultClaudeCodeProfile()
+	profile.Version = strings.TrimSpace(profile.Version)
+	if profile.Version != "" {
+		defaults.Version = profile.Version
+	}
+	profile.UserAgent = strings.TrimSpace(profile.UserAgent)
+	if profile.UserAgent != "" {
+		defaults.UserAgent = profile.UserAgent
+	}
+	if len(profile.Headers) > 0 {
+		headers := make(map[string]string, len(profile.Headers))
+		for key, value := range profile.Headers {
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+			if key == "" || value == "" {
+				continue
+			}
+			headers[key] = value
+		}
+		if len(headers) > 0 {
+			defaults.Headers = headers
+		}
+	}
+	if len(profile.Betas) > 0 {
+		defaults.Betas = normalizeStringList(profile.Betas)
+	}
+	profile.SystemPrompt = strings.TrimSpace(profile.SystemPrompt)
+	if profile.SystemPrompt != "" {
+		defaults.SystemPrompt = profile.SystemPrompt
+	}
+	if profile.BillingBlockEnabled != nil {
+		defaults.BillingBlockEnabled = profile.BillingBlockEnabled
+	}
+	profile.MetadataUserIDMode = strings.TrimSpace(profile.MetadataUserIDMode)
+	if profile.MetadataUserIDMode != "" {
+		defaults.MetadataUserIDMode = profile.MetadataUserIDMode
+	}
+	profile.UpdatedFrom = strings.TrimSpace(profile.UpdatedFrom)
+	if profile.UpdatedFrom != "" {
+		defaults.UpdatedFrom = profile.UpdatedFrom
+	}
 	if profile.UpdatedAt != nil {
 		defaults.UpdatedAt = profile.UpdatedAt
 	}
+	profile.SystemPromptMode = strings.TrimSpace(profile.SystemPromptMode)
+	if profile.SystemPromptMode != "" {
+		defaults.SystemPromptMode = profile.SystemPromptMode
+	}
+	defaults.Locked = true
 	return defaults
 }
 
@@ -427,6 +503,7 @@ func EffectiveClaudeCodePool(cfg ClaudeCodePoolConfig) EffectiveClaudeCodePoolCo
 		DatabasePath: DefaultDBFileName,
 		ProxyHealth:  defaultConfigFile().ProxyHealth,
 		AccountQuota: defaultConfigFile().AccountQuota,
+		Trace:        defaultConfigFile().Trace,
 		ClaudeCode:   cfg,
 		PoolConfig:   map[string]interface{}{},
 	}
@@ -450,8 +527,55 @@ func EffectiveClaudeCodePool(cfg ClaudeCodePoolConfig) EffectiveClaudeCodePoolCo
 		PureMode:     pureMode,
 		Cloak:        cloak,
 		Usage:        EffectiveClaudeCodeUsage(doc.ClaudeCode.Usage, doc.Profile),
+		Log:          EffectiveAccountPoolLog(doc.ClaudeCode.Log),
 		VirtualCache: claudeapipool.EffectiveVirtualCache(doc.ClaudeCode.VirtualCache),
 		Routing:      claudeapipool.EffectiveRouting(doc.ClaudeCode.Routing),
+	}
+}
+
+// EffectiveAccountPoolLog returns normalized dedicated account-pool logging settings.
+func EffectiveAccountPoolLog(cfg AccountPoolLogConfig) EffectiveAccountPoolLogConfig {
+	defaults := defaultConfigFile().ClaudeCode.Log
+	if cfg.Enabled == nil {
+		cfg.Enabled = defaults.Enabled
+	}
+	level := strings.ToLower(strings.TrimSpace(cfg.Level))
+	switch level {
+	case "debug", "info", "warn", "error":
+	default:
+		level = strings.ToLower(strings.TrimSpace(defaults.Level))
+		if level == "" {
+			level = "info"
+		}
+	}
+	dir := strings.TrimSpace(cfg.Dir)
+	if dir == "" {
+		dir = defaults.Dir
+	}
+	maxSize := cfg.MaxSizeMB
+	if maxSize <= 0 {
+		maxSize = defaults.MaxSizeMB
+	}
+	if maxSize <= 0 {
+		maxSize = 50
+	}
+	maxBackups := cfg.MaxBackups
+	if maxBackups <= 0 {
+		maxBackups = defaults.MaxBackups
+	}
+	if maxBackups < 0 {
+		maxBackups = 0
+	}
+	if cfg.Redact == nil {
+		cfg.Redact = defaults.Redact
+	}
+	return EffectiveAccountPoolLogConfig{
+		Enabled:    cfg.Enabled != nil && *cfg.Enabled,
+		Level:      level,
+		Dir:        dir,
+		MaxSizeMB:  maxSize,
+		MaxBackups: maxBackups,
+		Redact:     cfg.Redact == nil || *cfg.Redact,
 	}
 }
 
@@ -518,6 +642,26 @@ func ApplyClaudeCodePoolRuntimeConfig(ctx context.Context, configFilePath string
 	effective := EffectiveClaudeCodePool(doc.ClaudeCode)
 	claudeapipool.SetScopedRoutingConfig(coreexecutor.PoolScopeClaudeAccountPool, effective.Routing)
 	return nil
+}
+
+// EffectiveTrace returns normalized local trace dump settings.
+func EffectiveTrace(cfg TraceConfig) EffectiveTraceConfig {
+	defaults := defaultConfigFile().Trace
+	if cfg.Enabled == nil {
+		cfg.Enabled = defaults.Enabled
+	}
+	cfg.DumpDir = strings.TrimSpace(cfg.DumpDir)
+	if cfg.DumpDir == "" {
+		cfg.DumpDir = defaults.DumpDir
+	}
+	if cfg.RedactUserContent == nil {
+		cfg.RedactUserContent = defaults.RedactUserContent
+	}
+	return EffectiveTraceConfig{
+		Enabled:           cfg.Enabled != nil && *cfg.Enabled,
+		DumpDir:           cfg.DumpDir,
+		RedactUserContent: cfg.RedactUserContent == nil || *cfg.RedactUserContent,
+	}
 }
 
 // EffectiveProxyHealth returns normalized health-check settings.

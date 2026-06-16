@@ -204,7 +204,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = normalizeClaudeTemperatureForThinking(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support).
-	if !pureMode && countCacheControls(body) == 0 {
+	// Claude Code account-pool requests keep ordinary API mimicry conservative:
+	// do not add cache breakpoints unless the client already supplied Claude-style structure.
+	if !pureMode && !isClaudeCodeAccountPoolAuth(auth) && countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
 
@@ -221,6 +223,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
 	body = applyClaudeCodeAccountPoolProfile(ctx, auth, body, req, opts)
+	extraBetas = append(extraBetas, claudeCodeAccountPoolBodyBetas(body)...)
 	bodyForTranslation := body
 	cleanInputFloor := estimateClaudeVisibleInputTokens(originalTranslated)
 	if cleanInputFloor == 0 {
@@ -248,7 +251,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, baseModel)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -271,9 +274,11 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		e.dumpClaudeAccountPoolTrace(ctx, auth, opts.Metadata, httpReq, bodyForUpstream, false, 0, nil, err)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
+	e.dumpClaudeAccountPoolTrace(ctx, auth, opts.Metadata, httpReq, bodyForUpstream, false, httpResp.StatusCode, httpResp.Header.Clone(), nil)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -399,7 +404,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = normalizeClaudeTemperatureForThinking(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support).
-	if !pureMode && countCacheControls(body) == 0 {
+	if !pureMode && !isClaudeCodeAccountPoolAuth(auth) && countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
 
@@ -413,6 +418,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
 	body = applyClaudeCodeAccountPoolProfile(ctx, auth, body, req, opts)
+	extraBetas = append(extraBetas, claudeCodeAccountPoolBodyBetas(body)...)
 	bodyForTranslation := body
 	cleanInputFloor := estimateClaudeVisibleInputTokens(originalTranslated)
 	if cleanInputFloor == 0 {
@@ -439,7 +445,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg)
+	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg, baseModel)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -462,9 +468,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		e.dumpClaudeAccountPoolTrace(ctx, auth, opts.Metadata, httpReq, bodyForUpstream, true, 0, nil, err)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
+	e.dumpClaudeAccountPoolTrace(ctx, auth, opts.Metadata, httpReq, bodyForUpstream, true, httpResp.StatusCode, httpResp.Header.Clone(), nil)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -665,7 +673,7 @@ func rewriteClaudeUsageForCleanInput(auth *cliproxyauth.Auth, model string, data
 		return data
 	}
 	if !stream {
-		return rewriteClaudeCleanInputAtPath(auth, model, data, "usage", visibleInputFloor)
+		return rewriteClaudeCleanInputUsageObjects(auth, model, data, visibleInputFloor)
 	}
 	lines := bytes.SplitAfter(data, []byte("\n"))
 	changed := false
@@ -699,8 +707,7 @@ func rewriteClaudeStreamUsageForCleanInput(auth *cliproxyauth.Auth, model string
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return line
 	}
-	rewritten := rewriteClaudeCleanInputAtPath(auth, model, payload, "message.usage", visibleInputFloor)
-	rewritten = rewriteClaudeCleanInputAtPath(auth, model, rewritten, "usage", visibleInputFloor)
+	rewritten := rewriteClaudeCleanInputUsageObjects(auth, model, payload, visibleInputFloor)
 	if bytes.Equal(rewritten, payload) {
 		return line
 	}
@@ -708,6 +715,69 @@ func rewriteClaudeStreamUsageForCleanInput(auth *cliproxyauth.Auth, model string
 		return append([]byte("data: "), rewritten...)
 	}
 	return rewritten
+}
+
+func rewriteClaudeCleanInputUsageObjects(auth *cliproxyauth.Auth, model string, payload []byte, visibleInputFloor int64) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	paths := claudeCleanInputUsagePaths(payload)
+	if len(paths) == 0 {
+		return payload
+	}
+	out := payload
+	for _, path := range paths {
+		out = rewriteClaudeCleanInputAtPath(auth, model, out, path, visibleInputFloor)
+	}
+	return out
+}
+
+func claudeCleanInputUsagePaths(payload []byte) []string {
+	root := gjson.ParseBytes(payload)
+	var paths []string
+	var walk func(node gjson.Result, path string, parentKey string)
+	walk = func(node gjson.Result, path string, parentKey string) {
+		if node.IsObject() {
+			if node.Get("input_tokens").Exists() && claudeCleanInputLooksLikeUsageObject(node, parentKey) {
+				paths = append(paths, path)
+			}
+			node.ForEach(func(key, value gjson.Result) bool {
+				keyText := key.String()
+				nextPath := keyText
+				if path != "" {
+					nextPath = path + "." + keyText
+				}
+				walk(value, nextPath, keyText)
+				return true
+			})
+			return
+		}
+		if node.IsArray() {
+			node.ForEach(func(index, value gjson.Result) bool {
+				nextPath := fmt.Sprintf("%d", index.Int())
+				if path != "" {
+					nextPath = fmt.Sprintf("%s.%d", path, index.Int())
+				}
+				walk(value, nextPath, parentKey)
+				return true
+			})
+		}
+	}
+	walk(root, "", "")
+	return paths
+}
+
+func claudeCleanInputLooksLikeUsageObject(node gjson.Result, parentKey string) bool {
+	switch parentKey {
+	case "usage", "iterations":
+		return true
+	}
+	return node.Get("output_tokens").Exists() ||
+		node.Get("cache_read_input_tokens").Exists() ||
+		node.Get("cache_creation_input_tokens").Exists() ||
+		node.Get("cache_creation").Exists() ||
+		node.Get("output_tokens_details").Exists() ||
+		node.Get("type").String() == "message"
 }
 
 func rewriteClaudeCleanInputAtPath(auth *cliproxyauth.Auth, model string, payload []byte, path string, visibleInputFloor int64) []byte {
@@ -728,7 +798,11 @@ func rewriteClaudeCleanInputAtPath(auth *cliproxyauth.Auth, model string, payloa
 	if cleaned == inputTokens {
 		return payload
 	}
-	out, err := sjson.SetBytes(payload, path+".input_tokens", cleaned)
+	inputPath := "input_tokens"
+	if path != "" {
+		inputPath = path + ".input_tokens"
+	}
+	out, err := sjson.SetBytes(payload, inputPath, cleaned)
 	if err != nil {
 		return payload
 	}
@@ -996,6 +1070,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
 	body = applyClaudeCodeAccountPoolProfile(ctx, auth, body, req, opts)
+	extraBetas = append(extraBetas, claudeCodeAccountPoolBodyBetas(body)...)
 	body = stripClaudeCountTokensUnsupportedFields(body)
 	if isClaudeOAuthToken(apiKey) {
 		body, _ = prepareClaudeOAuthToolNamesForUpstream(body, claudeToolPrefix, auth.ToolPrefixDisabled())
@@ -1010,7 +1085,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg, baseModel)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1032,9 +1107,11 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
+		e.dumpClaudeAccountPoolTrace(ctx, auth, opts.Metadata, httpReq, body, false, 0, nil, err)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, err
 	}
+	e.dumpClaudeAccountPoolTrace(ctx, auth, opts.Metadata, httpReq, body, false, resp.StatusCode, resp.Header.Clone(), nil)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
@@ -1316,7 +1393,11 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 	return body, nil
 }
 
-func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) {
+func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config, models ...string) {
+	model := ""
+	if len(models) > 0 {
+		model = models[0]
+	}
 	hdrDefault := func(cfgVal, fallback string) string {
 		if cfgVal != "" {
 			return cfgVal
@@ -1330,6 +1411,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 
 	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
+	isAccountPool := isClaudeCodeAccountPoolAuth(auth)
 	isAnthropicBase := r.URL != nil && strings.EqualFold(r.URL.Scheme, "https") && strings.EqualFold(r.URL.Host, "api.anthropic.com")
 	if isAnthropicBase && useAPIKey {
 		r.Header.Del("Authorization")
@@ -1343,6 +1425,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
 	}
+	clientBetaHeader := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta"))
 	stabilizeDeviceProfile := helps.ClaudeDeviceProfileStabilizationEnabled(cfg)
 	var deviceProfile helps.ClaudeDeviceProfile
 	if stabilizeDeviceProfile {
@@ -1350,7 +1433,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 
 	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
-	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
+	if val := clientBetaHeader; val != "" {
 		baseBetas = val
 		if !strings.Contains(val, "oauth") {
 			baseBetas += ",oauth-2025-04-20"
@@ -1381,7 +1464,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
 	// Only set browser access header for API key mode; real Claude Code CLI does not send it.
-	if useAPIKey {
+	if useAPIKey && !isAccountPool {
 		misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
@@ -1393,7 +1476,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	// Session ID: stable per auth/apiKey, matches Claude Code's X-Claude-Code-Session-Id header.
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Claude-Code-Session-Id", helps.CachedSessionID(apiKey))
 	// Per-request UUID, matches Claude Code's x-client-request-id for first-party API.
-	if isAnthropicBase {
+	if isAnthropicBase && !isAccountPool {
 		misc.EnsureHeader(r.Header, ginHeaders, "x-client-request-id", uuid.New().String())
 	}
 	r.Header.Set("Connection", "keep-alive")
@@ -1420,7 +1503,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
-	applyClaudeCodeAccountPoolProfileHeaders(r, auth, extraBetas)
+	applyClaudeCodeAccountPoolProfileHeaders(r, auth, model, extraBetas, clientBetaHeader)
 	// Re-enforce Accept-Encoding: identity after ApplyCustomHeadersFromAttrs, which
 	// may override it with a user-configured value.  Compressed SSE breaks the line
 	// scanner regardless of user preference, so this is non-negotiable for streams.
@@ -1429,11 +1512,14 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 }
 
-func applyClaudeCodeAccountPoolProfileHeaders(r *http.Request, auth *cliproxyauth.Auth, extraBetas []string) {
+func applyClaudeCodeAccountPoolProfileHeaders(r *http.Request, auth *cliproxyauth.Auth, model string, extraBetas []string, clientBetaHeader string) {
 	if r == nil || !isClaudeCodeAccountPoolAuth(auth) {
 		return
 	}
-	profile := builtinClaudeCodeAccountPoolProfile()
+	profile := claudeCodeAccountPoolProfileFromAuth(auth)
+	r.Header.Del("X-Client-Request-Id")
+	r.Header.Del("x-client-request-id")
+	r.Header.Del("Anthropic-Dangerous-Direct-Browser-Access")
 	if strings.TrimSpace(profile.UserAgent) != "" {
 		r.Header.Set("User-Agent", strings.TrimSpace(profile.UserAgent))
 	}
@@ -1445,11 +1531,64 @@ func applyClaudeCodeAccountPoolProfileHeaders(r *http.Request, auth *cliproxyaut
 		}
 		r.Header.Set(key, value)
 	}
-	betas := append([]string(nil), profile.Betas...)
+	betas := claudeCodeAccountPoolBetasForModel(model)
+	betas = append(betas, parseClaudeBetaHeader(clientBetaHeader)...)
 	betas = append(betas, extraBetas...)
 	if len(betas) > 0 {
 		r.Header.Set("Anthropic-Beta", strings.Join(normalizeClaudeBetaList(betas), ","))
 	}
+}
+
+func claudeCodeAccountPoolBetasForModel(model string) []string {
+	modelLower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(modelLower, "haiku"):
+		return []string{
+			"interleaved-thinking-2025-05-14",
+			"thinking-token-count-2026-05-13",
+			"context-management-2025-06-27",
+			"prompt-caching-scope-2026-01-05",
+			"claude-code-20250219",
+			"advisor-tool-2026-03-01",
+		}
+	case strings.Contains(modelLower, "opus"):
+		return []string{
+			"claude-code-20250219",
+			"context-1m-2025-08-07",
+			"interleaved-thinking-2025-05-14",
+			"thinking-token-count-2026-05-13",
+			"context-management-2025-06-27",
+			"prompt-caching-scope-2026-01-05",
+			"mid-conversation-system-2026-04-07",
+			"advisor-tool-2026-03-01",
+			"effort-2025-11-24",
+		}
+	default:
+		return []string{
+			"claude-code-20250219",
+			"context-1m-2025-08-07",
+			"interleaved-thinking-2025-05-14",
+			"thinking-token-count-2026-05-13",
+			"context-management-2025-06-27",
+			"prompt-caching-scope-2026-01-05",
+			"advisor-tool-2026-03-01",
+			"effort-2025-11-24",
+		}
+	}
+}
+
+func parseClaudeBetaHeader(headerValue string) []string {
+	if strings.TrimSpace(headerValue) == "" {
+		return nil
+	}
+	parts := strings.Split(headerValue, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if beta := strings.TrimSpace(part); beta != "" {
+			out = append(out, beta)
+		}
+	}
+	return out
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
@@ -1473,22 +1612,81 @@ func checkSystemInstructions(payload []byte) []byte {
 }
 
 type claudeCodeAccountPoolProfile struct {
-	Version   string
-	UserAgent string
-	Headers   map[string]string
-	Betas     []string
+	Version      string
+	UserAgent    string
+	Headers      map[string]string
+	Betas        []string
+	SystemPrompt string
 }
 
 func applyClaudeCodeAccountPoolProfile(ctx context.Context, auth *cliproxyauth.Auth, body []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) []byte {
 	if !isClaudeCodeAccountPoolAuth(auth) {
 		return body
 	}
-	profile := builtinClaudeCodeAccountPoolProfile()
+	profile := claudeCodeAccountPoolProfileFromAuth(auth)
 	userID := claudeCodeAccountPoolMetadataUserID(ctx, auth, body, req, opts, profile.Version)
 	if userID != "" {
 		body, _ = sjson.SetBytes(body, "metadata.user_id", userID)
 	}
-	return checkSystemInstructionsWithSigningMode(body, false, true, true, profile.Version, "cli", getWorkloadFromContext(ctx))
+	body = applyClaudeCodeAccountPoolThinkingCompatibility(body)
+	if !claudeCodeAccountPoolLooksRealClaudeCode(body) {
+		body = injectToolsCacheControl(body)
+	}
+	return checkSystemInstructionsWithPrompt(body, false, true, true, profile.Version, "cli", getWorkloadFromContext(ctx), profile.SystemPrompt)
+}
+
+func applyClaudeCodeAccountPoolThinkingCompatibility(body []byte) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	if !gjson.GetBytes(body, "thinking").Exists() {
+		return body
+	}
+	if gjson.GetBytes(body, "context_management").Exists() {
+		return body
+	}
+	raw := `{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`
+	updated, errSet := sjson.SetRawBytes(body, "context_management", []byte(raw))
+	if errSet != nil {
+		return body
+	}
+	return updated
+}
+
+func claudeCodeAccountPoolBodyBetas(body []byte) []string {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return nil
+	}
+	var betas []string
+	if gjson.GetBytes(body, "thinking").Exists() {
+		betas = append(betas,
+			"interleaved-thinking-2025-05-14",
+			"thinking-token-count-2026-05-13",
+		)
+	}
+	if gjson.GetBytes(body, "context_management").Exists() {
+		betas = append(betas, "context-management-2025-06-27")
+	}
+	if gjson.GetBytes(body, "output_config.effort").Exists() {
+		betas = append(betas, "effort-2025-11-24")
+	}
+	return betas
+}
+
+func claudeCodeAccountPoolLooksRealClaudeCode(body []byte) bool {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	firstText := strings.TrimSpace(gjson.GetBytes(body, "system.0.text").String())
+	if !strings.HasPrefix(firstText, "x-anthropic-billing-header:") {
+		return false
+	}
+	toolCount := len(gjson.GetBytes(body, "tools").Array())
+	if toolCount >= 10 {
+		return true
+	}
+	return gjson.GetBytes(body, "output_config").Exists() &&
+		(gjson.GetBytes(body, "thinking").Exists() || gjson.GetBytes(body, "context_management").Exists())
 }
 
 func claudeCodeAccountPoolMetadataUserID(ctx context.Context, auth *cliproxyauth.Auth, body []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, version string) string {
@@ -1640,11 +1838,44 @@ func isClaudeCodeAccountPoolAuth(auth *cliproxyauth.Auth) bool {
 func builtinClaudeCodeAccountPoolProfile() claudeCodeAccountPoolProfile {
 	profile := resourcepool.EffectiveClaudeCodeProfile(resourcepool.ClaudeCodeProfile{})
 	return claudeCodeAccountPoolProfile{
-		Version:   profile.Version,
-		UserAgent: profile.UserAgent,
-		Headers:   profile.Headers,
-		Betas:     profile.Betas,
+		Version:      profile.Version,
+		UserAgent:    profile.UserAgent,
+		Headers:      profile.Headers,
+		Betas:        profile.Betas,
+		SystemPrompt: profile.SystemPrompt,
 	}
+}
+
+func claudeCodeAccountPoolProfileFromAuth(auth *cliproxyauth.Auth) claudeCodeAccountPoolProfile {
+	profile := builtinClaudeCodeAccountPoolProfile()
+	if auth == nil || auth.Attributes == nil {
+		return profile
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Attributes[resourcepool.AttrProfileManaged]), "true") {
+		return profile
+	}
+	if version := strings.TrimSpace(auth.Attributes[resourcepool.AttrProfileVersion]); version != "" {
+		profile.Version = version
+	}
+	if userAgent := strings.TrimSpace(auth.Attributes[resourcepool.AttrProfileUserAgent]); userAgent != "" {
+		profile.UserAgent = userAgent
+	}
+	if raw := strings.TrimSpace(auth.Attributes[resourcepool.AttrProfileHeadersJSON]); raw != "" {
+		var headers map[string]string
+		if err := json.Unmarshal([]byte(raw), &headers); err == nil && len(headers) > 0 {
+			profile.Headers = headers
+		}
+	}
+	if raw := strings.TrimSpace(auth.Attributes[resourcepool.AttrProfileBetasJSON]); raw != "" {
+		var betas []string
+		if err := json.Unmarshal([]byte(raw), &betas); err == nil && len(betas) > 0 {
+			profile.Betas = betas
+		}
+	}
+	if systemPrompt := strings.TrimSpace(auth.Attributes[resourcepool.AttrProfileSystemPrompt]); systemPrompt != "" {
+		profile.SystemPrompt = systemPrompt
+	}
+	return profile
 }
 
 func normalizeClaudeBetaList(values []string) []string {
@@ -2306,6 +2537,10 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 //	system[4]: doing tasks (no cache_control)
 //	system[5]: user system messages moved to first user message
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {
+	return checkSystemInstructionsWithPrompt(payload, strictMode, experimentalCCHSigning, oauthMode, version, entrypoint, workload, "")
+}
+
+func checkSystemInstructionsWithPrompt(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload, profilePrompt string) []byte {
 	system := gjson.GetBytes(payload, "system")
 
 	// Extract original message text for fingerprint computation (before billing injection).
@@ -2337,13 +2572,10 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	// scope='org' in the API request. Only scope='global' is sent explicitly.
 	// The system prompt prefix block is sent without cache_control.
 	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
-	staticPrompt := strings.Join([]string{
-		helps.ClaudeCodeIntro,
-		helps.ClaudeCodeSystem,
-		helps.ClaudeCodeDoingTasks,
-		helps.ClaudeCodeToneAndStyle,
-		helps.ClaudeCodeOutputEfficiency,
-	}, "\n\n")
+	staticPrompt := strings.TrimSpace(profilePrompt)
+	if staticPrompt == "" {
+		staticPrompt = helps.ClaudeCodeStaticPrompt()
+	}
 	staticBlock := buildTextBlock(staticPrompt, nil)
 
 	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"

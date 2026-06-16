@@ -2,9 +2,9 @@ package helps
 
 import "strings"
 
-// Claude Code system prompt static sections (extracted from Claude Code v2.1.63).
+// Claude Code system prompt static sections for the built-in 2.1.178 trace baseline.
 // These sections are sent as system[] blocks to Anthropic's API.
-// The structure and content must match real Claude Code to pass server-side validation.
+// Real Claude Code client requests are passed through instead of being rebuilt here.
 
 // ClaudeCodeIntro is the first system block after billing header and agent identifier.
 // Corresponds to getSimpleIntroSection() in prompts.ts.

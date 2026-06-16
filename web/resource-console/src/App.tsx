@@ -14,10 +14,14 @@ import {
   CheckCircle2,
   Clock3,
   Database,
+  Download,
+  Eraser,
+  GitCompareArrows,
   CopyPlus,
   Copy,
   ExternalLink,
   FileCode2,
+  FileText,
   Home,
   KeyRound,
   Link2Off,
@@ -37,7 +41,7 @@ import {
   UserRoundCog,
   UsersRound
 } from "lucide-react";
-import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
+import { FormEvent, ReactNode, RefObject, UIEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   AccountRow,
   AccountBatchAction,
@@ -46,6 +50,7 @@ import {
   AccountQuota,
   ClaudeCodeAccount,
   ClaudeCodeProfileResponse,
+  ClaudeCodeProfileSnapshot,
   CloakEffectiveConfig,
   ClaudeCodeModel,
   ClaudeCodeModelPayload,
@@ -53,10 +58,14 @@ import {
   ClaudeCodePoolEffectiveConfig,
   ClaudeCodePoolRawConfig,
   ClaudeCodePoolStats,
+  AccountPoolLogEffectiveConfig,
+  AccountPoolLogLine,
+  AccountPoolLogRawConfig,
   ProxyBatchAction,
   ProxyPayload,
   ProxyResource,
   RoutingEffectiveConfig,
+  RoutingEvent,
   UsageSummary,
   UsageCalibrationResponse,
   VirtualCacheEffectiveConfig,
@@ -179,9 +188,17 @@ function App() {
   const availableQuery = useQuery({ queryKey: ["available-proxies"], queryFn: api.availableProxies, enabled: dataEnabled });
   const poolConfigQuery = useQuery({ queryKey: ["account-pool-config"], queryFn: api.poolConfig, enabled: accountDataEnabled });
   const poolProfileQuery = useQuery({ queryKey: ["account-pool-profile"], queryFn: api.poolProfile, enabled: accountDataEnabled });
+  const profileSnapshotsQuery = useQuery({
+    queryKey: ["account-pool-profile-snapshots"],
+    queryFn: api.profileSnapshots,
+    enabled: accountDataEnabled
+  });
   const poolStatsQuery = useQuery({ queryKey: ["account-pool-stats"], queryFn: api.poolStats, enabled: accountDataEnabled, refetchInterval: 30_000 });
   const poolModelsQuery = useQuery({ queryKey: ["account-pool-models"], queryFn: api.poolModels, enabled: accountDataEnabled });
   const usageSummaryQuery = useQuery({ queryKey: ["account-pool-usage"], queryFn: api.usageSummary, enabled: accountDataEnabled, refetchInterval: 30_000 });
+  const routingEventsQuery = useQuery({ queryKey: ["account-pool-routing-events"], queryFn: api.routingEvents, enabled: accountDataEnabled, refetchInterval: 30_000 });
+  const logConfigQuery = useQuery({ queryKey: ["account-pool-log-config"], queryFn: api.poolLogConfig, enabled: accountDataEnabled });
+  const poolLogsQuery = useQuery({ queryKey: ["account-pool-logs"], queryFn: api.poolLogs, enabled: accountDataEnabled, refetchInterval: 30_000 });
   const usageCalibrationsQuery = useQuery({
     queryKey: ["account-pool-usage-calibrations"],
     queryFn: api.usageCalibrations,
@@ -194,9 +211,13 @@ function App() {
     availableQuery.error,
     poolConfigQuery.error,
     poolProfileQuery.error,
+    profileSnapshotsQuery.error,
     poolStatsQuery.error,
     poolModelsQuery.error,
     usageSummaryQuery.error,
+    routingEventsQuery.error,
+    logConfigQuery.error,
+    poolLogsQuery.error,
     usageCalibrationsQuery.error
   ].some(isManagementAuthError);
 
@@ -221,9 +242,13 @@ function App() {
       queryClient.invalidateQueries({ queryKey: ["available-proxies"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-config"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-profile"] }),
+      queryClient.invalidateQueries({ queryKey: ["account-pool-profile-snapshots"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-stats"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-models"] }),
-      queryClient.invalidateQueries({ queryKey: ["account-pool-usage"] })
+      queryClient.invalidateQueries({ queryKey: ["account-pool-usage"] }),
+      queryClient.invalidateQueries({ queryKey: ["account-pool-routing-events"] }),
+      queryClient.invalidateQueries({ queryKey: ["account-pool-log-config"] }),
+      queryClient.invalidateQueries({ queryKey: ["account-pool-logs"] })
     ]);
   };
 
@@ -239,9 +264,10 @@ function App() {
     };
     const onProxyChanged = () => invalidate(["resource-config", "proxies", "available-proxies", "accounts"]);
     const onAccountChanged = () =>
-      invalidate(["resource-config", "accounts", "proxies", "available-proxies", "account-pool-stats", "account-pool-usage"]);
-    const onConfigChanged = () => invalidate(["resource-config", "account-pool-config", "account-pool-profile", "account-pool-stats"]);
-    const onStatsChanged = () => invalidate(["account-pool-stats", "account-pool-usage"]);
+      invalidate(["resource-config", "accounts", "proxies", "available-proxies", "account-pool-stats", "account-pool-usage", "account-pool-routing-events", "account-pool-logs"]);
+    const onConfigChanged = () =>
+      invalidate(["resource-config", "account-pool-config", "account-pool-profile", "account-pool-profile-snapshots", "account-pool-stats", "account-pool-log-config"]);
+    const onStatsChanged = () => invalidate(["account-pool-stats", "account-pool-usage", "account-pool-routing-events", "account-pool-logs", "accounts"]);
     const onModelChanged = () => invalidate(["account-pool-models"]);
 
     source.addEventListener("proxy_changed", onProxyChanged);
@@ -266,7 +292,7 @@ function App() {
 
   const accountPoolLoading =
     accountDataEnabled &&
-    (poolConfigQuery.isLoading || poolProfileQuery.isLoading || poolStatsQuery.isLoading || poolModelsQuery.isLoading);
+    (poolConfigQuery.isLoading || poolProfileQuery.isLoading || profileSnapshotsQuery.isLoading || poolStatsQuery.isLoading || poolModelsQuery.isLoading);
   const loading = configQuery.isLoading || accountsQuery.isLoading || proxiesQuery.isLoading || availableQuery.isLoading;
   const accounts = accountsQuery.data?.items || [];
   const proxies = proxiesQuery.data?.items || [];
@@ -274,9 +300,13 @@ function App() {
   const summary = configQuery.data?.summary;
   const poolConfig = poolConfigQuery.data;
   const poolProfile = poolProfileQuery.data;
+  const profileSnapshots = profileSnapshotsQuery.data?.items || [];
   const poolStats = poolStatsQuery.data?.stats;
   const poolModels = poolModelsQuery.data?.items || [];
   const usageSummary = usageSummaryQuery.data?.summary;
+  const routingEvents = routingEventsQuery.data?.items || [];
+  const logConfig = logConfigQuery.data;
+  const poolLogs = poolLogsQuery.data?.items || [];
   const usageCalibrations = usageCalibrationsQuery.data;
 
   const pageTitle = view === "home" ? "资源池控制台" : view === "accounts" ? "Claude Code 账号池" : "代理 IP 池";
@@ -451,9 +481,13 @@ function App() {
               loading={loading || accountPoolLoading}
               config={poolConfig}
               profile={poolProfile}
+              profileSnapshots={profileSnapshots}
               stats={poolStats}
               models={poolModels}
               usage={usageSummary}
+              routingEvents={routingEvents}
+              logConfig={logConfig}
+              logs={poolLogs}
               calibrations={usageCalibrations}
               onBind={(account) => setModal({ type: "bind", account })}
               onTest={(account) => setModal({ type: "test-account", account, models: poolModels })}
@@ -714,9 +748,13 @@ function AccountsView({
   loading,
   config,
   profile,
+  profileSnapshots,
   stats,
   models,
   usage,
+  routingEvents,
+  logConfig,
+  logs,
   calibrations,
   onBind,
   onTest,
@@ -728,9 +766,13 @@ function AccountsView({
   loading: boolean;
   config?: ClaudeCodePoolConfigResponse;
   profile?: ClaudeCodeProfileResponse;
+  profileSnapshots: ClaudeCodeProfileSnapshot[];
   stats?: ClaudeCodePoolStats;
   models: ClaudeCodeModel[];
   usage?: UsageSummary;
+  routingEvents: RoutingEvent[];
+  logConfig?: { raw: AccountPoolLogRawConfig; effective: AccountPoolLogEffectiveConfig };
+  logs: AccountPoolLogLine[];
   calibrations?: UsageCalibrationResponse;
   onBind: (account: ClaudeCodeAccount) => void;
   onTest: (account: ClaudeCodeAccount) => void;
@@ -860,7 +902,7 @@ function AccountsView({
   return (
     <div className="grid gap-5">
       <PublicAPIPanel modelsCount={models.filter((model) => model.enabled).length} />
-      <AccountPoolMetrics stats={stats} config={effectiveConfig} />
+      <AccountPoolMetrics stats={stats} usage={usage} config={effectiveConfig} />
       <SegmentedTabs
         value={activeTab}
         onChange={setActiveTab}
@@ -904,6 +946,7 @@ function AccountsView({
       ) : (
         <div className="grid gap-5">
           <ClaudeCodeProfilePanel profile={profile} />
+          <ClaudeCodeProfileSnapshotsPanel snapshots={profileSnapshots} profile={profile} onDone={onDone} onToast={onToast} />
           <div className="grid grid-cols-2 gap-5 max-[1180px]:grid-cols-1">
             <AccountPoolConfigPanel config={effectiveConfig} path={config?.path} onDone={onDone} onToast={onToast} />
             <VirtualCachePanel config={effectiveConfig} stats={stats} onDone={onDone} onToast={onToast} />
@@ -912,7 +955,8 @@ function AccountsView({
           <RoutingProtectionPanel config={effectiveConfig} onDone={onDone} onToast={onToast} />
           <ModelManagementPanel models={models} accounts={accounts} onDone={onDone} onToast={onToast} />
           <CleanInputUsagePanel config={effectiveConfig} calibrations={calibrations} accounts={accounts} models={models} onDone={onDone} onToast={onToast} />
-          <UsageSummaryPanel usage={usage} />
+          <AccountPoolLogPanel config={logConfig?.effective || effectiveConfig.log} raw={logConfig?.raw} logs={logs} onDone={onDone} onToast={onToast} />
+          <RoutingEventsPanel events={routingEvents} />
         </div>
       )}
 
@@ -983,7 +1027,7 @@ function ClaudeCodeProfilePanel({
       </CardHeader>
       <CardContent className="grid gap-4">
         <div className="grid grid-cols-4 gap-3 max-[1180px]:grid-cols-2 max-[560px]:grid-cols-1">
-          <ReadOnlyTile label="Claude Code 版本" value={effective?.version || "2.1.177"} />
+          <ReadOnlyTile label="Claude Code 版本" value={effective?.version || "2.1.178"} />
           <ReadOnlyTile label="身份策略" value="账号固定 · 会话生成" />
           <ReadOnlyTile label="Billing/CCH" value={effective?.billing_block_enabled === false ? "关闭" : "内置签名"} />
           <ReadOnlyTile label="Prompt" value="完整静态提示词" />
@@ -991,7 +1035,7 @@ function ClaudeCodeProfilePanel({
 
         <div className="rounded-lg border bg-muted/30 p-3">
           <div className="text-xs font-medium text-muted-foreground">User-Agent</div>
-          <div className="mt-1 break-all font-mono text-sm">{effective?.user_agent || "claude-cli/2.1.177 (external, cli)"}</div>
+          <div className="mt-1 break-all font-mono text-sm">{effective?.user_agent || "claude-cli/2.1.178 (external, sdk-cli)"}</div>
         </div>
 
         <div className="grid grid-cols-2 gap-3 max-[860px]:grid-cols-1">
@@ -1032,6 +1076,586 @@ function ClaudeCodeProfilePanel({
   );
 }
 
+function ClaudeCodeProfileSnapshotsPanel({
+  snapshots,
+  profile,
+  onDone,
+  onToast
+}: {
+  snapshots: ClaudeCodeProfileSnapshot[];
+  profile?: ClaudeCodeProfileResponse;
+  onDone: () => Promise<void>;
+  onToast: (message: string, tone?: ToastState["tone"]) => void;
+}) {
+  const [version, setVersion] = useState(profile?.effective?.version || "2.1.178");
+  const [activeDiff, setActiveDiff] = useState<{ snapshot: ClaudeCodeProfileSnapshot; report: string } | null>(null);
+  const fetchMutation = useMutation({
+    mutationFn: ({ version, latest }: { version?: string; latest: boolean }) => api.fetchProfileSnapshot(version, latest),
+    onSuccess: async (data) => {
+      await onDone();
+      onToast(`已拉取 Profile 基线 ${data.item.version}`);
+    },
+    onError: (error) => onToast(`拉取失败：${errorMessage(error)}`, "danger")
+  });
+  const diffMutation = useMutation({
+    mutationFn: async (id: string) => {
+      const data = await api.diffProfileSnapshot(id);
+      const detail = await api.profileSnapshot(id);
+      return { diff: data.diff, snapshot: detail.item };
+    },
+    onSuccess: async (data) => {
+      setActiveDiff({ snapshot: data.snapshot, report: data.diff.report || "无差异" });
+      await onDone();
+      onToast("Diff 已更新");
+    },
+    onError: (error) => onToast(`Diff 失败：${errorMessage(error)}`, "danger")
+  });
+  const currentFingerprint = profile?.effective
+    ? `${profile.effective.version}:${shortText(profile.effective.user_agent || "", 18)}`
+    : "未加载";
+  const pending = fetchMutation.isPending || diffMutation.isPending;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Profile 基线</CardTitle>
+        <CardDescription>从 Phistory 拉取 Claude Code trace/prompt 快照，仅用于对比参考，不会应用到正常业务请求。</CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-end gap-3 max-[760px]:grid-cols-1">
+          <Label className="grid gap-2">
+            <span>指定版本</span>
+            <Input value={version} onChange={(event) => setVersion(event.target.value)} placeholder="2.1.178" />
+          </Label>
+          <Button
+            variant="outline"
+            disabled={pending}
+            onClick={() => fetchMutation.mutate({ version: version.trim(), latest: false })}
+          >
+            {fetchMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileCode2 className="h-4 w-4" />}
+            拉取指定版本
+          </Button>
+          <Button disabled={pending} onClick={() => fetchMutation.mutate({ latest: true })}>
+            {fetchMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            检查最新
+          </Button>
+        </div>
+
+        <div className="grid grid-cols-3 gap-3 max-[900px]:grid-cols-1">
+          <ReadOnlyTile label="当前运行版本" value={profile?.effective?.version || "-"} />
+          <ReadOnlyTile label="当前来源" value={profile?.effective?.updated_from || "builtin"} />
+          <ReadOnlyTile label="Profile 摘要" value={currentFingerprint} />
+        </div>
+
+        <div className="overflow-x-auto rounded-lg border">
+          <table className="min-w-[920px] text-sm">
+            <thead className="bg-muted/50 text-left text-xs text-muted-foreground">
+              <tr>
+                <th className="px-3 py-2 font-medium">版本</th>
+                <th className="px-3 py-2 font-medium">状态</th>
+                <th className="px-3 py-2 font-medium">Prompt Hash</th>
+                <th className="px-3 py-2 font-medium">Trace Hash</th>
+                <th className="px-3 py-2 font-medium">Diff</th>
+                <th className="px-3 py-2 font-medium">拉取时间</th>
+                <th className="px-3 py-2 text-right font-medium">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {snapshots.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
+                    还没有 Profile 基线，先拉取当前版本或最新版本。
+                  </td>
+                </tr>
+              ) : (
+                snapshots.map((item) => (
+                  <tr key={item.id} className="border-t">
+                    <td className="px-3 py-2">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">{item.version}</span>
+                      </div>
+                      <div className="text-xs text-muted-foreground">{item.source}</div>
+                    </td>
+                    <td className="px-3 py-2">
+                      <Badge tone={item.status === "promoted" ? "success" : item.status === "failed" ? "danger" : "info"}>{snapshotStatusText(item.status)}</Badge>
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs">{shortText(item.prompt_hash, 12)}</td>
+                    <td className="px-3 py-2 font-mono text-xs">{shortText(item.trace_hash, 12)}</td>
+                    <td className="px-3 py-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {item.fatal_count > 0 ? <Badge tone="danger">fatal {item.fatal_count}</Badge> : null}
+                        {item.warn_count > 0 ? <Badge tone="warning">warn {item.warn_count}</Badge> : null}
+                        {item.fatal_count === 0 && item.warn_count === 0 ? <Badge tone="success">ok</Badge> : null}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2">{formatTime(item.fetched_at)}</td>
+                    <td className="px-3 py-2">
+                      <div className="flex justify-end gap-2">
+                        <Button variant="outline" size="sm" disabled={pending} onClick={() => diffMutation.mutate(item.id)}>
+                          <GitCompareArrows className="h-3.5 w-3.5" />
+                          Diff
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {activeDiff ? (
+          <ProfileDiffPanel current={profile?.effective} snapshot={activeDiff.snapshot} report={activeDiff.report} onClose={() => setActiveDiff(null)} />
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+type ProfileDiffTab = "prompt" | "headers" | "betas" | "report";
+type DiffStatus = "same" | "missing-current" | "missing-snapshot" | "changed";
+
+interface ProfileDiffKVRow {
+  key: string;
+  current: string;
+  snapshot: string;
+  status: DiffStatus;
+}
+
+interface ProfileDiffLine {
+  currentLine?: number;
+  snapshotLine?: number;
+  current: string;
+  snapshot: string;
+  status: "same" | "changed" | "added" | "removed";
+}
+
+function ProfileDiffPanel({
+  current,
+  snapshot,
+  report,
+  onClose
+}: {
+  current?: ClaudeCodeProfileResponse["effective"];
+  snapshot: ClaudeCodeProfileSnapshot;
+  report: string;
+  onClose: () => void;
+}) {
+  const [tab, setTab] = useState<ProfileDiffTab>("prompt");
+  const currentPrompt = current?.system_prompt || "";
+  const snapshotProfile = snapshot.normalized_profile;
+  const snapshotPrompt = snapshot.prompt_md || snapshotProfile?.system_prompt || "";
+  const lineRows = useMemo(() => buildProfileLineDiff(currentPrompt, snapshotPrompt), [currentPrompt, snapshotPrompt]);
+  const headerRows = useMemo(() => buildProfileMapDiff(current?.headers, snapshotProfile?.headers), [current?.headers, snapshotProfile?.headers]);
+  const betaRows = useMemo(() => buildProfileListDiff(current?.betas, snapshotProfile?.betas), [current?.betas, snapshotProfile?.betas]);
+  const fatalCount = snapshot.fatal_count || 0;
+  const warnCount = snapshot.warn_count || 0;
+  return (
+    <div className="grid gap-3 rounded-lg border bg-muted/20 p-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="grid gap-1">
+          <div className="flex flex-wrap items-center gap-2 text-sm font-semibold">
+            <GitCompareArrows className="h-4 w-4 text-muted-foreground" />
+            Profile 对比
+            <Badge tone={fatalCount ? "danger" : warnCount ? "warning" : "success"}>
+              {fatalCount ? `fatal ${fatalCount}` : warnCount ? `warn ${warnCount}` : "一致"}
+            </Badge>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            当前运行 {current?.version || "-"} · Phistory {snapshot.version || "-"}
+          </div>
+        </div>
+        <Button variant="ghost" size="sm" onClick={onClose}>
+          收起
+        </Button>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <ProfileDiffTabButton active={tab === "prompt"} onClick={() => setTab("prompt")}>
+          System Prompt
+        </ProfileDiffTabButton>
+        <ProfileDiffTabButton active={tab === "headers"} onClick={() => setTab("headers")}>
+          Headers
+        </ProfileDiffTabButton>
+        <ProfileDiffTabButton active={tab === "betas"} onClick={() => setTab("betas")}>
+          Beta Headers
+        </ProfileDiffTabButton>
+        <ProfileDiffTabButton active={tab === "report"} onClick={() => setTab("report")}>
+          原始报告
+        </ProfileDiffTabButton>
+      </div>
+
+      {tab === "prompt" ? (
+        <ProfilePromptSideBySide rows={lineRows} currentTitle="当前运行" snapshotTitle={`Phistory ${snapshot.version || ""}`} />
+      ) : null}
+      {tab === "headers" ? (
+        <ProfileKVTable rows={headerRows} leftTitle="当前运行" rightTitle="Phistory 快照" emptyText="Headers 一致或均为空。" />
+      ) : null}
+      {tab === "betas" ? (
+        <ProfileKVTable rows={betaRows} leftTitle="当前运行" rightTitle="Phistory 快照" emptyText="Beta Headers 一致或均为空。" />
+      ) : null}
+      {tab === "report" ? (
+        <pre className="max-h-[520px] overflow-auto whitespace-pre-wrap rounded-md bg-slate-950 p-3 text-xs leading-5 text-slate-50">
+          {report || "无差异"}
+        </pre>
+      ) : null}
+    </div>
+  );
+}
+
+function ProfileDiffTabButton({
+  active,
+  children,
+  onClick
+}: {
+  active: boolean;
+  children: ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "min-h-9 rounded-lg border px-3 text-sm font-medium transition-colors",
+        active ? "border-primary bg-primary text-primary-foreground" : "bg-card text-muted-foreground hover:bg-muted hover:text-foreground"
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ProfilePromptSideBySide({
+  rows,
+  currentTitle,
+  snapshotTitle
+}: {
+  rows: ProfileDiffLine[];
+  currentTitle: string;
+  snapshotTitle: string;
+}) {
+  const leftRef = useRef<HTMLDivElement>(null);
+  const rightRef = useRef<HTMLDivElement>(null);
+  const scrollingRef = useRef<"left" | "right" | null>(null);
+  const syncScroll = (side: "left" | "right", event: UIEvent<HTMLDivElement>) => {
+    const target = side === "left" ? rightRef.current : leftRef.current;
+    if (!target || scrollingRef.current === side) {
+      return;
+    }
+    scrollingRef.current = side === "left" ? "right" : "left";
+    target.scrollTop = event.currentTarget.scrollTop;
+    target.scrollLeft = event.currentTarget.scrollLeft;
+    window.setTimeout(() => {
+      scrollingRef.current = null;
+    }, 0);
+  };
+  return (
+    <div className="grid gap-3 lg:grid-cols-2">
+      <PromptDiffColumn title={currentTitle} side="current" rows={rows} refValue={leftRef} onScroll={(event) => syncScroll("left", event)} />
+      <PromptDiffColumn title={snapshotTitle} side="snapshot" rows={rows} refValue={rightRef} onScroll={(event) => syncScroll("right", event)} />
+    </div>
+  );
+}
+
+function PromptDiffColumn({
+  title,
+  side,
+  rows,
+  refValue,
+  onScroll
+}: {
+  title: string;
+  side: "current" | "snapshot";
+  rows: ProfileDiffLine[];
+  refValue: RefObject<HTMLDivElement | null>;
+  onScroll: (event: UIEvent<HTMLDivElement>) => void;
+}) {
+  return (
+    <div className="min-w-0 overflow-hidden rounded-lg border bg-card">
+      <div className="flex items-center justify-between gap-2 border-b bg-muted/40 px-3 py-2">
+        <div className="truncate text-sm font-medium">{title}</div>
+        <Badge tone="neutral">{rows.length} 行</Badge>
+      </div>
+      <div ref={refValue} onScroll={onScroll} className="max-h-[70vh] overflow-auto">
+        <div className="min-w-[720px] py-1 font-mono text-xs leading-5">
+          {rows.length ? (
+            rows.map((row) => {
+              const text = side === "current" ? row.current : row.snapshot;
+              const lineNumber = side === "current" ? row.currentLine : row.snapshotLine;
+              const mutedSide =
+                (row.status === "added" && side === "current") ||
+                (row.status === "removed" && side === "snapshot");
+              return (
+                <div
+                  key={`${side}-${row.currentLine || "x"}-${row.snapshotLine || "x"}`}
+                  className={cn(
+                    "grid grid-cols-[64px_minmax(0,1fr)] gap-2 px-2",
+                    row.status === "changed" && side === "current" && "bg-amber-50 text-amber-950",
+                    row.status === "changed" && side === "snapshot" && "bg-amber-50 text-amber-950",
+                    row.status === "removed" && side === "current" && "bg-red-50 text-red-950",
+                    row.status === "added" && side === "snapshot" && "bg-emerald-50 text-emerald-950",
+                    mutedSide && "bg-muted/20 text-muted-foreground"
+                  )}
+                >
+                  <span className="select-none text-right text-muted-foreground">{lineNumber || ""}</span>
+                  <span className={cn("whitespace-pre", mutedSide && "select-none")}>{text || " "}</span>
+                </div>
+              );
+            })
+          ) : (
+            <div className="px-3 py-8 text-center text-muted-foreground">没有可对比的 System Prompt。</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProfileKVTable({
+  rows,
+  leftTitle,
+  rightTitle,
+  emptyText
+}: {
+  rows: ProfileDiffKVRow[];
+  leftTitle: string;
+  rightTitle: string;
+  emptyText: string;
+}) {
+  return (
+    <div className="overflow-x-auto rounded-lg border bg-card">
+      <table className="min-w-[860px] text-sm">
+        <thead className="bg-muted/50 text-left text-xs text-muted-foreground">
+          <tr>
+            <th className="px-3 py-2 font-medium">Key</th>
+            <th className="px-3 py-2 font-medium">{leftTitle}</th>
+            <th className="px-3 py-2 font-medium">{rightTitle}</th>
+            <th className="px-3 py-2 font-medium">状态</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length ? (
+            rows.map((row) => (
+              <tr key={row.key} className={cn("border-t", row.status !== "same" && "bg-amber-50/35")}>
+                <td className="px-3 py-2 font-mono text-xs">{row.key}</td>
+                <td className="max-w-[320px] break-all px-3 py-2 font-mono text-xs">{row.current || "-"}</td>
+                <td className="max-w-[320px] break-all px-3 py-2 font-mono text-xs">{row.snapshot || "-"}</td>
+                <td className="px-3 py-2">
+                  <DiffStatusBadge status={row.status} />
+                </td>
+              </tr>
+            ))
+          ) : (
+            <tr>
+              <td colSpan={4} className="px-3 py-8 text-center text-muted-foreground">
+                {emptyText}
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function DiffStatusBadge({ status }: { status: DiffStatus }) {
+  if (status === "same") {
+    return <Badge tone="success">一致</Badge>;
+  }
+  if (status === "missing-current") {
+    return <Badge tone="warning">当前缺失</Badge>;
+  }
+  if (status === "missing-snapshot") {
+    return <Badge tone="neutral">快照缺失</Badge>;
+  }
+  return <Badge tone="danger">不一致</Badge>;
+}
+
+function buildProfileLineDiff(current: string, snapshot: string): ProfileDiffLine[] {
+  if (!current.trim() && !snapshot.trim()) {
+    return [];
+  }
+  const currentLines = splitProfileLines(current);
+  const snapshotLines = splitProfileLines(snapshot);
+  const aligned = buildProfileAlignedLineDiff(currentLines, snapshotLines);
+  return collapseAdjacentLineChanges(aligned);
+}
+
+function buildProfileAlignedLineDiff(currentLines: string[], snapshotLines: string[]): ProfileDiffLine[] {
+  const currentLength = currentLines.length;
+  const snapshotLength = snapshotLines.length;
+  const width = snapshotLength + 1;
+  const table = new Uint16Array((currentLength + 1) * (snapshotLength + 1));
+  for (let i = currentLength - 1; i >= 0; i--) {
+    const currentLine = currentLines[i];
+    const row = i * width;
+    const nextRow = (i + 1) * width;
+    for (let j = snapshotLength - 1; j >= 0; j--) {
+      table[row + j] =
+        currentLine === snapshotLines[j]
+          ? table[nextRow + j + 1] + 1
+          : Math.max(table[nextRow + j], table[row + j + 1]);
+    }
+  }
+  const rows: ProfileDiffLine[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < currentLength && j < snapshotLength) {
+    if (currentLines[i] === snapshotLines[j]) {
+      rows.push({
+        currentLine: i + 1,
+        snapshotLine: j + 1,
+        current: currentLines[i],
+        snapshot: snapshotLines[j],
+        status: "same"
+      });
+      i++;
+      j++;
+      continue;
+    }
+    const removeScore = table[(i + 1) * width + j];
+    const addScore = table[i * width + j + 1];
+    if (removeScore >= addScore) {
+      rows.push({
+        currentLine: i + 1,
+        current: currentLines[i],
+        snapshot: "",
+        status: "removed"
+      });
+      i++;
+    } else {
+      rows.push({
+        snapshotLine: j + 1,
+        current: "",
+        snapshot: snapshotLines[j],
+        status: "added"
+      });
+      j++;
+    }
+  }
+  while (i < currentLength) {
+    rows.push({
+      currentLine: i + 1,
+      current: currentLines[i],
+      snapshot: "",
+      status: "removed"
+    });
+    i++;
+  }
+  while (j < snapshotLength) {
+    rows.push({
+      snapshotLine: j + 1,
+      current: "",
+      snapshot: snapshotLines[j],
+      status: "added"
+    });
+    j++;
+  }
+  return rows;
+}
+
+function collapseAdjacentLineChanges(rows: ProfileDiffLine[]): ProfileDiffLine[] {
+  const out: ProfileDiffLine[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const current = rows[i];
+    const next = rows[i + 1];
+    if (
+      current?.status === "removed" &&
+      next?.status === "added" &&
+      current.current.trim() !== "" &&
+      next.snapshot.trim() !== ""
+    ) {
+      out.push({
+        currentLine: current.currentLine,
+        snapshotLine: next.snapshotLine,
+        current: current.current,
+        snapshot: next.snapshot,
+        status: "changed"
+      });
+      i++;
+      continue;
+    }
+    out.push(current);
+  }
+  return out;
+}
+
+function splitProfileLines(value: string) {
+  const normalized = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (normalized === "") {
+    return [];
+  }
+  return normalized.split("\n");
+}
+
+function buildProfileMapDiff(current?: Record<string, string>, snapshot?: Record<string, string>): ProfileDiffKVRow[] {
+  const currentNorm = normalizeProfileMap(current);
+  const snapshotNorm = normalizeProfileMap(snapshot);
+  const keys = Array.from(new Set([...Object.keys(currentNorm), ...Object.keys(snapshotNorm)])).sort((a, b) => a.localeCompare(b));
+  return keys.map((key) => {
+    const currentValue = currentNorm[key] || "";
+    const snapshotValue = snapshotNorm[key] || "";
+    return {
+      key,
+      current: currentValue,
+      snapshot: snapshotValue,
+      status: diffValueStatus(currentValue, snapshotValue)
+    };
+  });
+}
+
+function buildProfileListDiff(current?: string[], snapshot?: string[]): ProfileDiffKVRow[] {
+  const currentSet = normalizeProfileList(current);
+  const snapshotSet = normalizeProfileList(snapshot);
+  const keys = Array.from(new Set([...Object.keys(currentSet), ...Object.keys(snapshotSet)])).sort((a, b) => a.localeCompare(b));
+  return keys.map((key) => {
+    const currentValue = currentSet[key] || "";
+    const snapshotValue = snapshotSet[key] || "";
+    return {
+      key,
+      current: currentValue,
+      snapshot: snapshotValue,
+      status: diffValueStatus(currentValue, snapshotValue)
+    };
+  });
+}
+
+function normalizeProfileMap(values?: Record<string, string>) {
+  const out: Record<string, string> = {};
+  for (const [rawKey, rawValue] of Object.entries(values || {})) {
+    const key = rawKey.trim().toLowerCase();
+    const value = String(rawValue || "").trim();
+    if (!key || !value) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function normalizeProfileList(values?: string[]) {
+  const out: Record<string, string> = {};
+  for (const value of values || []) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) {
+      continue;
+    }
+    out[trimmed] = trimmed;
+  }
+  return out;
+}
+
+function diffValueStatus(current: string, snapshot: string): DiffStatus {
+  if (!current && snapshot) {
+    return "missing-current";
+  }
+  if (current && !snapshot) {
+    return "missing-snapshot";
+  }
+  return current === snapshot ? "same" : "changed";
+}
+
 function ReadOnlyTile({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border bg-muted/30 p-3">
@@ -1041,7 +1665,7 @@ function ReadOnlyTile({ label, value }: { label: string; value: string }) {
   );
 }
 
-function AccountPoolMetrics({ stats, config }: { stats?: ClaudeCodePoolStats; config: ClaudeCodePoolEffectiveConfig }) {
+function AccountPoolMetrics({ stats, usage, config }: { stats?: ClaudeCodePoolStats; usage?: UsageSummary; config: ClaudeCodePoolEffectiveConfig }) {
   const rpmLimit = stats?.rpm_limit || config.routing.per_account_rpm * Math.max(1, stats?.account_count || 0);
   return (
     <Card>
@@ -1049,28 +1673,44 @@ function AccountPoolMetrics({ stats, config }: { stats?: ClaudeCodePoolStats; co
         <CardTitle>运行指标</CardTitle>
         <CardDescription>独立统计 Claude Code Account Pool，不混入原 Claude API Pool。</CardDescription>
       </CardHeader>
-      <CardContent className="grid grid-cols-6 gap-3 max-[1280px]:grid-cols-3 max-[760px]:grid-cols-2 max-[480px]:grid-cols-1">
-        <MetricTile label="可用账号" value={`${stats?.available_accounts || 0}`} sub={`总数 ${stats?.account_count || 0}`} icon={UsersRound} />
-        <MetricTile label="全局并发" value={`${stats?.in_flight || 0}`} sub="当前请求" icon={Activity} />
-        <MetricTile label="RPM" value={`${stats?.rpm_used || 0} / ${rpmLimit || 0}`} sub="滚动窗口" icon={Clock3} />
-        <MetricTile
-          label="真实缓存率"
-          value={formatRatioPercent(stats?.real_cache_ratio)}
-          sub={`读 ${stats?.cache_read_tokens || 0} / 建 ${stats?.cache_creation_tokens || 0}`}
-          icon={Database}
-        />
-        <MetricTile
-          label="亲和 Key / lanes"
-          value={`${stats?.active_affinity_keys || 0} / ${stats?.warm_lanes || stats?.affinity_auto_plan?.effective_lanes || 0}`}
-          sub="缓存路由"
-          icon={Network}
-        />
-        <MetricTile
-          label="成功率"
-          value={formatRatioPercent(stats?.success_rate)}
-          sub={`${stats?.success_count || 0} / ${stats?.request_count || 0}`}
-          icon={CheckCircle2}
-        />
+      <CardContent className="grid gap-4">
+        <div className="grid grid-cols-6 gap-3 max-[1280px]:grid-cols-3 max-[760px]:grid-cols-2 max-[480px]:grid-cols-1">
+          <MetricTile label="可用账号" value={`${stats?.available_accounts || 0}`} sub={`总数 ${stats?.account_count || 0}`} icon={UsersRound} />
+          <MetricTile label="全局并发" value={`${stats?.in_flight || 0}`} sub={`冷却/不可用 ${stats?.cooling_accounts || 0}`} icon={Activity} />
+          <MetricTile label="RPM" value={`${stats?.rpm_used || 0} / ${rpmLimit || 0}`} sub={`本地拒绝 ${stats?.local_reject_count || 0}`} icon={Clock3} />
+          <MetricTile
+            label="真实缓存率"
+            value={formatRatioPercent(stats?.real_cache_ratio)}
+            sub={`读 ${formatTokenCompact(stats?.cache_read_tokens || 0)} / 建 ${formatTokenCompact(stats?.cache_creation_tokens || 0)}`}
+            icon={Database}
+          />
+          <MetricTile
+            label="亲和 Key / lanes"
+            value={`${stats?.active_affinity_keys || 0} / ${stats?.warm_lanes || stats?.affinity_auto_plan?.effective_lanes || 0}`}
+            sub="缓存路由"
+            icon={Network}
+          />
+          <MetricTile
+            label="成功率"
+            value={formatRatioPercent(stats?.success_rate)}
+            sub={`${stats?.success_count || 0} / ${stats?.request_count || 0}`}
+            icon={CheckCircle2}
+          />
+        </div>
+
+        <div className="grid grid-cols-5 gap-3 max-[1180px]:grid-cols-3 max-[760px]:grid-cols-2 max-[480px]:grid-cols-1">
+          <CompactStat label="真实输入" value={formatTokenLarge(stats?.raw_input_tokens || stats?.input_tokens || 0)} />
+          <CompactStat label="真实输出" value={formatTokenLarge(stats?.output_tokens || 0)} />
+          <CompactStat label="缓存创建" value={formatTokenLarge(stats?.cache_creation_tokens || 0)} />
+          <CompactStat label="缓存读取" value={formatTokenLarge(stats?.cache_read_tokens || 0)} />
+          <CompactStat label="真实总量" value={formatTokenLarge(stats?.raw_total_tokens || realTotalTokens(stats))} />
+        </div>
+
+        <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.2fr)] gap-3 max-[1080px]:grid-cols-1">
+          <UsageBucket title="近 1h 按模型" items={usage?.by_requested_model?.length ? usage.by_requested_model : usage?.by_model || []} />
+          <UsageBucket title="近 1h 按账号" items={usage?.by_account || []} />
+          <RecentRoutingErrors errors={stats?.recent_errors || []} />
+        </div>
       </CardContent>
     </Card>
   );
@@ -1983,20 +2623,24 @@ function CompactQuotaWindow({ label, window }: { label: string; window?: Account
 function CompactCapacity({ account }: { account: ClaudeCodeAccount }) {
   const runtime = account.runtime_capacity;
   const configured = account.capacity;
-  const limit = runtime?.capacity_limit ?? (configured ? configured.concurrency_limit + configured.sticky_buffer : 0);
-  const used = runtime?.capacity_used ?? 0;
-  const percent = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+  const concurrencyLimit = runtime?.concurrency_limit ?? configured?.concurrency_limit ?? 0;
+  const inFlight = runtime?.in_flight ?? 0;
+  const percent = concurrencyLimit > 0 ? Math.min(100, Math.round((inFlight / concurrencyLimit) * 100)) : 0;
 
   return (
     <div className="grid gap-2 rounded-lg border bg-muted/20 p-3">
       <div className="flex items-center justify-between gap-2 text-xs">
-        <span className="text-muted-foreground">容量</span>
-        <span className="font-semibold tabular-nums">{limit > 0 ? `${used} / ${limit}` : "-"}</span>
+        <span className="text-muted-foreground">并发</span>
+        <span className="font-semibold tabular-nums">{concurrencyLimit > 0 ? `${inFlight} / ${concurrencyLimit}` : "-"}</span>
       </div>
       <Progress value={percent} />
-      <div className="text-xs text-muted-foreground">
-        并发 {runtime?.in_flight ?? 0}/{runtime?.concurrency_limit ?? configured?.concurrency_limit ?? 0} · RPM {runtime?.rpm_used ?? 0}/
-        {runtime?.rpm_limit || configured?.base_rpm || 0}
+      <div className="grid gap-1 text-xs text-muted-foreground">
+        <span>
+          RPM {runtime?.rpm_used ?? 0}/{runtime?.rpm_limit || configured?.base_rpm || 0}
+        </span>
+        <span>
+          Sticky buffer {runtime?.buffer_used ?? 0}/{runtime?.sticky_buffer ?? configured?.sticky_buffer ?? 0}
+        </span>
       </div>
     </div>
   );
@@ -2226,13 +2870,10 @@ function CapacitySummary({ account }: { account: ClaudeCodeAccount }) {
     return <span className="text-muted-foreground">-</span>;
   }
   return (
-    <div className="grid gap-1 text-sm">
-      <span className="font-medium">
-        {runtime.capacity_used} / {runtime.capacity_limit}
-      </span>
-      <span className="text-xs text-muted-foreground">
-        并发 {runtime.in_flight}/{runtime.concurrency_limit} · RPM {runtime.rpm_used}/{runtime.rpm_limit || runtime.base_rpm}
-      </span>
+    <div className="grid gap-1 text-sm tabular-nums">
+      <span>并发 {runtime.in_flight}/{runtime.concurrency_limit}</span>
+      <span>RPM {runtime.rpm_used}/{runtime.rpm_limit || runtime.base_rpm}</span>
+      <span>Sticky buffer {runtime.buffer_used}/{runtime.sticky_buffer}</span>
     </div>
   );
 }
@@ -2440,28 +3081,6 @@ function calibrationStatusText(status: string, estimated?: boolean) {
   return estimated ? "估算" : "未校准";
 }
 
-function UsageSummaryPanel({ usage }: { usage?: UsageSummary }) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>用量账本</CardTitle>
-        <CardDescription>只做统计和观测，不做扣费、订阅或用户余额。</CardDescription>
-      </CardHeader>
-      <CardContent className="grid gap-4">
-        <div className="grid grid-cols-3 gap-3 max-[640px]:grid-cols-1">
-          <CompactStat label="请求数" value={`${usage?.request_count || 0}`} />
-          <CompactStat label="成功率" value={formatRatioPercent((usage?.success_rate || 0) / 100)} />
-          <CompactStat label="缓存读/建" value={`${usage?.cache_read_tokens || 0} / ${usage?.cache_creation_tokens || 0}`} />
-        </div>
-        <div className="grid grid-cols-2 gap-3 max-[760px]:grid-cols-1">
-          <UsageBucket title="按模型" items={usage?.by_model || []} />
-          <UsageBucket title="按账号" items={usage?.by_account || []} />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 function UsageBucket({ title, items }: { title: string; items: NonNullable<UsageSummary["by_model"]> }) {
   return (
     <div className="rounded-lg border bg-muted/20 p-3">
@@ -2474,7 +3093,7 @@ function UsageBucket({ title, items }: { title: string; items: NonNullable<Usage
                 {item.key}
               </span>
               <span className="text-muted-foreground">
-                {item.request_count} 次 · {Math.round(item.success_rate)}%
+                {item.request_count} 次 · {Math.round(item.success_rate)}% · {formatTokenLarge(item.raw_total_tokens || realTotalTokens(item))}
               </span>
             </div>
           ))
@@ -2483,6 +3102,228 @@ function UsageBucket({ title, items }: { title: string; items: NonNullable<Usage
         )}
       </div>
     </div>
+  );
+}
+
+function RecentRoutingErrors({ errors }: { errors: RoutingEvent[] }) {
+  return (
+    <div className="rounded-lg border bg-muted/20 p-3">
+      <div className="mb-2 text-sm font-medium">最近错误 / 本地拒绝</div>
+      <div className="grid gap-2">
+        {errors.length ? (
+          errors.slice(0, 5).map((event, index) => (
+            <div key={`${event.id || index}-${event.created_at}`} className="grid gap-1 rounded-md bg-background/65 px-2 py-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone={event.decision === "rejected" ? "warning" : "danger"}>{event.decision || "error"}</Badge>
+                <span className="font-medium">{event.requested_model || event.model || "-"}</span>
+                <span className="text-muted-foreground">{formatTime(event.created_at)}</span>
+              </div>
+              <div className="break-words text-muted-foreground">{event.reason || event.error || `HTTP ${event.status_code || "-"}`}</div>
+            </div>
+          ))
+        ) : (
+          <p className="text-sm text-muted-foreground">暂无错误或本地拒绝</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AccountPoolLogPanel({
+  config,
+  raw,
+  logs,
+  onDone,
+  onToast
+}: {
+  config: AccountPoolLogEffectiveConfig;
+  raw?: AccountPoolLogRawConfig;
+  logs: AccountPoolLogLine[];
+  onDone: () => Promise<void>;
+  onToast: (message: string, tone?: ToastState["tone"]) => void;
+}) {
+  const [enabled, setEnabled] = useState(config.enabled);
+  const [level, setLevel] = useState(config.level || "info");
+  const [maxSizeMB, setMaxSizeMB] = useState(config.max_size_mb || 50);
+  const [maxBackups, setMaxBackups] = useState(config.max_backups || 3);
+  const [redact, setRedact] = useState(config.redact);
+  useEffect(() => {
+    setEnabled(config.enabled);
+    setLevel(config.level || "info");
+    setMaxSizeMB(config.max_size_mb || 50);
+    setMaxBackups(config.max_backups || 3);
+    setRedact(config.redact);
+  }, [config.enabled, config.level, config.max_size_mb, config.max_backups, config.redact]);
+  const saveMutation = useMutation({
+    mutationFn: () =>
+      api.savePoolLogConfig({
+        ...raw,
+        enabled,
+        level,
+        dir: config.dir || raw?.dir || "acc-pool-logs",
+        max_size_mb: maxSizeMB,
+        max_backups: maxBackups,
+        redact
+      }),
+    onSuccess: async () => {
+      await onDone();
+      onToast("日志配置已保存");
+    },
+    onError: (error) => onToast(`保存日志配置失败：${errorMessage(error)}`, "danger")
+  });
+  const clearMutation = useMutation({
+    mutationFn: api.clearPoolLogs,
+    onSuccess: async () => {
+      await onDone();
+      onToast("账号池日志已清空");
+    },
+    onError: (error) => onToast(`清空日志失败：${errorMessage(error)}`, "danger")
+  });
+  const downloadMutation = useMutation({
+    mutationFn: api.downloadPoolLogs,
+    onSuccess: (blob) => {
+      const href = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = href;
+      anchor.download = "account-pool.log";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(href);
+    },
+    onError: (error) => onToast(`下载日志失败：${errorMessage(error)}`, "danger")
+  });
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>账号池日志</CardTitle>
+        <CardDescription>JSONL 诊断日志，默认脱敏并按大小轮转。</CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid grid-cols-5 gap-3 max-[1100px]:grid-cols-2 max-[560px]:grid-cols-1">
+          <ToggleRow label="启用日志" checked={enabled} onChange={setEnabled} />
+          <Field label="日志等级">
+            <Select value={level} onChange={(event) => setLevel(event.target.value)}>
+              <option value="debug">debug</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+            </Select>
+          </Field>
+          <Field label="单文件 MB">
+            <Input type="number" min={1} max={1024} value={maxSizeMB} onChange={(event) => setMaxSizeMB(Number(event.target.value) || 50)} />
+          </Field>
+          <Field label="保留文件">
+            <Input type="number" min={0} max={30} value={maxBackups} onChange={(event) => setMaxBackups(Number(event.target.value) || 3)} />
+          </Field>
+          <ToggleRow label="脱敏" checked={redact} onChange={setRedact} />
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="text-sm text-muted-foreground">目录：{config.dir || "acc-pool-logs"}</div>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending}>
+              {saveMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+              保存配置
+            </Button>
+            <Button variant="outline" onClick={() => downloadMutation.mutate()} disabled={downloadMutation.isPending}>
+              {downloadMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              下载日志
+            </Button>
+            <Button variant="outline" onClick={() => clearMutation.mutate()} disabled={clearMutation.isPending}>
+              {clearMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Eraser className="h-4 w-4" />}
+              清空
+            </Button>
+          </div>
+        </div>
+        <div className="max-h-80 overflow-auto rounded-lg border bg-muted/20">
+          {logs.length ? (
+            <div className="grid divide-y">
+              {logs.slice(0, 80).map((line, index) => (
+                <LogLineView key={`${line.entry?.ts || index}-${line.line.slice(0, 12)}`} line={line} />
+              ))}
+            </div>
+          ) : (
+            <div className="p-4 text-sm text-muted-foreground">暂无日志</div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function LogLineView({ line }: { line: AccountPoolLogLine }) {
+  const entry = line.entry;
+  if (!entry) {
+    return <pre className="whitespace-pre-wrap break-all px-3 py-2 text-xs text-muted-foreground">{line.line}</pre>;
+  }
+  return (
+    <div className="grid gap-1 px-3 py-2 text-xs">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge tone={entry.level === "error" ? "danger" : entry.level === "warn" ? "warning" : "info"}>{entry.level}</Badge>
+        <span className="font-medium">{entry.event}</span>
+        <span className="text-muted-foreground">{formatTime(entry.ts)}</span>
+        {entry.status_code ? <span className="tabular-nums text-muted-foreground">HTTP {entry.status_code}</span> : null}
+      </div>
+      <div className="break-words text-muted-foreground">
+        {entry.requested_model || entry.model || "-"} · {entry.decision || "-"} {entry.reason ? `· ${entry.reason}` : ""} {entry.error ? `· ${entry.error}` : ""}
+      </div>
+    </div>
+  );
+}
+
+function RoutingEventsPanel({ events }: { events: RoutingEvent[] }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>最近调度事件</CardTitle>
+        <CardDescription>包含选号、本地拒绝、上游错误和成功事件。</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="table-scroll">
+          <table className="data-table min-w-[920px]">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>决策</th>
+                <th>模型</th>
+                <th>状态</th>
+                <th>容量</th>
+                <th>原因</th>
+              </tr>
+            </thead>
+            <tbody>
+              {events.length ? (
+                events.slice(0, 40).map((event, index) => (
+                  <tr key={`${event.id || index}-${event.created_at}`}>
+                    <td>{formatTime(event.created_at)}</td>
+                    <td>
+                      <Badge tone={event.decision === "success" ? "success" : event.decision === "rejected" ? "warning" : event.decision === "upstream_error" ? "danger" : "info"}>
+                        {event.decision}
+                      </Badge>
+                    </td>
+                    <td className="max-w-64 truncate" title={event.requested_model || event.model}>
+                      {event.requested_model || event.model || "-"}
+                    </td>
+                    <td>{event.status_code || "-"}</td>
+                    <td>
+                      {event.capacity_used ?? 0}/{event.capacity_limit ?? 0}
+                    </td>
+                    <td className="max-w-80 break-words">{event.reason || event.error || "-"}</td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={6} className="text-center text-muted-foreground">
+                    暂无调度事件
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -2524,7 +3365,7 @@ function CompactStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border bg-muted/25 p-3">
       <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="mt-1 text-lg font-semibold leading-none">{value}</div>
+      <div className="mt-1 break-words text-lg font-semibold leading-none">{value}</div>
     </div>
   );
 }
@@ -2583,6 +3424,46 @@ function formatRatioPercent(value?: number) {
   }
   const normalized = value > 1 ? value : value * 100;
   return `${Math.round(normalized)}%`;
+}
+
+function realTotalTokens(value?: {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+}) {
+  if (!value) {
+    return 0;
+  }
+  return (value.input_tokens || 0) + (value.output_tokens || 0) + (value.cache_read_tokens || 0) + (value.cache_creation_tokens || 0);
+}
+
+function formatTokenCompact(tokens: number) {
+  if (!Number.isFinite(tokens) || tokens <= 0) {
+    return "0";
+  }
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(tokens);
+}
+
+function formatTokenLarge(tokens: number) {
+  if (!Number.isFinite(tokens) || tokens <= 0) {
+    return "0M";
+  }
+  const millions = tokens / 1_000_000;
+  if (millions >= 1000) {
+    return `${formatShortNumber(millions / 1000)}B`;
+  }
+  return `${formatShortNumber(millions)}M`;
+}
+
+function formatShortNumber(value: number) {
+  if (value >= 100) {
+    return `${Math.round(value)}`;
+  }
+  if (value >= 10) {
+    return value.toFixed(1).replace(/\.0$/, "");
+  }
+  return value.toFixed(2).replace(/\.00$/, "").replace(/0$/, "");
 }
 
 function compactModelName(model: string) {
@@ -2666,6 +3547,14 @@ function defaultPoolEffectiveConfig(): ClaudeCodePoolEffectiveConfig {
       system_prompt_overhead_tokens: 1909,
       profile_fingerprint: ""
     },
+    log: {
+      enabled: true,
+      level: "info",
+      dir: "acc-pool-logs",
+      max_size_mb: 50,
+      max_backups: 3,
+      redact: true
+    },
     virtual_cache: {
       enabled: false,
       mode: "natural",
@@ -2715,6 +3604,14 @@ function toRawPoolConfig(config: ClaudeCodePoolEffectiveConfig): ClaudeCodePoolR
     usage: {
       clean_input_tokens: config.usage.clean_input_tokens,
       system_prompt_overhead_tokens: config.usage.system_prompt_overhead_tokens
+    },
+    log: {
+      enabled: config.log.enabled,
+      level: config.log.level,
+      dir: config.log.dir,
+      max_size_mb: config.log.max_size_mb,
+      max_backups: config.log.max_backups,
+      redact: config.log.redact
     },
     virtual_cache: {
       enabled: config.virtual_cache.enabled,
@@ -4019,6 +4916,30 @@ function groupProxies(proxies: ProxyResource[]) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function shortText(value?: string, length = 12) {
+  const text = (value || "").trim();
+  if (!text) {
+    return "-";
+  }
+  if (text.length <= length) {
+    return text;
+  }
+  return `${text.slice(0, length)}...`;
+}
+
+function snapshotStatusText(status?: string) {
+  switch ((status || "").trim()) {
+    case "promoted":
+      return "已标记";
+    case "fetched":
+      return "已拉取";
+    case "failed":
+      return "异常";
+    default:
+      return status || "未知";
+  }
 }
 
 function formatPercent(value?: number) {
