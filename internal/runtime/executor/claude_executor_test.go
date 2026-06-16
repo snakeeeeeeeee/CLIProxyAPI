@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/resourcepool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -989,7 +990,7 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolUsesBuiltinFullProfile(t *testing.T
 	}))
 	defer server.Close()
 
-	fixedUserID := "2cbd8b9e-b3ec-4b6f-a831-76437a59b04e"
+	fixedUserID := "user_be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714_account_11111111-2222-4333-8444-555555555555_session_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 	executor := NewClaudeExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
 		"api_key":                                   "key-123",
@@ -1000,7 +1001,7 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolUsesBuiltinFullProfile(t *testing.T
 		"claude_code_profile_user_agent":            "bad-client/0.0.1",
 		"claude_code_profile_system_prompt":         "bad prompt",
 		"claude_code_profile_billing_block_enabled": "false",
-	}}
+	}, Metadata: map[string]any{"account_uuid": "99999999-aaaa-4bbb-8ccc-dddddddddddd"}}
 	payload := []byte(`{"system":"Custom downstream system.","messages":[{"role":"user","content":"hi"}]}`)
 
 	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
@@ -1039,11 +1040,85 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolUsesBuiltinFullProfile(t *testing.T
 	if got := blocks[2].Get("text").String(); got != expectedClaudeCodeStaticPrompt() {
 		t.Fatalf("static prompt block did not use builtin full Claude Code prompt")
 	}
-	if got := gjson.GetBytes(seenBody, "metadata.user_id").String(); got != fixedUserID {
-		t.Fatalf("metadata.user_id = %q, want fixed account user id", got)
+	userID := gjson.GetBytes(seenBody, "metadata.user_id").String()
+	parsed, ok := helps.ParseClaudeCodeMetadataUserID(userID)
+	if !ok {
+		t.Fatalf("metadata.user_id = %q, want Claude Code metadata user id", userID)
+	}
+	if parsed.DeviceID != "be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714" {
+		t.Fatalf("metadata.user_id device_id = %q", parsed.DeviceID)
+	}
+	if parsed.AccountUUID != "99999999-aaaa-4bbb-8ccc-dddddddddddd" {
+		t.Fatalf("metadata.user_id account_uuid = %q", parsed.AccountUUID)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(userID), "{") {
+		t.Fatalf("metadata.user_id = %q, want JSON format for builtin Claude Code profile", userID)
 	}
 	if got := gjson.GetBytes(seenBody, "messages.0.content").String(); !strings.Contains(got, "Use the available tools when needed") || strings.Contains(got, "Custom downstream system.") {
 		t.Fatalf("forwarded system reminder was not sanitized for OAuth account pool: %q", got)
+	}
+}
+
+func TestClaudeExecutor_ClaudeCodeAccountPoolSessionIDIsStableByConversation(t *testing.T) {
+	var userIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		userIDs = append(userIDs, gjson.GetBytes(body, "metadata.user_id").String())
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-3-5-sonnet","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":                  "key-123",
+		"base_url":                 server.URL,
+		"claude_oauth_pool":        "true",
+		"claude_code_pool":         "true",
+		"cloak_user_id":            "user_be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714_account_11111111-2222-4333-8444-555555555555_session_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		resourcepool.AttrAccountID: "account-a",
+	}, Metadata: map[string]any{"account_uuid": "11111111-2222-4333-8444-555555555555"}}
+	payload := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+
+	for i := 0; i < 2; i++ {
+		if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+			Model:   "claude-3-5-sonnet",
+			Payload: payload,
+		}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+			t.Fatalf("Execute call %d error: %v", i, err)
+		}
+	}
+	changedPayload := []byte(`{"messages":[{"role":"user","content":"different conversation"}]}`)
+	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet",
+		Payload: changedPayload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+		t.Fatalf("Execute changed conversation error: %v", err)
+	}
+
+	if len(userIDs) != 3 {
+		t.Fatalf("expected 3 requests, got %d", len(userIDs))
+	}
+	first, ok := helps.ParseClaudeCodeMetadataUserID(userIDs[0])
+	if !ok {
+		t.Fatalf("first metadata.user_id = %q", userIDs[0])
+	}
+	second, ok := helps.ParseClaudeCodeMetadataUserID(userIDs[1])
+	if !ok {
+		t.Fatalf("second metadata.user_id = %q", userIDs[1])
+	}
+	third, ok := helps.ParseClaudeCodeMetadataUserID(userIDs[2])
+	if !ok {
+		t.Fatalf("third metadata.user_id = %q", userIDs[2])
+	}
+	if first.DeviceID != second.DeviceID || first.AccountUUID != second.AccountUUID {
+		t.Fatalf("account identity changed across calls: first=%+v second=%+v", first, second)
+	}
+	if first.SessionID != second.SessionID {
+		t.Fatalf("same conversation session_id changed: %q vs %q", first.SessionID, second.SessionID)
+	}
+	if first.SessionID == third.SessionID {
+		t.Fatalf("different conversation reused session_id %q", first.SessionID)
 	}
 }
 
@@ -2466,8 +2541,68 @@ func TestNormalizeClaudeTemperatureForThinking_AfterForcedToolChoiceKeepsOrigina
 	}
 }
 
-func TestRemapOAuthToolNames_TitleCase_NoReverseNeeded(t *testing.T) {
-	body := []byte(`{"tools":[{"name":"Bash","description":"Run shell commands","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+func TestRemapOAuthToolNames_CustomToolNameAndSchemaPreserved(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"AskUserQuestion","description":"Ask the user","input_schema":{"type":"object","properties":{"questions":{"type":"array","items":{"type":"string"}}},"required":["questions"]}},{"name":"question","description":"custom question tool","input_schema":{"type":"object","properties":{"questions":{"type":"array","items":{"type":"string"}}}}}],"tool_choice":{"type":"tool","name":"AskUserQuestion"},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	out, reverseMap := remapOAuthToolNames(body)
+	if len(reverseMap) != 0 {
+		t.Fatalf("reverseMap = %v, want empty", reverseMap)
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "AskUserQuestion" {
+		t.Fatalf("tools.0.name = %q, want %q", got, "AskUserQuestion")
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "question" {
+		t.Fatalf("tools.1.name = %q, want %q", got, "question")
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "AskUserQuestion" {
+		t.Fatalf("tool_choice.name = %q, want %q", got, "AskUserQuestion")
+	}
+	if got := gjson.GetBytes(out, "tools.0.input_schema.properties.questions.type").String(); got != "array" {
+		t.Fatalf("questions schema type = %q, want array", got)
+	}
+
+	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"AskUserQuestion","input":{"question":"bad shape"}}]}`)
+	reversed := reverseRemapOAuthToolNames(resp, reverseMap)
+	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "AskUserQuestion" {
+		t.Fatalf("content.0.name = %q, want %q", got, "AskUserQuestion")
+	}
+}
+
+func TestRemapOAuthToolNames_StaticSessionPrefix_RenamesAndRestores(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"sessions_list","input_schema":{"type":"object"}},{"name":"session_get","input_schema":{"type":"object"}},{"type":"web_search_20250305","name":"web_search"}],"tool_choice":{"type":"tool","name":"sessions_list"},"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"session_get","input":{}}]}]}`)
+
+	out, reverseMap := remapOAuthToolNames(body)
+	if reverseMap["cc_sess_list"] != "sessions_list" || reverseMap["cc_ses_get"] != "session_get" {
+		t.Fatalf("reverseMap = %v, want static session prefix entries", reverseMap)
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "cc_sess_list" {
+		t.Fatalf("tools.0.name = %q, want %q", got, "cc_sess_list")
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "cc_ses_get" {
+		t.Fatalf("tools.1.name = %q, want %q", got, "cc_ses_get")
+	}
+	if got := gjson.GetBytes(out, "tools.2.name").String(); got != "web_search" {
+		t.Fatalf("server tool name = %q, want web_search", got)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "cc_sess_list" {
+		t.Fatalf("tool_choice.name = %q, want %q", got, "cc_sess_list")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "cc_ses_get" {
+		t.Fatalf("message tool_use name = %q, want %q", got, "cc_ses_get")
+	}
+
+	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"cc_sess_list","input":{}}]}`)
+	reversed := reverseRemapOAuthToolNames(resp, reverseMap)
+	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "sessions_list" {
+		t.Fatalf("content.0.name = %q, want %q", got, "sessions_list")
+	}
+}
+
+func TestRemapOAuthToolNames_SmallToolSetDoesNotTitleCaseBuiltins(t *testing.T) {
+	body := []byte(`{"tools":[` +
+		`{"name":"Bash","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}},` +
+		`{"name":"glob","input_schema":{"type":"object","properties":{"filePattern":{"type":"string"}}}}` +
+		`]}`)
 
 	out, reverseMap := remapOAuthToolNames(body)
 	if len(reverseMap) != 0 {
@@ -2476,75 +2611,63 @@ func TestRemapOAuthToolNames_TitleCase_NoReverseNeeded(t *testing.T) {
 	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
 		t.Fatalf("tools.0.name = %q, want %q", got, "Bash")
 	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "glob" {
+		t.Fatalf("tools.1.name = %q, want %q", got, "glob")
+	}
 
-	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"cmd":"ls"}}]}`)
+	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"glob","input":{"filePattern":"**/*.go"}}]}`)
 	reversed := reverseRemapOAuthToolNames(resp, reverseMap)
-	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "Bash" {
-		t.Fatalf("content.0.name = %q, want %q", got, "Bash")
-	}
-}
-
-func TestRemapOAuthToolNames_Lowercase_ReverseApplied(t *testing.T) {
-	body := []byte(`{"tools":[{"name":"bash","description":"Run shell commands","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-
-	out, reverseMap := remapOAuthToolNames(body)
-	if reverseMap["Bash"] != "bash" {
-		t.Fatalf("reverseMap = %v, want entry Bash->bash", reverseMap)
-	}
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
-		t.Fatalf("tools.0.name = %q, want %q", got, "Bash")
-	}
-
-	resp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"cmd":"ls"}}]}`)
-	reversed := reverseRemapOAuthToolNames(resp, reverseMap)
-	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "bash" {
-		t.Fatalf("content.0.name = %q, want %q", got, "bash")
-	}
-}
-
-// TestRemapOAuthToolNames_MixedCase_OnlyRenamedToolsReversed is the regression
-// test for a case where a single request contains both a TitleCase tool (which
-// must pass through unchanged) and a lowercase tool that we forward-rename.
-// Before the fix, triggering ANY forward rename caused the reverse pass to
-// lowercase every TitleCase tool in the response using a global reverse map,
-// corrupting tool names the client originally sent in TitleCase (notably Amp
-// CLI's `Bash`, which its registry lookup cannot find as `bash`).
-func TestRemapOAuthToolNames_MixedCase_OnlyRenamedToolsReversed(t *testing.T) {
-	body := []byte(`{"tools":[` +
-		`{"name":"Bash","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}},` +
-		`{"name":"glob","input_schema":{"type":"object","properties":{"filePattern":{"type":"string"}}}}` +
-		`]}`)
-
-	out, reverseMap := remapOAuthToolNames(body)
-
-	// Forward: TitleCase `Bash` is not a forward-map key, must pass through.
-	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
-		t.Fatalf("tools.0.name = %q, want %q (TitleCase tool must not be renamed)", got, "Bash")
-	}
-	// Forward: `glob` is a forward-map key, upstream sees `Glob`.
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "Glob" {
-		t.Fatalf("tools.1.name = %q, want %q", got, "Glob")
-	}
-
-	// Reverse map records ONLY the rename that happened.
-	if len(reverseMap) != 1 || reverseMap["Glob"] != "glob" {
-		t.Fatalf("reverseMap = %v, want {Glob:glob}", reverseMap)
-	}
-
-	// Upstream responds with a `Bash` tool_use. Since we never renamed `Bash`,
-	// reverseRemap MUST leave it alone.
-	bashResp := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"cmd":"ls"}}]}`)
-	reversed := reverseRemapOAuthToolNames(bashResp, reverseMap)
-	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "Bash" {
-		t.Fatalf("content.0.name = %q, want %q (Bash must be preserved; was never forward-renamed)", got, "Bash")
-	}
-
-	// Upstream responds with a `Glob` tool_use. Since we renamed `glob`→`Glob`,
-	// reverseRemap MUST restore the original `glob`.
-	globResp := []byte(`{"content":[{"type":"tool_use","id":"toolu_02","name":"Glob","input":{"filePattern":"**/*.go"}}]}`)
-	reversed = reverseRemapOAuthToolNames(globResp, reverseMap)
 	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "glob" {
-		t.Fatalf("content.0.name = %q, want %q (Glob must be restored to client's original `glob`)", got, "glob")
+		t.Fatalf("content.0.name = %q, want %q", got, "glob")
+	}
+}
+
+func TestRemapOAuthToolNames_DynamicMap_RenamesAndRestores(t *testing.T) {
+	body := []byte(`{"tools":[` +
+		`{"name":"alpha_search","input_schema":{"type":"object","properties":{"q":{"type":"string"}}}},` +
+		`{"name":"beta_lookup","input_schema":{"type":"object"}},` +
+		`{"name":"gamma_fetch","input_schema":{"type":"object"}},` +
+		`{"name":"delta_update","input_schema":{"type":"object"}},` +
+		`{"name":"epsilon_parse","input_schema":{"type":"object"}},` +
+		`{"name":"zeta_render","input_schema":{"type":"object"}},` +
+		`{"type":"web_search_20250305","name":"web_search"}` +
+		`],"tool_choice":{"type":"tool","name":"gamma_fetch"},"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"gamma_fetch","input":{}}]}]}`)
+
+	out, reverseMap := remapOAuthToolNames(body)
+	if len(reverseMap) != 6 {
+		t.Fatalf("reverseMap length = %d, want 6: %v", len(reverseMap), reverseMap)
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got == "alpha_search" {
+		t.Fatalf("dynamic map should rename alpha_search")
+	}
+	if got := gjson.GetBytes(out, "tools.0.input_schema.properties.q.type").String(); got != "string" {
+		t.Fatalf("schema should be preserved, got q.type=%q", got)
+	}
+	if got := gjson.GetBytes(out, "tools.6.name").String(); got != "web_search" {
+		t.Fatalf("server tool name = %q, want web_search", got)
+	}
+
+	var fakeGamma string
+	for fake, real := range reverseMap {
+		if real == "gamma_fetch" {
+			fakeGamma = fake
+			break
+		}
+	}
+	if fakeGamma == "" {
+		t.Fatalf("reverseMap missing gamma_fetch: %v", reverseMap)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != fakeGamma {
+		t.Fatalf("tool_choice.name = %q, want %q", got, fakeGamma)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != fakeGamma {
+		t.Fatalf("message tool_use name = %q, want %q", got, fakeGamma)
+	}
+
+	resp := []byte(fmt.Sprintf(`{"content":[{"type":"tool_use","id":"toolu_01","name":%q,"input":{}}]}`, fakeGamma))
+	reversed := reverseRemapOAuthToolNames(resp, reverseMap)
+	if got := gjson.GetBytes(reversed, "content.0.name").String(); got != "gamma_fetch" {
+		t.Fatalf("content.0.name = %q, want gamma_fetch", got)
 	}
 }
 
@@ -2585,25 +2708,25 @@ func TestPrepareClaudeOAuthToolNamesForUpstream_MixedCaseWithPrefix(t *testing.T
 	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "proxy_Bash" {
 		t.Fatalf("tools.0.name = %q, want %q", got, "proxy_Bash")
 	}
-	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_Glob" {
-		t.Fatalf("tools.1.name = %q, want %q", got, "proxy_Glob")
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "proxy_glob" {
+		t.Fatalf("tools.1.name = %q, want %q", got, "proxy_glob")
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "proxy_Bash" {
 		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "proxy_Bash")
 	}
-	if got := gjson.GetBytes(out, "messages.0.content.1.name").String(); got != "proxy_Glob" {
-		t.Fatalf("messages.0.content.1.name = %q, want %q", got, "proxy_Glob")
+	if got := gjson.GetBytes(out, "messages.0.content.1.name").String(); got != "proxy_glob" {
+		t.Fatalf("messages.0.content.1.name = %q, want %q", got, "proxy_glob")
 	}
-	if len(reverseMap) != 1 || reverseMap["Glob"] != "glob" {
-		t.Fatalf("reverseMap = %v, want {Glob:glob}", reverseMap)
+	if len(reverseMap) != 0 {
+		t.Fatalf("reverseMap = %v, want empty", reverseMap)
 	}
 }
 
 func TestRestoreClaudeOAuthToolNamesFromResponse_MixedCaseWithPrefix(t *testing.T) {
-	reverseMap := map[string]string{"Glob": "glob"}
+	reverseMap := map[string]string{}
 	resp := []byte(`{"content":[` +
 		`{"type":"tool_use","id":"toolu_01","name":"proxy_Bash","input":{}},` +
-		`{"type":"tool_use","id":"toolu_02","name":"proxy_Glob","input":{}}` +
+		`{"type":"tool_use","id":"toolu_02","name":"proxy_glob","input":{}}` +
 		`]}`)
 
 	out := restoreClaudeOAuthToolNamesFromResponse(resp, "proxy_", false, reverseMap)
@@ -2617,7 +2740,7 @@ func TestRestoreClaudeOAuthToolNamesFromResponse_MixedCaseWithPrefix(t *testing.
 }
 
 func TestRestoreClaudeOAuthToolNamesFromStreamLine_MixedCaseWithPrefix(t *testing.T) {
-	reverseMap := map[string]string{"Glob": "glob"}
+	reverseMap := map[string]string{}
 
 	bashLine := []byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"proxy_Bash","input":{}}}`)
 	out := restoreClaudeOAuthToolNamesFromStreamLine(bashLine, "proxy_", false, reverseMap)
@@ -2628,7 +2751,7 @@ func TestRestoreClaudeOAuthToolNamesFromStreamLine_MixedCaseWithPrefix(t *testin
 		t.Fatalf("Bash must not be lowercased, got: %s", string(out))
 	}
 
-	globLine := []byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_02","name":"proxy_Glob","input":{}}}`)
+	globLine := []byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_02","name":"proxy_glob","input":{}}}`)
 	out = restoreClaudeOAuthToolNamesFromStreamLine(globLine, "proxy_", false, reverseMap)
 	if !bytes.Contains(out, []byte(`"name":"glob"`)) {
 		t.Fatalf("Glob should be restored to glob, got: %s", string(out))

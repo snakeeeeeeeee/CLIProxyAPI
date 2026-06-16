@@ -6,11 +6,14 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
+	mrand "math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -83,38 +86,24 @@ func logClaudeSignatureSanitizeReport(ctx context.Context, baseModel string, rep
 	helps.LogWithRequestID(ctx).WithFields(fields).Debug("claude executor: sanitized signature history before upstream")
 }
 
-// oauthToolRenameMap maps OpenCode-style (lowercase) tool names to Claude Code-style
-// (TitleCase) names. Anthropic uses tool name fingerprinting to detect third-party
-// clients on OAuth traffic. Renaming to official names avoids extra-usage billing.
-// All tools are mapped to TitleCase equivalents to match Claude Code naming patterns.
-var oauthToolRenameMap = map[string]string{
-	"bash":         "Bash",
-	"read":         "Read",
-	"write":        "Write",
-	"edit":         "Edit",
-	"glob":         "Glob",
-	"grep":         "Grep",
-	"task":         "Task",
-	"webfetch":     "WebFetch",
-	"todowrite":    "TodoWrite",
-	"question":     "Question",
-	"skill":        "Skill",
-	"ls":           "LS",
-	"todoread":     "TodoRead",
-	"notebookedit": "NotebookEdit",
+// OAuth tool-name rewriting follows the Claude Code mimicry behavior used by
+// sub2api/Parrot: preserve client schemas and only rewrite names when a generic
+// name-masking rule applies. Do not map custom tools to Claude Code built-ins
+// like Bash or AskUserQuestion; doing so changes the model's expected input
+// shape and can break client-side tool validation.
+var oauthStaticToolNameRewrites = map[string]string{
+	"sessions_": "cc_sess_",
+	"session_":  "cc_ses_",
 }
 
-// The reverse map is now computed per-request in remapOAuthToolNames so that
-// only names the client actually caused us to rewrite are restored on the
-// response. A global reverse map — as used previously — corrupted responses
-// for clients that sent mixed casing (e.g. Amp CLI sends `Bash` TitleCase
-// alongside `glob` lowercase; the request flagged renames via `glob→Glob`,
-// then the global reverse map incorrectly rewrote every `Bash` in the
-// response to `bash`, causing Amp to reject the tool_use as unknown).
+var oauthFakeToolNamePrefixes = []string{
+	"analyze_", "compute_", "fetch_", "generate_", "lookup_", "modify_",
+	"process_", "query_", "render_", "resolve_", "sync_", "update_",
+	"validate_", "convert_", "extract_", "manage_", "monitor_", "parse_",
+	"review_", "search_", "transform_", "handle_", "invoke_", "notify_",
+}
 
-// oauthToolsToRemove lists tool names that must be stripped from OAuth requests
-// even after remapping. Currently empty — all tools are mapped instead of removed.
-var oauthToolsToRemove = map[string]bool{}
+const oauthDynamicToolMapThreshold = 5
 
 // Anthropic-compatible upstreams may reject or even crash when Claude models
 // omit max_tokens. Prefer registered model metadata before using a fallback.
@@ -231,7 +220,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Extract betas from body and convert to header
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
-	body = applyClaudeCodeAccountPoolProfile(ctx, auth, body)
+	body = applyClaudeCodeAccountPoolProfile(ctx, auth, body, req, opts)
 	bodyForTranslation := body
 	cleanInputFloor := estimateClaudeVisibleInputTokens(originalTranslated)
 	if cleanInputFloor == 0 {
@@ -423,7 +412,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Extract betas from body and convert to header
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
-	body = applyClaudeCodeAccountPoolProfile(ctx, auth, body)
+	body = applyClaudeCodeAccountPoolProfile(ctx, auth, body, req, opts)
 	bodyForTranslation := body
 	cleanInputFloor := estimateClaudeVisibleInputTokens(originalTranslated)
 	if cleanInputFloor == 0 {
@@ -1006,7 +995,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	// Extract betas from body and convert to header (for count_tokens too)
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
-	body = applyClaudeCodeAccountPoolProfile(ctx, auth, body)
+	body = applyClaudeCodeAccountPoolProfile(ctx, auth, body, req, opts)
 	body = stripClaudeCountTokensUnsupportedFields(body)
 	if isClaudeOAuthToken(apiKey) {
 		body, _ = prepareClaudeOAuthToolNamesForUpstream(body, claudeToolPrefix, auth.ToolPrefixDisabled())
@@ -1490,16 +1479,158 @@ type claudeCodeAccountPoolProfile struct {
 	Betas     []string
 }
 
-func applyClaudeCodeAccountPoolProfile(ctx context.Context, auth *cliproxyauth.Auth, body []byte) []byte {
+func applyClaudeCodeAccountPoolProfile(ctx context.Context, auth *cliproxyauth.Auth, body []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) []byte {
 	if !isClaudeCodeAccountPoolAuth(auth) {
 		return body
 	}
-	userID := strings.TrimSpace(auth.Attributes["cloak_user_id"])
+	profile := builtinClaudeCodeAccountPoolProfile()
+	userID := claudeCodeAccountPoolMetadataUserID(ctx, auth, body, req, opts, profile.Version)
 	if userID != "" {
 		body, _ = sjson.SetBytes(body, "metadata.user_id", userID)
 	}
-	profile := builtinClaudeCodeAccountPoolProfile()
 	return checkSystemInstructionsWithSigningMode(body, false, true, true, profile.Version, "cli", getWorkloadFromContext(ctx))
+}
+
+func claudeCodeAccountPoolMetadataUserID(ctx context.Context, auth *cliproxyauth.Auth, body []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, version string) string {
+	deviceID, accountUUID := claudeCodeAccountPoolIdentity(auth)
+	if deviceID == "" {
+		return ""
+	}
+	sessionID := claudeCodeAccountPoolSessionID(ctx, auth, body, req, opts)
+	if sessionID == "" {
+		sessionID = uuid.NewString()
+	}
+	return helps.FormatClaudeCodeMetadataUserID(deviceID, accountUUID, sessionID, version)
+}
+
+func claudeCodeAccountPoolIdentity(auth *cliproxyauth.Auth) (deviceID string, accountUUID string) {
+	if auth == nil {
+		return "", ""
+	}
+	if auth.Attributes != nil {
+		if parsed, ok := helps.ParseClaudeCodeMetadataUserID(auth.Attributes["cloak_user_id"]); ok {
+			deviceID = parsed.DeviceID
+			if parsed.AccountUUID != "" {
+				accountUUID = parsed.AccountUUID
+			}
+		}
+	}
+	if deviceID == "" {
+		device := make([]byte, 32)
+		if _, err := rand.Read(device); err != nil {
+			return "", ""
+		}
+		deviceID = hex.EncodeToString(device)
+	}
+	if auth.Metadata != nil {
+		if value := metadataValueString(auth.Metadata, "account_uuid"); value != "" {
+			accountUUID = value
+		}
+	}
+	return strings.ToLower(strings.TrimSpace(deviceID)), strings.ToLower(strings.TrimSpace(accountUUID))
+}
+
+func claudeCodeAccountPoolSessionID(ctx context.Context, auth *cliproxyauth.Auth, body []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	if existing := gjson.GetBytes(body, "metadata.user_id").String(); existing != "" {
+		if parsed, ok := helps.ParseClaudeCodeMetadataUserID(existing); ok && parsed.SessionID != "" {
+			return strings.ToLower(parsed.SessionID)
+		}
+	}
+	if explicit := claudeCodeAccountPoolExplicitSession(ctx, req, opts); explicit != "" {
+		return helps.StableUUIDFromSeed(claudeCodeAccountPoolSessionSeed(auth, "explicit:"+explicit, ""))
+	}
+	firstUserText := helps.FirstClaudeUserText(body)
+	if firstUserText == "" && len(req.Payload) > 0 {
+		firstUserText = helps.FirstClaudeUserText(req.Payload)
+	}
+	discriminator := claudeCodeAccountPoolClientDiscriminator(ctx, opts)
+	return helps.StableUUIDFromSeed(claudeCodeAccountPoolSessionSeed(auth, discriminator, firstUserText))
+}
+
+func claudeCodeAccountPoolExplicitSession(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	if value := metadataValueString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
+		return value
+	}
+	if value := metadataValueString(req.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
+		return value
+	}
+	for _, headers := range []http.Header{opts.Headers, ginRequestHeaders(ctx)} {
+		if headers == nil {
+			continue
+		}
+		for _, key := range []string{"X-Session-ID", "Session-Id", "Session_id", "X-Amp-Thread-Id", "X-Client-Request-Id"} {
+			if value := strings.TrimSpace(headers.Get(key)); value != "" {
+				return value
+			}
+		}
+	}
+	for _, payload := range [][]byte{req.Payload, opts.OriginalRequest} {
+		if len(payload) == 0 {
+			continue
+		}
+		if value := strings.TrimSpace(gjson.GetBytes(payload, "conversation_id").String()); value != "" {
+			return value
+		}
+		if value := strings.TrimSpace(gjson.GetBytes(payload, "session_id").String()); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func claudeCodeAccountPoolClientDiscriminator(ctx context.Context, opts cliproxyexecutor.Options) string {
+	values := make([]string, 0, 4)
+	if headers := ginRequestHeaders(ctx); headers != nil {
+		if ua := strings.TrimSpace(headers.Get("User-Agent")); ua != "" {
+			values = append(values, "ua:"+ua)
+		}
+		if forwarded := strings.TrimSpace(headers.Get("X-Forwarded-For")); forwarded != "" {
+			values = append(values, "xff:"+forwarded)
+		}
+	}
+	if opts.Headers != nil {
+		if ua := strings.TrimSpace(opts.Headers.Get("User-Agent")); ua != "" {
+			values = append(values, "optua:"+ua)
+		}
+	}
+	return strings.Join(values, "|")
+}
+
+func claudeCodeAccountPoolSessionSeed(auth *cliproxyauth.Auth, discriminator string, firstUserText string) string {
+	accountID := ""
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+		if auth.Attributes != nil {
+			accountID = strings.TrimSpace(auth.Attributes[resourcepool.AttrAccountID])
+		}
+	}
+	return strings.Join([]string{accountID, authID, strings.TrimSpace(discriminator), firstUserText}, "::")
+}
+
+func ginRequestHeaders(ctx context.Context) http.Header {
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		return ginCtx.Request.Header
+	}
+	return nil
+}
+
+func metadataValueString(metadata map[string]any, key string) string {
+	if metadata == nil || key == "" {
+		return ""
+	}
+	value, ok := metadata[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case fmt.Stringer:
+		return strings.TrimSpace(typed.String())
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
 }
 
 func isClaudeCodeAccountPoolAuth(auth *cliproxyauth.Auth) bool {
@@ -1564,94 +1695,57 @@ func restoreClaudeOAuthToolNamesFromStreamLine(line []byte, prefix string, prefi
 	return reverseRemapOAuthToolNamesFromStreamLine(line, reverseMap)
 }
 
-// remapOAuthToolNames renames third-party tool names to Claude Code equivalents
-// and removes tools without an official counterpart. This prevents Anthropic from
-// fingerprinting the request as a third-party client via tool naming patterns.
+// remapOAuthToolNames applies generic Claude Code-style tool-name masking while
+// preserving the client-provided schema and semantics. It intentionally does not
+// translate arbitrary custom tools to Claude Code built-in names.
 //
-// It operates on: tools[].name, tool_choice.name, and all tool_use/tool_reference
-// references in messages. Removed tools' corresponding tool_result blocks are preserved
-// (they just become orphaned, which is safe for Claude).
-//
-// The returned map is keyed on the upstream (TitleCase) name and maps to the
-// client-supplied original name. Callers MUST pass this map to the reverse
-// functions so only names the client actually caused us to rewrite are restored
-// on the response. A global reverse map (the previous implementation) incorrectly
-// rewrote names the client originally sent in TitleCase (e.g. Amp CLI's `Bash`)
-// when any OTHER tool in the same request triggered a forward rename (e.g.
-// Amp's `glob`→`Glob`), because the global reverse map contained `Bash`→`bash`
-// regardless of what the client originally sent.
+// It operates on tools[].name, tool_choice.name, and tool_use/tool_reference
+// references in messages. The returned map is keyed on the upstream fake name
+// and maps back to the client-supplied original name.
 func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
-	reverseMap := make(map[string]string, len(oauthToolRenameMap))
+	forwardMap := buildOAuthToolNameForwardMap(body)
+	reverseMap := make(map[string]string, len(forwardMap))
 	recordRename := func(original, renamed string) {
-		// Preserve the first-seen original name if the same upstream name is
-		// produced from multiple call sites; they all map back identically.
+		if original == "" || renamed == "" || original == renamed {
+			return
+		}
 		if _, exists := reverseMap[renamed]; !exists {
 			reverseMap[renamed] = original
 		}
 	}
 
-	// 1. Rewrite tools array in a single pass (if present).
-	// IMPORTANT: do not mutate names first and then rebuild from an older gjson
-	// snapshot. gjson results are snapshots of the original bytes; rebuilding from a
-	// stale snapshot will preserve removals but overwrite renamed names back to their
-	// original lowercase values.
-	tools := gjson.GetBytes(body, "tools")
-	if tools.Exists() && tools.IsArray() {
-
-		var toolsJSON strings.Builder
-		toolsJSON.WriteByte('[')
-		toolCount := 0
-		tools.ForEach(func(_, tool gjson.Result) bool {
-			// Keep Anthropic built-in tools (web_search, code_execution, etc.) unchanged.
-			if tool.Get("type").Exists() && tool.Get("type").String() != "" {
-				if toolCount > 0 {
-					toolsJSON.WriteByte(',')
-				}
-				toolsJSON.WriteString(tool.Raw)
-				toolCount++
-				return true
-			}
-
-			name := tool.Get("name").String()
-			if oauthToolsToRemove[name] {
-				return true
-			}
-
-			toolJSON := tool.Raw
-			if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
-				updatedTool, err := sjson.Set(toolJSON, "name", newName)
-				if err == nil {
-					toolJSON = updatedTool
-					recordRename(name, newName)
-				}
-			}
-
-			if toolCount > 0 {
-				toolsJSON.WriteByte(',')
-			}
-			toolsJSON.WriteString(toolJSON)
-			toolCount++
-			return true
-		})
-		toolsJSON.WriteByte(']')
-		body, _ = sjson.SetRawBytes(body, "tools", []byte(toolsJSON.String()))
+	if len(forwardMap) == 0 {
+		return body, reverseMap
 	}
 
-	// 2. Rename tool_choice if it references a known tool
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && tools.IsArray() {
+		tools.ForEach(func(index, tool gjson.Result) bool {
+			if !shouldOAuthMimicToolName(tool.Get("type").String()) {
+				return true
+			}
+			name := tool.Get("name").String()
+			if name == "" {
+				return true
+			}
+			if newName, ok := forwardMap[name]; ok && newName != name {
+				path := fmt.Sprintf("tools.%d.name", index.Int())
+				body, _ = sjson.SetBytes(body, path, newName)
+				recordRename(name, newName)
+			}
+			return true
+		})
+	}
+
 	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
 	if toolChoiceType == "tool" {
 		tcName := gjson.GetBytes(body, "tool_choice.name").String()
-		if oauthToolsToRemove[tcName] {
-			// The chosen tool was removed from the tools array, so drop tool_choice to
-			// keep the payload internally consistent and fall back to normal auto tool use.
-			body, _ = sjson.DeleteBytes(body, "tool_choice")
-		} else if newName, ok := oauthToolRenameMap[tcName]; ok && newName != tcName {
+		if newName, ok := forwardMap[tcName]; ok && newName != tcName {
 			body, _ = sjson.SetBytes(body, "tool_choice.name", newName)
 			recordRename(tcName, newName)
 		}
 	}
 
-	// 3. Rename tool references in messages
 	messages := gjson.GetBytes(body, "messages")
 	if messages.Exists() && messages.IsArray() {
 		messages.ForEach(func(msgIndex, msg gjson.Result) bool {
@@ -1664,20 +1758,19 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 				switch partType {
 				case "tool_use":
 					name := part.Get("name").String()
-					if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
+					if newName, ok := forwardMap[name]; ok && newName != name {
 						path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
 						body, _ = sjson.SetBytes(body, path, newName)
 						recordRename(name, newName)
 					}
 				case "tool_reference":
 					toolName := part.Get("tool_name").String()
-					if newName, ok := oauthToolRenameMap[toolName]; ok && newName != toolName {
+					if newName, ok := forwardMap[toolName]; ok && newName != toolName {
 						path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
 						body, _ = sjson.SetBytes(body, path, newName)
 						recordRename(toolName, newName)
 					}
 				case "tool_result":
-					// Handle nested tool_reference blocks inside tool_result.content[]
 					toolID := part.Get("tool_use_id").String()
 					_ = toolID // tool_use_id stays as-is
 					nestedContent := part.Get("content")
@@ -1685,7 +1778,7 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
 							if nestedPart.Get("type").String() == "tool_reference" {
 								nestedToolName := nestedPart.Get("tool_name").String()
-								if newName, ok := oauthToolRenameMap[nestedToolName]; ok && newName != nestedToolName {
+								if newName, ok := forwardMap[nestedToolName]; ok && newName != nestedToolName {
 									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
 									body, _ = sjson.SetBytes(body, nestedPath, newName)
 									recordRename(nestedToolName, newName)
@@ -1702,6 +1795,100 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 	}
 
 	return body, reverseMap
+}
+
+func buildOAuthToolNameForwardMap(body []byte) map[string]string {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return nil
+	}
+
+	names := make([]string, 0)
+	seen := make(map[string]bool)
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		if !shouldOAuthMimicToolName(tool.Get("type").String()) {
+			return true
+		}
+		name := tool.Get("name").String()
+		if name == "" || seen[name] {
+			return true
+		}
+		seen[name] = true
+		names = append(names, name)
+		return true
+	})
+	if len(names) == 0 {
+		return nil
+	}
+
+	dynamicMap := buildOAuthDynamicToolMap(names)
+	forwardMap := make(map[string]string, len(names))
+	for _, name := range names {
+		newName := sanitizeOAuthToolName(name, dynamicMap)
+		if newName != "" && newName != name {
+			forwardMap[name] = newName
+		}
+	}
+	if len(forwardMap) == 0 {
+		return nil
+	}
+	return forwardMap
+}
+
+func shouldOAuthMimicToolName(toolType string) bool {
+	return toolType == "" || toolType == "function" || toolType == "custom"
+}
+
+func buildOAuthDynamicToolMap(toolNames []string) map[string]string {
+	if len(toolNames) <= oauthDynamicToolMapThreshold {
+		return nil
+	}
+
+	h := fnv.New64a()
+	for i, name := range toolNames {
+		if i > 0 {
+			_, _ = h.Write([]byte{0})
+		}
+		_, _ = h.Write([]byte(name))
+	}
+
+	available := make([]string, len(oauthFakeToolNamePrefixes))
+	copy(available, oauthFakeToolNamePrefixes)
+	rng := mrand.New(mrand.NewSource(int64(h.Sum64())))
+	rng.Shuffle(len(available), func(i, j int) {
+		available[i], available[j] = available[j], available[i]
+	})
+
+	dynamicMap := make(map[string]string, len(toolNames))
+	used := make(map[string]bool, len(toolNames))
+	for i, name := range toolNames {
+		headLen := 3
+		if len(name) < headLen {
+			headLen = len(name)
+		}
+		base := fmt.Sprintf("%s%s%02d", available[i%len(available)], name[:headLen], i)
+		fake := base
+		for suffix := 1; used[fake] || fake == name; suffix++ {
+			fake = fmt.Sprintf("%s_%d", base, suffix)
+		}
+		used[fake] = true
+		dynamicMap[name] = fake
+	}
+	return dynamicMap
+}
+
+func sanitizeOAuthToolName(name string, dynamicMap map[string]string) string {
+	if dynamicMap != nil {
+		if renamed, ok := dynamicMap[name]; ok {
+			return renamed
+		}
+	}
+	for prefix, replacement := range oauthStaticToolNameRewrites {
+		if strings.HasPrefix(name, prefix) {
+			return replacement + name[len(prefix):]
+		}
+	}
+	return name
 }
 
 // reverseRemapOAuthToolNames reverses the tool name mapping for non-stream responses

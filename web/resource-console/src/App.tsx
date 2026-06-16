@@ -984,7 +984,7 @@ function ClaudeCodeProfilePanel({
       <CardContent className="grid gap-4">
         <div className="grid grid-cols-4 gap-3 max-[1180px]:grid-cols-2 max-[560px]:grid-cols-1">
           <ReadOnlyTile label="Claude Code 版本" value={effective?.version || "2.1.177"} />
-          <ReadOnlyTile label="身份 ID" value="账号级固定" />
+          <ReadOnlyTile label="身份策略" value="账号固定 · 会话生成" />
           <ReadOnlyTile label="Billing/CCH" value={effective?.billing_block_enabled === false ? "关闭" : "内置签名"} />
           <ReadOnlyTile label="Prompt" value="完整静态提示词" />
         </div>
@@ -1860,6 +1860,7 @@ function AccountPoolCard({
 }) {
   const { account, runtime } = row;
   const health = runtimeHealth(account, runtime);
+  const healthTone = requestSuccessTone(health);
   const displayName = account.email || account.auth_id;
   const bound = Boolean(account.proxy_resource_id || account.proxy);
 
@@ -1901,10 +1902,13 @@ function AccountPoolCard({
 
       <div className="grid gap-2 rounded-lg border bg-muted/20 p-3">
         <div className="flex items-center justify-between gap-2 text-xs">
-          <span className="text-muted-foreground">健康度</span>
-          <span className="font-semibold tabular-nums">{health}%</span>
+          <span className="text-muted-foreground">请求成功率</span>
+          <span className={cn("font-semibold tabular-nums", healthTone.textClass)}>{health}%</span>
         </div>
-        <Progress value={health} />
+        <Progress value={health} indicatorClassName={healthTone.barClass} />
+        <div className="flex justify-end">
+          <Badge tone={healthTone.badgeTone}>{healthTone.label}</Badge>
+        </div>
       </div>
 
       <CompactQuotaGrid quota={account.quota} />
@@ -2049,6 +2053,8 @@ function AccountDetailDialog({
   const runtime = row?.runtime;
   const bound = Boolean(account?.proxy_resource_id || account?.proxy);
   const health = account ? runtimeHealth(account, runtime) : 0;
+  const healthTone = requestSuccessTone(health);
+  const identity = parseClaudeCodeIdentity(account?.cloak_user_id);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -2069,7 +2075,9 @@ function AccountDetailDialog({
 
               <div className="grid grid-cols-3 gap-3 max-[900px]:grid-cols-1">
                 <ReadOnlyTile label="Auth ID" value={account.auth_id} />
-                <ReadOnlyTile label="身份 ID" value={account.cloak_user_id || "-"} />
+                <ReadOnlyTile label="Device ID" value={identity.deviceId || "-"} />
+                <ReadOnlyTile label="Account UUID" value={identity.accountUUID || "-"} />
+                <ReadOnlyTile label="Session ID" value="请求时按会话生成" />
                 <ReadOnlyTile label="成功率" value={successRate(runtime)} />
                 <ReadOnlyTile label="连续失败" value={`${account.consecutive_failures || 0}`} />
                 <ReadOnlyTile label="最近测试" value={formatTime(account.last_test_at)} />
@@ -2080,10 +2088,13 @@ function AccountDetailDialog({
                 <div className="grid gap-4">
                   <div className="grid gap-2 rounded-lg border bg-muted/20 p-3">
                     <div className="flex items-center justify-between gap-2 text-sm">
-                      <span className="font-medium">健康度</span>
-                      <span className="tabular-nums text-muted-foreground">{health}%</span>
+                      <span className="font-medium">请求成功率</span>
+                      <div className="flex items-center gap-2">
+                        <Badge tone={healthTone.badgeTone}>{healthTone.label}</Badge>
+                        <span className={cn("tabular-nums", healthTone.textClass)}>{health}%</span>
+                      </div>
                     </div>
-                    <Progress value={health} />
+                    <Progress value={health} indicatorClassName={healthTone.barClass} />
                     <div className="text-xs text-muted-foreground">
                       当前请求 {account.runtime_capacity?.in_flight || 0} · RPM {account.runtime_capacity?.rpm_used || 0}
                     </div>
@@ -3189,7 +3200,11 @@ function AccountTestForm({
         <div className="grid gap-2 rounded-lg border bg-muted/25 p-3 text-sm">
           <div className="break-words font-medium">{account.email || account.auth_id}</div>
           <div className="break-all text-xs text-muted-foreground">{account.auth_id}</div>
-          {account.cloak_user_id ? <div className="break-all text-xs text-muted-foreground">身份 ID：{account.cloak_user_id}</div> : null}
+          {account.cloak_user_id ? (
+            <div className="break-all text-xs text-muted-foreground">
+              Device ID：{parseClaudeCodeIdentity(account.cloak_user_id).deviceId || account.cloak_user_id}
+            </div>
+          ) : null}
           <div className="text-xs text-muted-foreground">代理：{account.proxy ? `${account.proxy.name} · ${proxyDisplay(account.proxy)}` : "未绑定"}</div>
         </div>
         <Field label="测试模型">
@@ -4018,6 +4033,51 @@ function formatNumber(value?: number) {
     return "-";
   }
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
+}
+
+function requestSuccessTone(value: number): {
+  label: string;
+  badgeTone: "success" | "warning" | "danger";
+  barClass: string;
+  textClass: string;
+} {
+  if (value >= 80) {
+    return {
+      label: "良好",
+      badgeTone: "success",
+      barClass: "bg-emerald-600",
+      textClass: "text-emerald-700"
+    };
+  }
+  if (value >= 50) {
+    return {
+      label: "一般",
+      badgeTone: "warning",
+      barClass: "bg-amber-500",
+      textClass: "text-amber-700"
+    };
+  }
+  return {
+    label: "较低",
+    badgeTone: "danger",
+    barClass: "bg-red-600",
+    textClass: "text-red-700"
+  };
+}
+
+function parseClaudeCodeIdentity(raw?: string) {
+  const value = (raw || "").trim();
+  if (!value) {
+    return { deviceId: "", accountUUID: "" };
+  }
+  const match = value.match(/^user_([a-fA-F0-9]{64})_account_([0-9a-fA-F-]*)_session_([0-9a-fA-F-]+)$/);
+  if (!match) {
+    return { deviceId: value, accountUUID: "" };
+  }
+  return {
+    deviceId: match[1],
+    accountUUID: match[2] || ""
+  };
 }
 
 export default App;
