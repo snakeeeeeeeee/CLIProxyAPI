@@ -22,6 +22,9 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - Auth material defaults under `auths/`
 - Storage backends: file-based default; optional Postgres/git/object store (`PGSTORE_*`, `GITSTORE_*`, `OBJECTSTORE_*`)
 
+## Secondary Development Notes
+- Before working on this repository's secondary-development features, account pool, proxy pool, build/deploy flow, or troubleshooting, read `2dev/迭代开发日志.md` and `2dev/2dev.md` first.
+
 ## Architecture
 - `cmd/server/` — Server entrypoint
 - `internal/api/` — Gin HTTP API (routes, middleware, modules)
