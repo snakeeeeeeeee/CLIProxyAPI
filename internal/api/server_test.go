@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/tidwall/gjson"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -90,6 +92,42 @@ func TestHealthz(t *testing.T) {
 			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
 		}
 	})
+}
+
+func TestAuthMiddlewareClaudeRoutesUseAnthropicErrorEnvelope(t *testing.T) {
+	server := newTestServer(t)
+	tests := []string{
+		"/v1/messages",
+		"/v1/messages/count_tokens",
+		"/claude-acc-pool/v1/messages",
+		"/claude-acc-pool/v1/messages/count_tokens",
+	}
+	for _, path := range tests {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}`))
+			req.Header.Set("Authorization", "Bearer bad-key")
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+
+			server.engine.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusUnauthorized, rr.Body.String())
+			}
+			if got := gjson.GetBytes(rr.Body.Bytes(), "type").String(); got != "error" {
+				t.Fatalf("type = %q, want error; body=%s", got, rr.Body.String())
+			}
+			if got := gjson.GetBytes(rr.Body.Bytes(), "error.type").String(); got != "authentication_error" {
+				t.Fatalf("error.type = %q, want authentication_error; body=%s", got, rr.Body.String())
+			}
+			if got := gjson.GetBytes(rr.Body.Bytes(), "error.message").String(); got != "Invalid API key" {
+				t.Fatalf("error.message = %q, want Invalid API key; body=%s", got, rr.Body.String())
+			}
+			if got := rr.Header().Get("request-id"); got == "" {
+				t.Fatalf("request-id header is empty; headers=%v body=%s", rr.Header(), rr.Body.String())
+			}
+		})
+	}
 }
 
 func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {

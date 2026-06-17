@@ -1941,8 +1941,71 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 		if statusCode >= http.StatusInternalServerError {
 			log.Errorf("authentication middleware error: %v", err)
 		}
+		if wantsClaudeErrorEnvelope(c.Request) {
+			writeClaudeAuthError(c, statusCode, err.Message)
+			return
+		}
 		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
 	}
+}
+
+func wantsClaudeErrorEnvelope(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	path := strings.TrimSpace(req.URL.Path)
+	switch path {
+	case "/v1/messages", "/v1/messages/count_tokens", "/claude-acc-pool/v1/messages", "/claude-acc-pool/v1/messages/count_tokens":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeClaudeAuthError(c *gin.Context, statusCode int, message string) {
+	if statusCode <= 0 {
+		statusCode = http.StatusUnauthorized
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = http.StatusText(statusCode)
+	}
+	errType := "authentication_error"
+	switch statusCode {
+	case http.StatusForbidden:
+		errType = "permission_error"
+	case http.StatusTooManyRequests:
+		errType = "rate_limit_error"
+	default:
+		if statusCode >= http.StatusInternalServerError {
+			errType = "api_error"
+		}
+	}
+	ensureClaudeErrorRequestIDHeader(c)
+	c.AbortWithStatusJSON(statusCode, gin.H{
+		"type": "error",
+		"error": gin.H{
+			"type":    errType,
+			"message": message,
+		},
+	})
+}
+
+func ensureClaudeErrorRequestIDHeader(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	if c.Writer.Header().Get("request-id") != "" || c.Writer.Header().Get("x-request-id") != "" {
+		return
+	}
+	requestID := logging.GetGinRequestID(c)
+	if requestID == "" && c.Request != nil {
+		requestID = logging.GetRequestID(c.Request.Context())
+	}
+	if requestID == "" {
+		requestID = logging.GenerateRequestID()
+	}
+	c.Writer.Header().Set("request-id", requestID)
 }
 
 func configuredSignatureCacheEnabled(cfg *config.Config) bool {

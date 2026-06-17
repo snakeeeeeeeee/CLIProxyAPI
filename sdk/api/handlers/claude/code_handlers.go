@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
@@ -387,6 +388,7 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	if err != nil {
 		body = []byte(`{"type":"error","error":{"type":"api_error","message":"Internal Server Error"}}`)
 	}
+	ensureClaudeRequestIDHeader(c)
 	appendClaudeAPIResponse(c, body)
 	if !c.Writer.Written() {
 		c.Writer.Header().Set("Content-Type", "application/json")
@@ -424,8 +426,46 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 			}
 		}
 	}
+	errType = normalizeClaudeErrorType(status, errType, message)
 
 	return errType, message
+}
+
+func normalizeClaudeErrorType(status int, errType string, message string) string {
+	errType = strings.TrimSpace(errType)
+	if status == http.StatusBadRequest && (errType == "" || errType == "upstream_error") {
+		return "invalid_request_error"
+	}
+	if status == http.StatusUnauthorized && (errType == "" || errType == "upstream_error") {
+		return "authentication_error"
+	}
+	if status == http.StatusForbidden && (errType == "" || errType == "upstream_error") {
+		return "permission_error"
+	}
+	if status == http.StatusTooManyRequests && (errType == "" || errType == "upstream_error") {
+		return "rate_limit_error"
+	}
+	if strings.TrimSpace(message) == "" && errType == "" {
+		return claudeErrorTypeFromStatus(status)
+	}
+	return errType
+}
+
+func ensureClaudeRequestIDHeader(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	if c.Writer.Header().Get("request-id") != "" || c.Writer.Header().Get("x-request-id") != "" {
+		return
+	}
+	requestID := logging.GetGinRequestID(c)
+	if requestID == "" && c.Request != nil {
+		requestID = logging.GetRequestID(c.Request.Context())
+	}
+	if requestID == "" {
+		requestID = logging.GenerateRequestID()
+	}
+	c.Writer.Header().Set("request-id", requestID)
 }
 
 func claudeErrorTypeFromStatus(status int) string {

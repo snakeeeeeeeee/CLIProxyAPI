@@ -732,6 +732,31 @@ func rewriteClaudeCleanInputUsageObjects(auth *cliproxyauth.Auth, model string, 
 	return out
 }
 
+func rewriteClaudeCleanInputTokenCount(auth *cliproxyauth.Auth, model string, payload []byte, visibleInputFloor int64) []byte {
+	if !cleanInputUsageEnabled(auth) || len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	root := gjson.ParseBytes(payload)
+	if !root.IsObject() {
+		return payload
+	}
+	inputNode := root.Get("input_tokens")
+	if !inputNode.Exists() {
+		return payload
+	}
+	inputTokens := inputNode.Int()
+	cleaned := resourcepool.CleanInputTokens(inputTokens, cleanInputUsageOverhead(auth, model))
+	cleaned = clampClaudeCleanInputTokens(inputTokens, cleaned, visibleInputFloor)
+	if cleaned == inputTokens {
+		return payload
+	}
+	out, err := sjson.SetBytes(payload, "input_tokens", cleaned)
+	if err != nil {
+		return payload
+	}
+	return out
+}
+
 func claudeCleanInputUsagePaths(payload []byte) []string {
 	root := gjson.ParseBytes(payload)
 	var paths []string
@@ -1156,6 +1181,11 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		return cliproxyexecutor.Response{}, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	cleanInputFloor := estimateClaudeVisibleInputTokens(req.Payload)
+	if cleanInputFloor == 0 {
+		cleanInputFloor = estimateClaudeVisibleInputTokens(body)
+	}
+	data = rewriteClaudeCleanInputTokenCount(auth, baseModel, data, cleanInputFloor)
 	count := gjson.GetBytes(data, "input_tokens").Int()
 	out := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, data)
 	return cliproxyexecutor.Response{Payload: out, Headers: resp.Header.Clone()}, nil
@@ -2582,26 +2612,13 @@ func checkSystemInstructionsWithPrompt(payload []byte, strictMode bool, experime
 	}
 	staticBlock := buildTextBlock(staticPrompt, nil)
 
-	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"
+	systemBlocks := []string{billingBlock, agentBlock, staticBlock}
+	preservedCachedSystemBlocks, userSystemParts := splitSystemInstructionsForForwarding(system)
+	systemBlocks = append(systemBlocks, preservedCachedSystemBlocks...)
+	systemResult := "[" + strings.Join(systemBlocks, ",") + "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
 
-	// Collect user system instructions and prepend to first user message
 	if !strictMode {
-		var userSystemParts []string
-		if system.IsArray() {
-			system.ForEach(func(_, part gjson.Result) bool {
-				if part.Get("type").String() == "text" {
-					txt := strings.TrimSpace(part.Get("text").String())
-					if txt != "" {
-						userSystemParts = append(userSystemParts, txt)
-					}
-				}
-				return true
-			})
-		} else if system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
-			userSystemParts = append(userSystemParts, strings.TrimSpace(system.String()))
-		}
-
 		if len(userSystemParts) > 0 {
 			combined := strings.Join(userSystemParts, "\n\n")
 			if oauthMode {
@@ -2614,6 +2631,33 @@ func checkSystemInstructionsWithPrompt(payload []byte, strictMode bool, experime
 	}
 
 	return payload
+}
+
+func splitSystemInstructionsForForwarding(system gjson.Result) (preservedCachedBlocks []string, userSystemParts []string) {
+	if system.IsArray() {
+		system.ForEach(func(_, part gjson.Result) bool {
+			if part.Get("cache_control").Exists() {
+				if raw := strings.TrimSpace(part.Raw); raw != "" {
+					preservedCachedBlocks = append(preservedCachedBlocks, raw)
+				}
+				return true
+			}
+			if part.Get("type").String() == "text" {
+				txt := strings.TrimSpace(part.Get("text").String())
+				if txt != "" {
+					userSystemParts = append(userSystemParts, txt)
+				}
+			}
+			return true
+		})
+		return preservedCachedBlocks, userSystemParts
+	}
+	if system.Type == gjson.String {
+		if txt := strings.TrimSpace(system.String()); txt != "" {
+			userSystemParts = append(userSystemParts, txt)
+		}
+	}
+	return preservedCachedBlocks, userSystemParts
 }
 
 // sanitizeForwardedSystemPrompt reduces forwarded third-party system context to a

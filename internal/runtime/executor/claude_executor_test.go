@@ -1123,6 +1123,62 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolRequestShape(t *testing.T) {
 	}
 }
 
+func TestClaudeExecutor_ClaudeCodeAccountPoolPreservesCachedSystemBlocks(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":           "sk-ant-oat-test",
+		"base_url":          server.URL,
+		"claude_oauth_pool": "true",
+		"cloak_user_id":     "user_be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714_account_11111111-2222-4333-8444-555555555555_session_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+	}, Metadata: map[string]any{"account_uuid": "11111111-2222-4333-8444-555555555555"}}
+	payload := []byte(`{
+		"model":"claude-sonnet-4-6",
+		"max_tokens":16,
+		"system":[
+			{"type":"text","text":"CACHE_ME","cache_control":{"type":"ephemeral"}},
+			{"type":"text","text":"Do not cache this plain instruction."}
+		],
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+
+	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if len(seenBody) == 0 {
+		t.Fatal("expected upstream body to be captured")
+	}
+	blocks := gjson.GetBytes(seenBody, "system").Array()
+	if len(blocks) != 4 {
+		t.Fatalf("expected 3 injected blocks plus 1 cached block, got %d: %s", len(blocks), seenBody)
+	}
+	if got := blocks[3].Get("text").String(); got != "CACHE_ME" {
+		t.Fatalf("cached system block text = %q, want CACHE_ME; body=%s", got, seenBody)
+	}
+	if got := blocks[3].Get("cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("cached system block cache_control.type = %q, want ephemeral; body=%s", got, seenBody)
+	}
+	userContent := gjson.GetBytes(seenBody, "messages.0.content").String()
+	if strings.Contains(userContent, "CACHE_ME") {
+		t.Fatalf("cached system block should not be moved into user content: %q", userContent)
+	}
+	if !strings.Contains(userContent, "Use the available tools when needed") || strings.Contains(userContent, "Do not cache this plain instruction.") {
+		t.Fatalf("plain system reminder was not sanitized for OAuth account pool: %q", userContent)
+	}
+}
+
 func TestClaudeExecutor_ClaudeCodeAccountPoolPreservesExplicitLongContextBeta(t *testing.T) {
 	var seenBeta string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1360,6 +1416,36 @@ func TestClaudeExecutor_ExecuteCleanInputTokensUsesVisibleInputFloor(t *testing.
 	}
 	if got := gjson.GetBytes(resp.Payload, "usage.input_tokens").Int(); got != floor {
 		t.Fatalf("response usage.input_tokens = %d, want estimated floor %d; payload=%s", got, floor, resp.Payload)
+	}
+}
+
+func TestClaudeExecutor_CountTokensRewritesCleanInputTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"input_tokens":112}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":                        "sk-ant-oat-test",
+		"base_url":                       server.URL,
+		"claude_oauth_pool":              "true",
+		"claude_code_clean_input_tokens": "true",
+		"claude_code_clean_input_default_overhead_tokens": "105",
+		"claude_code_usage_overheads_json":                `{"claude-opus-4-8":105}`,
+	}}
+	payload := []byte(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":"Deterministic token accounting verification text."}]}`)
+
+	resp, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("CountTokens error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "input_tokens").Int(); got != 7 {
+		t.Fatalf("count_tokens input_tokens = %d, want clean 7; payload=%s", got, resp.Payload)
 	}
 }
 
