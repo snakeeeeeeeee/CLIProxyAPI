@@ -1101,7 +1101,6 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolRequestShape(t *testing.T) {
 	beta := seenHeaders.Get("Anthropic-Beta")
 	for _, want := range []string{
 		"claude-code-20250219",
-		"context-1m-2025-08-07",
 		"mid-conversation-system-2026-04-07",
 		"advisor-tool-2026-03-01",
 		"effort-2025-11-24",
@@ -1113,11 +1112,43 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolRequestShape(t *testing.T) {
 	if strings.Contains(beta, "oauth-2025-04-20") {
 		t.Fatalf("Anthropic-Beta = %q, should not force oauth beta", beta)
 	}
+	if strings.Contains(beta, "context-1m-2025-08-07") {
+		t.Fatalf("Anthropic-Beta = %q, should not add long-context beta by default", beta)
+	}
 	if gjson.GetBytes(seenBody, "tools").Exists() {
 		t.Fatalf("ordinary account-pool mimic request should not inject tools: %s", seenBody)
 	}
 	if gjson.GetBytes(seenBody, "thinking").Exists() {
 		t.Fatalf("ordinary account-pool mimic request should not inject thinking: %s", seenBody)
+	}
+}
+
+func TestClaudeExecutor_ClaudeCodeAccountPoolPreservesExplicitLongContextBeta(t *testing.T) {
+	var seenBeta string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBeta = r.Header.Get("Anthropic-Beta")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":           "sk-ant-oat-test",
+		"base_url":          server.URL,
+		"claude_oauth_pool": "true",
+	}}
+	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":16,"betas":["context-1m-2025-08-07"],"messages":[{"role":"user","content":"hi"}]}`)
+
+	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if !strings.Contains(seenBeta, "context-1m-2025-08-07") {
+		t.Fatalf("Anthropic-Beta = %q, want explicit long-context beta preserved", seenBeta)
 	}
 }
 
@@ -1134,12 +1165,13 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolModelSpecificBetas(t *testing.T) {
 		},
 		{
 			model:   "claude-sonnet-4-6",
-			want:    []string{"claude-code-20250219", "context-1m-2025-08-07", "interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "advisor-tool-2026-03-01", "effort-2025-11-24"},
-			notWant: []string{"mid-conversation-system-2026-04-07"},
+			want:    []string{"claude-code-20250219", "interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "advisor-tool-2026-03-01", "effort-2025-11-24"},
+			notWant: []string{"context-1m-2025-08-07", "mid-conversation-system-2026-04-07"},
 		},
 		{
-			model: "claude-opus-4-8",
-			want:  []string{"claude-code-20250219", "context-1m-2025-08-07", "interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "mid-conversation-system-2026-04-07", "advisor-tool-2026-03-01", "effort-2025-11-24"},
+			model:   "claude-opus-4-8",
+			want:    []string{"claude-code-20250219", "interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "mid-conversation-system-2026-04-07", "advisor-tool-2026-03-01", "effort-2025-11-24"},
+			notWant: []string{"context-1m-2025-08-07"},
 		},
 	}
 	for _, tt := range tests {

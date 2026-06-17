@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -85,5 +86,16 @@ func TestBuildClaudeCodeUsageCalibrationBodyStripsCountTokensUnsupportedFields(t
 	}
 	if _, ok := calibrationPayload["system"]; !ok {
 		t.Fatal("calibration payload missing system prompt")
+	}
+}
+
+func TestClaudeCodeManagementBetasDoNotForceLongContext(t *testing.T) {
+	for _, model := range []string{"claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001"} {
+		t.Run(model, func(t *testing.T) {
+			betas := strings.Join(claudeCodeManagementBetasForModel(model), ",")
+			if strings.Contains(betas, "context-1m-2025-08-07") {
+				t.Fatalf("management beta %q should not include long-context beta by default", betas)
+			}
+		})
 	}
 }

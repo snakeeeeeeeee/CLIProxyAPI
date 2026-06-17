@@ -200,7 +200,6 @@ func defaultClaudeCodeProfile() ClaudeCodeProfile {
 		},
 		Betas: []string{
 			"claude-code-20250219",
-			"context-1m-2025-08-07",
 			"interleaved-thinking-2025-05-14",
 			"thinking-token-count-2026-05-13",
 			"context-management-2025-06-27",
