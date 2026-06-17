@@ -35,9 +35,12 @@ const (
 )
 
 var (
-	claudeRefreshGroup singleflight.Group
-	claudeRefreshMu    sync.Mutex
-	claudeRefreshBlock = make(map[string]time.Time)
+	claudeRefreshGroup         singleflight.Group
+	claudeCodeRefreshGroup     singleflight.Group
+	claudeRefreshMu            sync.Mutex
+	claudeCodeAccountRefreshMu sync.Mutex
+	claudeRefreshBlock         = make(map[string]time.Time)
+	claudeCodeRefreshBlock     = make(map[string]time.Time)
 )
 
 type refreshHTTPError struct {
@@ -58,7 +61,9 @@ func resetClaudeRefreshState() {
 	claudeRefreshMu.Lock()
 	defer claudeRefreshMu.Unlock()
 	claudeRefreshBlock = make(map[string]time.Time)
+	claudeCodeRefreshBlock = make(map[string]time.Time)
 	claudeRefreshGroup = singleflight.Group{}
+	claudeCodeRefreshGroup = singleflight.Group{}
 }
 
 func claudeRefreshBlockedUntil(refreshToken string) time.Time {
@@ -77,6 +82,24 @@ func clearClaudeRefreshBlockedUntil(refreshToken string) {
 	claudeRefreshMu.Lock()
 	defer claudeRefreshMu.Unlock()
 	delete(claudeRefreshBlock, refreshToken)
+}
+
+func claudeCodeRefreshBlockedUntil(refreshToken string) time.Time {
+	claudeRefreshMu.Lock()
+	defer claudeRefreshMu.Unlock()
+	return claudeCodeRefreshBlock[refreshToken]
+}
+
+func setClaudeCodeRefreshBlockedUntil(refreshToken string, until time.Time) {
+	claudeRefreshMu.Lock()
+	defer claudeRefreshMu.Unlock()
+	claudeCodeRefreshBlock[refreshToken] = until
+}
+
+func clearClaudeCodeRefreshBlockedUntil(refreshToken string) {
+	claudeRefreshMu.Lock()
+	defer claudeRefreshMu.Unlock()
+	delete(claudeCodeRefreshBlock, refreshToken)
 }
 
 func clampClaudeRefreshBackoff(d time.Duration) time.Duration {
@@ -469,10 +492,49 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
 }
 
 func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken string) (*ClaudeTokenData, error) {
-	if blockedUntil := claudeRefreshBlockedUntil(refreshToken); blockedUntil.After(time.Now()) {
+	return o.refreshTokensSingleFlightWithEndpoint(ctx, refreshToken, TokenURL, claudeRefreshBlockedUntil, setClaudeRefreshBlockedUntil, clearClaudeRefreshBlockedUntil)
+}
+
+// RefreshClaudeCodeTokens refreshes a Claude Code OAuth token through the
+// platform endpoint. Calls are serialized process-wide to avoid concurrent
+// account-pool refreshes.
+func (o *ClaudeAuth) RefreshClaudeCodeTokens(ctx context.Context, refreshToken string) (*ClaudeTokenData, error) {
+	if refreshToken == "" {
+		return nil, fmt.Errorf("refresh token is required")
+	}
+
+	if blockedUntil := claudeCodeRefreshBlockedUntil(refreshToken); blockedUntil.After(time.Now()) {
 		return nil, &refreshHTTPError{
 			status:    http.StatusTooManyRequests,
 			message:   fmt.Sprintf("refresh temporarily blocked until %s", blockedUntil.Format(time.RFC3339)),
+			retryable: false,
+		}
+	}
+
+	result, err, _ := claudeCodeRefreshGroup.Do(refreshToken, func() (interface{}, error) {
+		claudeCodeAccountRefreshMu.Lock()
+		defer claudeCodeAccountRefreshMu.Unlock()
+		return o.refreshClaudeCodeTokensSingleFlight(context.WithoutCancel(ctx), refreshToken)
+	})
+	if err != nil {
+		return nil, err
+	}
+	tokenData, ok := result.(*ClaudeTokenData)
+	if !ok || tokenData == nil {
+		return nil, fmt.Errorf("token refresh failed: invalid single-flight result")
+	}
+	return tokenData, nil
+}
+
+func (o *ClaudeAuth) refreshClaudeCodeTokensSingleFlight(ctx context.Context, refreshToken string) (*ClaudeTokenData, error) {
+	return o.refreshTokensSingleFlightWithEndpoint(ctx, refreshToken, ClaudeCodeTokenURL, claudeCodeRefreshBlockedUntil, setClaudeCodeRefreshBlockedUntil, clearClaudeCodeRefreshBlockedUntil)
+}
+
+func (o *ClaudeAuth) refreshTokensSingleFlightWithEndpoint(ctx context.Context, refreshToken, tokenURL string, blockedUntil func(string) time.Time, setBlockedUntil func(string, time.Time), clearBlockedUntil func(string)) (*ClaudeTokenData, error) {
+	if blockedUntilAt := blockedUntil(refreshToken); blockedUntilAt.After(time.Now()) {
+		return nil, &refreshHTTPError{
+			status:    http.StatusTooManyRequests,
+			message:   fmt.Sprintf("refresh temporarily blocked until %s", blockedUntilAt.Format(time.RFC3339)),
 			retryable: false,
 		}
 	}
@@ -488,7 +550,7 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 		return nil, fmt.Errorf("failed to marshal request body: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(string(jsonBody)))
+	req, err := http.NewRequestWithContext(ctx, "POST", tokenURL, strings.NewReader(string(jsonBody)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create refresh request: %w", err)
 	}
@@ -513,7 +575,7 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 		message := string(body)
 		if resp.StatusCode == http.StatusTooManyRequests {
 			retryAfter := parseClaudeRetryAfter(resp)
-			setClaudeRefreshBlockedUntil(refreshToken, time.Now().Add(retryAfter))
+			setBlockedUntil(refreshToken, time.Now().Add(retryAfter))
 			return nil, &refreshHTTPError{status: resp.StatusCode, message: message, retryable: false}
 		}
 		return nil, &refreshHTTPError{
@@ -531,7 +593,7 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 	}
 
 	// Create token data
-	clearClaudeRefreshBlockedUntil(refreshToken)
+	clearBlockedUntil(refreshToken)
 
 	return &ClaudeTokenData{
 		AccessToken:      tokenResp.AccessToken,
@@ -604,6 +666,35 @@ func (o *ClaudeAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken st
 	}
 
 	return nil, fmt.Errorf("token refresh failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+// RefreshClaudeCodeTokensWithRetry refreshes Claude Code OAuth tokens through
+// the platform endpoint with retry behavior matching RefreshTokensWithRetry.
+func (o *ClaudeAuth) RefreshClaudeCodeTokensWithRetry(ctx context.Context, refreshToken string, maxRetries int) (*ClaudeTokenData, error) {
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+
+		tokenData, err := o.RefreshClaudeCodeTokens(ctx, refreshToken)
+		if err == nil {
+			return tokenData, nil
+		}
+
+		lastErr = err
+		log.Warnf("Claude Code token refresh attempt %d failed: %v", attempt+1, err)
+		if !isClaudeRefreshRetryable(err) {
+			break
+		}
+	}
+
+	return nil, fmt.Errorf("claude code token refresh failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 // UpdateTokenStorage updates an existing token storage with new token data.

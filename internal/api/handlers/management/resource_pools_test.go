@@ -65,6 +65,9 @@ func TestBuildClaudeCodeUsageCalibrationBodyStripsCountTokensUnsupportedFields(t
 	if _, ok := testPayload["metadata"]; !ok {
 		t.Fatal("test body metadata missing, want normal account test requests to keep metadata")
 	}
+	if got, ok := testPayload["max_tokens"].(float64); !ok || int(got) != claudeCodeAccountTestMaxTokens {
+		t.Fatalf("test body max_tokens = %#v, want %d", testPayload["max_tokens"], claudeCodeAccountTestMaxTokens)
+	}
 
 	calibrationBody, err := buildClaudeCodeUsageCalibrationBody("claude-opus-4-8", "user_device_account_account_session_session")
 	if err != nil {

@@ -257,6 +257,60 @@ func TestStoreEmptyListsReturnNonNilSlices(t *testing.T) {
 	}
 }
 
+func TestAccountAvailabilityAggregatesTwoHourMinuteBuckets(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, err := store.RegisterClaudeCodeAccount(ctx, "claude-availability.json", "availability@example.com", "")
+	if err != nil {
+		t.Fatalf("RegisterClaudeCodeAccount() error = %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Minute)
+	entries := []UsageLedgerEntry{
+		{AccountID: account.ID, Success: true, CreatedAt: now.Add(-2 * time.Minute)},
+		{AccountID: account.ID, Success: true, CreatedAt: now.Add(-2 * time.Minute).Add(5 * time.Second)},
+		{AccountID: account.ID, Success: true, CreatedAt: now.Add(-1 * time.Minute)},
+		{AccountID: account.ID, Success: false, CreatedAt: now.Add(-1 * time.Minute).Add(10 * time.Second)},
+		{AccountID: account.ID, Success: false, CreatedAt: now},
+	}
+	for _, entry := range entries {
+		if err := store.RecordUsageLedger(ctx, entry); err != nil {
+			t.Fatalf("RecordUsageLedger() error = %v", err)
+		}
+	}
+	availability, err := store.AccountAvailability(ctx, account.ID, 2*time.Hour)
+	if err != nil {
+		t.Fatalf("AccountAvailability() error = %v", err)
+	}
+	if availability.WindowMinutes != 120 || len(availability.Buckets) != 120 {
+		t.Fatalf("bucket count = window %d len %d, want 120", availability.WindowMinutes, len(availability.Buckets))
+	}
+	if availability.RequestCount != 5 || availability.SuccessCount != 3 || availability.FailureCount != 2 {
+		t.Fatalf("availability totals = %+v, want requests=5 success=3 failures=2", availability)
+	}
+	if availability.Status != "degraded" {
+		t.Fatalf("availability status = %q, want degraded", availability.Status)
+	}
+	byMinute := map[string]AccountAvailabilityBucket{}
+	for _, bucket := range availability.Buckets {
+		byMinute[bucket.StartedAt.Format(time.RFC3339)] = bucket
+	}
+	healthy := byMinute[now.Add(-2*time.Minute).Format(time.RFC3339)]
+	if healthy.Status != "healthy" || healthy.RequestCount != 2 || healthy.SuccessCount != 2 {
+		t.Fatalf("healthy bucket = %+v, want 2/2 healthy", healthy)
+	}
+	degraded := byMinute[now.Add(-1*time.Minute).Format(time.RFC3339)]
+	if degraded.Status != "degraded" || degraded.RequestCount != 2 || degraded.SuccessCount != 1 {
+		t.Fatalf("degraded bucket = %+v, want 1/2 degraded", degraded)
+	}
+	unhealthy := byMinute[now.Format(time.RFC3339)]
+	if unhealthy.Status != "unhealthy" || unhealthy.RequestCount != 1 || unhealthy.SuccessCount != 0 {
+		t.Fatalf("unhealthy bucket = %+v, want 0/1 unhealthy", unhealthy)
+	}
+	if availability.Buckets[0].Status != "none" || availability.Buckets[0].RequestCount != 0 {
+		t.Fatalf("empty bucket = %+v, want none", availability.Buckets[0])
+	}
+}
+
 func TestStorePersistsClaudeCodeAuthJSONAndSynthesizesAuth(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -312,6 +366,7 @@ func TestStorePersistsClaudeCodeAuthJSONAndSynthesizesAuth(t *testing.T) {
 func TestStoreSaveClaudeCodeAccountAuthUpdatesJSON(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
+	expireAt := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	auth := &coreauth.Auth{
 		ID:       "claude-user@example.com.json",
 		Provider: "claude",
@@ -327,6 +382,7 @@ func TestStoreSaveClaudeCodeAccountAuthUpdatesJSON(t *testing.T) {
 	}
 	auth.Metadata["access_token"] = "new-access"
 	auth.Metadata["refresh_token"] = "new-refresh"
+	auth.Metadata["expired"] = expireAt.Format(time.RFC3339)
 	if err := store.SaveClaudeCodeAccountAuth(ctx, auth); err != nil {
 		t.Fatalf("SaveClaudeCodeAccountAuth() error = %v", err)
 	}
@@ -339,6 +395,13 @@ func TestStoreSaveClaudeCodeAccountAuthUpdatesJSON(t *testing.T) {
 	}
 	if got := auths[0].Metadata["refresh_token"]; got != "new-refresh" {
 		t.Fatalf("refresh_token = %q, want new-refresh", got)
+	}
+	account, err := store.GetAccountByAuthID(ctx, auth.ID)
+	if err != nil {
+		t.Fatalf("GetAccountByAuthID() error = %v", err)
+	}
+	if account.TokenExpiresAt == nil || !account.TokenExpiresAt.Equal(expireAt) {
+		t.Fatalf("TokenExpiresAt = %v, want %v", account.TokenExpiresAt, expireAt)
 	}
 }
 

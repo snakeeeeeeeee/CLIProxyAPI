@@ -15,6 +15,7 @@ import (
 )
 
 const defaultUsageWindow = time.Hour
+const defaultAvailabilityWindow = 2 * time.Hour
 
 // SaveClaudeCodeProfile persists the Claude Code request-shape profile.
 func (s *Store) SaveClaudeCodeProfile(ctx context.Context, profile ClaudeCodeProfile) (*ConfigFile, error) {
@@ -550,9 +551,9 @@ INSERT INTO claude_code_usage_ledger(request_id, api_key_preview, account_id, au
 	status_code, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, raw_input_tokens, raw_total_tokens, estimated_cost, success, created_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, strings.TrimSpace(entry.RequestID), strings.TrimSpace(entry.APIKeyPreview), strings.TrimSpace(entry.AccountID), strings.TrimSpace(entry.AuthID),
-	strings.TrimSpace(entry.Model), strings.TrimSpace(entry.RequestedModel), entry.StatusCode, nonNegativeInt64(entry.InputTokens),
-	nonNegativeInt64(entry.OutputTokens), nonNegativeInt64(entry.CacheReadTokens), nonNegativeInt64(entry.CacheCreationTokens),
-	nonNegativeInt64(entry.RawInputTokens), nonNegativeInt64(entry.RawTotalTokens), entry.EstimatedCost, boolInt(entry.Success), dbTime(entry.CreatedAt))
+		strings.TrimSpace(entry.Model), strings.TrimSpace(entry.RequestedModel), entry.StatusCode, nonNegativeInt64(entry.InputTokens),
+		nonNegativeInt64(entry.OutputTokens), nonNegativeInt64(entry.CacheReadTokens), nonNegativeInt64(entry.CacheCreationTokens),
+		nonNegativeInt64(entry.RawInputTokens), nonNegativeInt64(entry.RawTotalTokens), entry.EstimatedCost, boolInt(entry.Success), dbTime(entry.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("record claude code usage ledger: %w", err)
 	}
@@ -600,6 +601,88 @@ WHERE created_at >= ?
 	if err != nil {
 		return summary, err
 	}
+	return summary, nil
+}
+
+// AccountAvailability summarizes the latest per-minute success history for one account.
+func (s *Store) AccountAvailability(ctx context.Context, accountID string, window time.Duration) (*AccountAvailabilitySummary, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, fmt.Errorf("account id is required")
+	}
+	if window <= 0 {
+		window = defaultAvailabilityWindow
+	}
+	minutes := int(window / time.Minute)
+	if minutes <= 0 {
+		minutes = int(defaultAvailabilityWindow / time.Minute)
+	}
+	if minutes > 24*60 {
+		minutes = 24 * 60
+	}
+	end := time.Now().UTC().Truncate(time.Minute)
+	start := end.Add(-time.Duration(minutes-1) * time.Minute)
+	summary := &AccountAvailabilitySummary{
+		WindowMinutes: minutes,
+		Status:        "none",
+		Buckets:       make([]AccountAvailabilityBucket, minutes),
+	}
+	bucketByMinute := make(map[string]*AccountAvailabilityBucket, minutes)
+	for i := 0; i < minutes; i++ {
+		startedAt := start.Add(time.Duration(i) * time.Minute)
+		summary.Buckets[i] = AccountAvailabilityBucket{
+			StartedAt: startedAt,
+			Status:    "none",
+		}
+		bucketByMinute[startedAt.Format(time.RFC3339)] = &summary.Buckets[i]
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT created_at, success
+FROM claude_code_usage_ledger
+WHERE account_id = ? AND created_at >= ?
+ORDER BY created_at ASC
+`, accountID, dbTime(start))
+	if err != nil {
+		return nil, fmt.Errorf("list account availability ledger: %w", err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	for rows.Next() {
+		var createdRaw string
+		var success int
+		if err := rows.Scan(&createdRaw, &success); err != nil {
+			return nil, fmt.Errorf("scan account availability ledger: %w", err)
+		}
+		createdAt := parseDBTime(createdRaw).UTC().Truncate(time.Minute)
+		if createdAt.Before(start) || createdAt.After(end) {
+			continue
+		}
+		bucket := bucketByMinute[createdAt.Format(time.RFC3339)]
+		if bucket == nil {
+			continue
+		}
+		bucket.RequestCount++
+		if success != 0 {
+			bucket.SuccessCount++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate account availability ledger: %w", err)
+	}
+	for i := range summary.Buckets {
+		bucket := &summary.Buckets[i]
+		bucket.SuccessRate = ratioPercent(bucket.SuccessCount, bucket.RequestCount)
+		bucket.Status = availabilityStatus(bucket.RequestCount, bucket.SuccessCount)
+		summary.RequestCount += bucket.RequestCount
+		summary.SuccessCount += bucket.SuccessCount
+	}
+	summary.FailureCount = summary.RequestCount - summary.SuccessCount
+	summary.SuccessRate = ratioPercent(summary.SuccessCount, summary.RequestCount)
+	summary.Status = availabilityStatus(summary.RequestCount, summary.SuccessCount)
 	return summary, nil
 }
 
@@ -793,6 +876,20 @@ func ratioPercent(part, total int64) float64 {
 	return float64(part) * 100 / float64(total)
 }
 
+func availabilityStatus(requestCount, successCount int64) string {
+	if requestCount <= 0 {
+		return "none"
+	}
+	rate := ratioPercent(successCount, requestCount)
+	if rate >= 90 {
+		return "healthy"
+	}
+	if rate >= 10 {
+		return "degraded"
+	}
+	return "unhealthy"
+}
+
 func nonNegativeInt64(value int64) int64 {
 	if value < 0 {
 		return 0
@@ -848,5 +945,8 @@ func (s *Store) hydrateAccountRuntime(ctx context.Context, account *ClaudeCodeAc
 	}
 	if statuses, err := s.ListAccountModelStatuses(ctx, account.ID); err == nil {
 		account.ModelStatuses = statuses
+	}
+	if availability, err := s.AccountAvailability(ctx, account.ID, defaultAvailabilityWindow); err == nil {
+		account.Availability = availability
 	}
 }

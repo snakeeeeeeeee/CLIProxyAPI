@@ -26,6 +26,7 @@ export interface ClaudeCodeAccount {
   cloak_user_id?: string;
   email: string;
   has_auth_data?: boolean;
+  token_expires_at?: string;
   enabled: boolean;
   priority: number;
   proxy_resource_id?: string;
@@ -35,6 +36,7 @@ export interface ClaudeCodeAccount {
   quota?: AccountQuota;
   capacity?: AccountCapacity;
   runtime_capacity?: AccountRuntimeCapacity;
+  availability?: AccountAvailabilitySummary;
   model_statuses?: AccountModelStatus[];
   test_status?: string;
   consecutive_failures?: number;
@@ -64,6 +66,26 @@ export interface AccountRuntimeCapacity extends AccountCapacity {
   cooling: boolean;
   cooling_until?: string;
   unavailable: boolean;
+}
+
+export type AccountAvailabilityStatus = "none" | "healthy" | "degraded" | "unhealthy" | string;
+
+export interface AccountAvailabilityBucket {
+  started_at: string;
+  request_count: number;
+  success_count: number;
+  success_rate: number;
+  status: AccountAvailabilityStatus;
+}
+
+export interface AccountAvailabilitySummary {
+  window_minutes: number;
+  request_count: number;
+  success_count: number;
+  failure_count: number;
+  success_rate: number;
+  status: AccountAvailabilityStatus;
+  buckets: AccountAvailabilityBucket[];
 }
 
 export interface AccountModelStatus {
@@ -759,6 +781,10 @@ export const api = {
     }),
   refreshAccountQuota: (id: string) =>
     request<{ account: ClaudeCodeAccount; warning?: string }>(`/claude-code-account-pool/accounts/${id}/quota/refresh`, {
+      method: "POST"
+    }),
+  refreshAccountToken: (id: string) =>
+    request<{ account: ClaudeCodeAccount; warning?: string }>(`/claude-code-account-pool/accounts/${id}/token/refresh`, {
       method: "POST"
     }),
   deleteAccount: (id: string) => request<{ status: string }>(`/claude-code-account-pool/accounts/${id}`, { method: "DELETE" }),

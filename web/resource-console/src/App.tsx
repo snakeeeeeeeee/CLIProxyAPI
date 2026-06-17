@@ -44,6 +44,7 @@ import {
 import { FormEvent, ReactNode, RefObject, UIEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   AccountRow,
+  AccountAvailabilitySummary,
   AccountBatchAction,
   AccountCapacity,
   AccountModelStatus,
@@ -90,7 +91,7 @@ import { Label } from "./components/ui/label";
 import { Progress } from "./components/ui/progress";
 import { Select } from "./components/ui/select";
 import { Textarea } from "./components/ui/textarea";
-import { formatTime, healthText, proxyDisplay, runtimeHealth, successRate } from "./format";
+import { formatTime, healthText, proxyDisplay, successRate } from "./format";
 import { cn } from "./lib/utils";
 
 type View = "home" | "accounts" | "proxies";
@@ -510,6 +511,7 @@ function App() {
         modal={modal}
         available={available}
         onClose={() => setModal(null)}
+        onRefresh={invalidateAll}
         onDone={async (message) => {
           setModal(null);
           showToast(message);
@@ -868,6 +870,18 @@ function AccountsView({
     },
     onError: (error) => onToast(`额度刷新失败：${errorMessage(error)}`, "danger")
   });
+  const tokenMutation = useMutation({
+    mutationFn: api.refreshAccountToken,
+    onSuccess: async (data) => {
+      await onDone();
+      if (data.warning) {
+        onToast(`Token 刷新异常：${data.warning}`, "danger");
+      } else {
+        onToast("Token 已刷新");
+      }
+    },
+    onError: (error) => onToast(`Token 刷新失败：${errorMessage(error)}`, "danger")
+  });
   const batchMutation = useMutation({
     mutationFn: ({ action, ids }: { action: AccountBatchAction; ids: string[] }) => api.batchAccounts(action, ids),
     onSuccess: async (data) => {
@@ -970,6 +984,8 @@ function AccountsView({
         onReset={(account) => resetMutation.mutate(account.id)}
         onRefreshQuota={(account) => quotaMutation.mutate(account.id)}
         quotaPending={quotaMutation.isPending}
+        onRefreshToken={(account) => tokenMutation.mutate(account.id)}
+        tokenPending={tokenMutation.isPending}
         onToggle={(account) => patchMutation.mutate({ accountID: account.id, enabled: !account.enabled })}
         onDelete={(account) => {
           if (window.confirm("确认删除这个账号？绑定代理会自动释放。")) {
@@ -2426,7 +2442,7 @@ function AccountCardsPanel({
       <CardContent className="grid gap-4">
         {total > 0 ? (
           <div className="max-h-[680px] overflow-y-auto pr-1">
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-3">
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,280px),1fr))] gap-3">
               {rows.map((row) => (
                 <AccountPoolCard
                   key={row.account.id}
@@ -2499,8 +2515,6 @@ function AccountPoolCard({
   onDelete: () => void;
 }) {
   const { account, runtime } = row;
-  const health = runtimeHealth(account, runtime);
-  const healthTone = requestSuccessTone(health);
   const displayName = account.email || account.auth_id;
   const bound = Boolean(account.proxy_resource_id || account.proxy);
 
@@ -2509,7 +2523,7 @@ function AccountPoolCard({
       role="button"
       tabIndex={0}
       className={cn(
-        "grid min-h-[360px] cursor-pointer gap-3 rounded-lg border bg-card p-4 transition-colors hover:border-primary/45 hover:bg-muted/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        "grid min-h-[360px] min-w-0 cursor-pointer gap-3 overflow-hidden rounded-lg border bg-card p-4 transition-colors hover:border-primary/45 hover:bg-muted/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
         selected && "border-primary bg-primary/5"
       )}
       onClick={onDetails}
@@ -2540,16 +2554,7 @@ function AccountPoolCard({
         </div>
       </div>
 
-      <div className="grid gap-2 rounded-lg border bg-muted/20 p-3">
-        <div className="flex items-center justify-between gap-2 text-xs">
-          <span className="text-muted-foreground">请求成功率</span>
-          <span className={cn("font-semibold tabular-nums", healthTone.textClass)}>{health}%</span>
-        </div>
-        <Progress value={health} indicatorClassName={healthTone.barClass} />
-        <div className="flex justify-end">
-          <Badge tone={healthTone.badgeTone}>{healthTone.label}</Badge>
-        </div>
-      </div>
+      <AvailabilityPanel availability={account.availability} compact />
 
       <CompactQuotaGrid quota={account.quota} />
       <CompactCapacity account={account} />
@@ -2589,7 +2594,7 @@ function AccountPoolCard({
 
 function CompactQuotaGrid({ quota }: { quota?: AccountQuota }) {
   return (
-    <div className="grid grid-cols-2 gap-2">
+    <div className="grid min-w-0 grid-cols-2 gap-2">
       <CompactQuotaWindow label="5h" window={findQuotaWindow(quota, ["five_hour", "5 小时", "5小时"])} />
       <CompactQuotaWindow label="7天" window={findQuotaWindow(quota, ["seven_day", "7 天", "7天"])} />
     </div>
@@ -2599,7 +2604,7 @@ function CompactQuotaGrid({ quota }: { quota?: AccountQuota }) {
 function CompactQuotaWindow({ label, window }: { label: string; window?: AccountQuota["windows"][number] }) {
   if (!window) {
     return (
-      <div className="grid gap-1 rounded-lg border bg-muted/20 p-3">
+      <div className="grid min-w-0 gap-1 rounded-lg border bg-muted/20 p-3">
         <div className="text-xs text-muted-foreground">{label}</div>
         <div className="text-sm font-semibold">未检测</div>
         <Progress value={0} />
@@ -2607,7 +2612,7 @@ function CompactQuotaWindow({ label, window }: { label: string; window?: Account
     );
   }
   return (
-    <div className="grid gap-1 rounded-lg border bg-muted/20 p-3">
+    <div className="grid min-w-0 gap-1 rounded-lg border bg-muted/20 p-3">
       <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
         <span>{label}</span>
         <span className="tabular-nums">{formatPercent(window.remain_percent)}</span>
@@ -2628,7 +2633,7 @@ function CompactCapacity({ account }: { account: ClaudeCodeAccount }) {
   const percent = concurrencyLimit > 0 ? Math.min(100, Math.round((inFlight / concurrencyLimit) * 100)) : 0;
 
   return (
-    <div className="grid gap-2 rounded-lg border bg-muted/20 p-3">
+    <div className="grid min-w-0 gap-2 rounded-lg border bg-muted/20 p-3">
       <div className="flex items-center justify-between gap-2 text-xs">
         <span className="text-muted-foreground">并发</span>
         <span className="font-semibold tabular-nums">{concurrencyLimit > 0 ? `${inFlight} / ${concurrencyLimit}` : "-"}</span>
@@ -2649,7 +2654,7 @@ function CompactCapacity({ account }: { account: ClaudeCodeAccount }) {
 function BoundProxyIndicator({ account }: { account: ClaudeCodeAccount }) {
   const bound = Boolean(account.proxy_resource_id || account.proxy);
   return (
-    <div className="flex min-h-11 items-center justify-between gap-3 rounded-lg border bg-muted/20 px-3 py-2 text-sm">
+    <div className="flex min-h-11 min-w-0 items-center justify-between gap-3 overflow-hidden rounded-lg border bg-muted/20 px-3 py-2 text-sm">
       <span className="text-muted-foreground">固定出口</span>
       {bound ? (
         <span className="inline-flex min-w-0 items-center gap-1.5 text-emerald-700">
@@ -2668,6 +2673,122 @@ function BoundProxyIndicator({ account }: { account: ClaudeCodeAccount }) {
   );
 }
 
+function AvailabilityPanel({
+  availability,
+  compact = false
+}: {
+  availability?: AccountAvailabilitySummary;
+  compact?: boolean;
+}) {
+  const tone = availabilityTone(availability?.status || "none");
+  const hasData = Boolean(availability && availability.request_count > 0);
+  const value = hasData ? formatPercent(availability?.success_rate) : "暂无数据";
+  const failureCount = availability ? Math.max(0, availability.failure_count || 0) : 0;
+  return (
+    <div className={cn("grid min-w-0 overflow-hidden rounded-lg border bg-muted/20", compact ? "gap-2 p-2.5" : "gap-3 p-3 bg-background/70")}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="grid gap-0.5">
+          <div className="text-xs font-medium text-muted-foreground">2小时可用性</div>
+          <div className={cn(compact ? "text-base" : "text-lg", "font-semibold tabular-nums", tone.textClass)}>{value}</div>
+        </div>
+        <Badge tone={tone.badgeTone}>{tone.label}</Badge>
+      </div>
+      <AvailabilityStrip availability={availability} compact={compact} />
+      <div className={cn("flex items-center justify-between gap-2 text-xs text-muted-foreground", !compact && "flex-wrap")}>
+        <span className="shrink-0">{compact ? "2 小时" : "过去 2 小时 · 每格 2 分钟"}</span>
+        <span className="min-w-0 truncate tabular-nums">
+          {hasData
+            ? compact
+              ? `${availability?.success_count || 0}/${availability?.request_count || 0} 成功`
+              : `${availability?.success_count || 0}/${availability?.request_count || 0} 成功 · 失败 ${failureCount}`
+            : compact
+              ? "无请求"
+              : "灰色表示无请求"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function AvailabilityStrip({ availability, compact = false }: { availability?: AccountAvailabilitySummary; compact?: boolean }) {
+  const buckets = aggregateAvailabilityBuckets(normalizeAvailabilityBuckets(availability), 2);
+  return (
+    <div
+      className={cn("grid min-w-0 max-w-full grid-flow-col gap-px overflow-hidden", compact ? "h-4" : "h-8")}
+      style={{ gridTemplateColumns: `repeat(${buckets.length}, minmax(0, 1fr))` }}
+      aria-label="最近 2 小时每分钟请求可用性"
+    >
+      {buckets.map((bucket, index) => {
+        const tone = availabilityTone(bucket.status);
+        const title = availabilityBucketTitle(bucket);
+        return (
+          <span
+            key={`${bucket.started_at || "empty"}-${index}`}
+            className={cn("block min-w-0 rounded-[1px]", tone.barClass)}
+            title={title}
+            aria-label={title}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function normalizeAvailabilityBuckets(availability?: AccountAvailabilitySummary) {
+  const buckets = availability?.buckets || [];
+  if (buckets.length >= 120) {
+    return buckets.slice(-120);
+  }
+  const padding = Array.from({ length: 120 - buckets.length }, () => ({
+    started_at: "",
+    request_count: 0,
+    success_count: 0,
+    success_rate: 0,
+    status: "none"
+  }));
+  return [...padding, ...buckets];
+}
+
+function aggregateAvailabilityBuckets(buckets: ReturnType<typeof normalizeAvailabilityBuckets>, size: number) {
+  if (size <= 1) {
+    return buckets;
+  }
+  const out: ReturnType<typeof normalizeAvailabilityBuckets> = [];
+  for (let index = 0; index < buckets.length; index += size) {
+    const group = buckets.slice(index, index + size);
+    const requestCount = group.reduce((sum, bucket) => sum + (bucket.request_count || 0), 0);
+    const successCount = group.reduce((sum, bucket) => sum + (bucket.success_count || 0), 0);
+    out.push({
+      started_at: group[0]?.started_at || "",
+      request_count: requestCount,
+      success_count: successCount,
+      success_rate: requestCount > 0 ? (successCount * 100) / requestCount : 0,
+      status: availabilityStatusForCount(requestCount, successCount)
+    });
+  }
+  return out;
+}
+
+function availabilityBucketTitle(bucket: ReturnType<typeof normalizeAvailabilityBuckets>[number]) {
+  const time = bucket.started_at ? `${formatMinute(bucket.started_at)} 起 2 分钟` : "无数据";
+  if (!bucket.request_count) {
+    return `${time} · 无请求`;
+  }
+  return `${time} · ${bucket.success_count}/${bucket.request_count} 成功 · ${formatPercent(bucket.success_rate)}`;
+}
+
+function AvailabilityStats({ availability }: { availability?: AccountAvailabilitySummary }) {
+  const hasData = Boolean(availability && availability.request_count > 0);
+  return (
+    <div className="grid grid-cols-4 gap-3 max-[720px]:grid-cols-2">
+      <CompactStat label="请求数" value={hasData ? formatNumber(availability?.request_count) : "暂无"} />
+      <CompactStat label="成功" value={hasData ? formatNumber(availability?.success_count) : "暂无"} />
+      <CompactStat label="失败" value={hasData ? formatNumber(availability?.failure_count) : "暂无"} />
+      <CompactStat label="成功率" value={hasData ? formatPercent(availability?.success_rate) : "暂无数据"} />
+    </div>
+  );
+}
+
 function AccountDetailDialog({
   row,
   open,
@@ -2678,6 +2799,8 @@ function AccountDetailDialog({
   onReset,
   onRefreshQuota,
   quotaPending,
+  onRefreshToken,
+  tokenPending,
   onToggle,
   onDelete
 }: {
@@ -2690,14 +2813,14 @@ function AccountDetailDialog({
   onReset: (account: ClaudeCodeAccount) => void;
   onRefreshQuota: (account: ClaudeCodeAccount) => void;
   quotaPending: boolean;
+  onRefreshToken: (account: ClaudeCodeAccount) => void;
+  tokenPending: boolean;
   onToggle: (account: ClaudeCodeAccount) => void;
   onDelete: (account: ClaudeCodeAccount) => void;
 }) {
   const account = row?.account;
   const runtime = row?.runtime;
   const bound = Boolean(account?.proxy_resource_id || account?.proxy);
-  const health = account ? runtimeHealth(account, runtime) : 0;
-  const healthTone = requestSuccessTone(health);
   const identity = parseClaudeCodeIdentity(account?.cloak_user_id);
 
   return (
@@ -2722,23 +2845,18 @@ function AccountDetailDialog({
                 <ReadOnlyTile label="Device ID" value={identity.deviceId || "-"} />
                 <ReadOnlyTile label="Account UUID" value={identity.accountUUID || "-"} />
                 <ReadOnlyTile label="Session ID" value="请求时按会话生成" />
-                <ReadOnlyTile label="成功率" value={successRate(runtime)} />
+                <ReadOnlyTile label="运行成功率" value={successRate(runtime)} />
                 <ReadOnlyTile label="连续失败" value={`${account.consecutive_failures || 0}`} />
                 <ReadOnlyTile label="最近测试" value={formatTime(account.last_test_at)} />
+                <ReadOnlyTile label="Token 过期" value={formatTime(account.token_expires_at)} />
                 <ReadOnlyTile label="更新时间" value={formatTime(account.updated_at)} />
               </div>
 
               <div className="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] gap-4 max-[900px]:grid-cols-1">
                 <div className="grid gap-4">
-                  <div className="grid gap-2 rounded-lg border bg-muted/20 p-3">
-                    <div className="flex items-center justify-between gap-2 text-sm">
-                      <span className="font-medium">请求成功率</span>
-                      <div className="flex items-center gap-2">
-                        <Badge tone={healthTone.badgeTone}>{healthTone.label}</Badge>
-                        <span className={cn("tabular-nums", healthTone.textClass)}>{health}%</span>
-                      </div>
-                    </div>
-                    <Progress value={health} indicatorClassName={healthTone.barClass} />
+                  <div className="grid gap-3 rounded-lg border bg-muted/20 p-3">
+                    <AvailabilityPanel availability={account.availability} />
+                    <AvailabilityStats availability={account.availability} />
                     <div className="text-xs text-muted-foreground">
                       当前请求 {account.runtime_capacity?.in_flight || 0} · RPM {account.runtime_capacity?.rpm_used || 0}
                     </div>
@@ -2787,6 +2905,10 @@ function AccountDetailDialog({
                 <Button variant="outline" onClick={() => onReset(account)}>
                   <Clock3 className="h-4 w-4" />
                   清冷却
+                </Button>
+                <Button variant="outline" onClick={() => onRefreshToken(account)} disabled={tokenPending}>
+                  <RefreshCw className={cn("h-4 w-4", tokenPending && "animate-spin")} />
+                  刷新 Token
                 </Button>
                 <Button variant="outline" onClick={() => onToggle(account)}>
                   {account.enabled ? "禁用账号" : "启用账号"}
@@ -4018,18 +4140,20 @@ function ResourceModal({
   modal,
   available,
   onClose,
+  onRefresh,
   onDone,
   onToast
 }: {
   modal: ModalState;
   available: ProxyResource[];
   onClose: () => void;
+  onRefresh: () => Promise<void>;
   onDone: (message: string) => Promise<void>;
   onToast: (message: string, tone?: ToastState["tone"]) => void;
 }) {
   return (
     <Dialog open={modal !== null} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className={modal?.type === "oauth" ? "max-w-5xl" : undefined}>
+      <DialogContent className={modal?.type === "oauth" ? "max-w-5xl" : modal?.type === "test-account" ? "max-w-4xl p-0" : undefined}>
         {modal?.type === "oauth" ? (
           <OAuthForm available={available} onDone={onDone} onToast={onToast} />
         ) : modal?.type === "proxy" ? (
@@ -4039,7 +4163,7 @@ function ResourceModal({
         ) : modal?.type === "bind" ? (
           <BindProxyForm account={modal.account} available={available} onDone={onDone} onToast={onToast} />
         ) : modal?.type === "test-account" ? (
-          <AccountTestForm account={modal.account} models={modal.models} onDone={onDone} onToast={onToast} />
+          <AccountTestForm account={modal.account} models={modal.models} onRefresh={onRefresh} onClose={onClose} />
         ) : null}
       </DialogContent>
     </Dialog>
@@ -4049,60 +4173,104 @@ function ResourceModal({
 function AccountTestForm({
   account,
   models,
-  onDone,
-  onToast
+  onRefresh,
+  onClose
 }: {
   account: ClaudeCodeAccount;
   models: ClaudeCodeModel[];
-  onDone: (message: string) => Promise<void>;
-  onToast: (message: string, tone?: ToastState["tone"]) => void;
+  onRefresh: () => Promise<void>;
+  onClose: () => void;
 }) {
   const enabledModels = useMemo(() => models.filter((model) => model.enabled), [models]);
   const defaultModel = enabledModels[0]?.alias || enabledModels[0]?.name || "claude-3-5-haiku-latest";
   const [model, setModel] = useState(defaultModel);
   const [message, setMessage] = useState("hi");
+  const [result, setResult] = useState<AccountTestResultState>({
+    status: "idle",
+    lines: ["选择模型后发送测试消息，响应会显示在这里。"]
+  });
 
   useEffect(() => {
     setModel(defaultModel);
     setMessage("hi");
+    setResult({
+      status: "idle",
+      lines: ["选择模型后发送测试消息，响应会显示在这里。"]
+    });
   }, [account.id, defaultModel]);
 
   const mutation = useMutation({
     mutationFn: () => api.testAccount(account.id, { model, message }),
-    onSuccess: async (data) => {
-      await onDone(data.warning ? `测试完成但异常：${data.warning}` : "测试完成");
-      if (data.reply) {
-        onToast(`Claude 回复：${data.reply.slice(0, 120)}`);
-      }
+    onMutate: () => {
+      setResult({
+        status: "running",
+        lines: [
+          "连接 API 中",
+          `开始测试账号：${account.email || account.auth_id}`,
+          "账号类型：oauth",
+          `使用模型：${model}`,
+          `发送测试消息："${message}"`
+        ]
+      });
     },
-    onError: (error) => onToast(`测试失败：${errorMessage(error)}`, "danger")
+    onSuccess: async (data) => {
+      setResult({
+        status: data.warning ? "warning" : "success",
+        lines: [
+          data.warning ? "测试完成但异常" : "已连接到 API",
+          `开始测试账号：${account.email || account.auth_id}`,
+          "账号类型：oauth",
+          `使用模型：${model}`,
+          `发送测试消息："${message}"`,
+          data.warning ? `异常：${data.warning}` : "响应：",
+          data.reply || "测试成功，但接口未返回回复文本。"
+        ]
+      });
+      await onRefresh();
+    },
+    onError: async (error) => {
+      setResult({
+        status: "error",
+        lines: [
+          "测试失败",
+          `开始测试账号：${account.email || account.auth_id}`,
+          "账号类型：oauth",
+          `使用模型：${model}`,
+          `发送测试消息："${message}"`,
+          `错误：${errorMessage(error)}`
+        ]
+      });
+      await onRefresh();
+    }
   });
 
   return (
-    <>
-      <DialogHeader>
-        <DialogTitle className="flex items-center gap-2">
-          <Play className="h-5 w-5 text-primary" />
-          账号对话测试
-        </DialogTitle>
-        <DialogDescription>选择模型后发送一条短消息，测试 OAuth token 和绑定代理是否可正常对话。</DialogDescription>
+    <div className="grid max-h-[calc(100dvh-2rem)] overflow-hidden">
+      <DialogHeader className="border-b px-6 py-5 pr-14">
+        <DialogTitle className="text-2xl">测试账号连接</DialogTitle>
       </DialogHeader>
       <form
-        className="grid gap-4"
+        className="grid gap-5 overflow-y-auto px-6 py-5"
         onSubmit={(event) => {
           event.preventDefault();
           mutation.mutate();
         }}
       >
-        <div className="grid gap-2 rounded-lg border bg-muted/25 p-3 text-sm">
-          <div className="break-words font-medium">{account.email || account.auth_id}</div>
-          <div className="break-all text-xs text-muted-foreground">{account.auth_id}</div>
-          {account.cloak_user_id ? (
-            <div className="break-all text-xs text-muted-foreground">
-              Device ID：{parseClaudeCodeIdentity(account.cloak_user_id).deviceId || account.cloak_user_id}
+        <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/25 p-4 max-[640px]:items-start">
+          <div className="flex min-w-0 items-center gap-4">
+            <div className="grid h-14 w-14 shrink-0 place-items-center rounded-lg bg-teal-600 text-white">
+              <Play className="h-7 w-7" />
             </div>
-          ) : null}
-          <div className="text-xs text-muted-foreground">代理：{account.proxy ? `${account.proxy.name} · ${proxyDisplay(account.proxy)}` : "未绑定"}</div>
+            <div className="min-w-0">
+              <div className="break-words text-lg font-semibold leading-6">{account.email || account.auth_id}</div>
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+                <Badge tone="neutral">OAUTH</Badge>
+                <span className="break-all">账号</span>
+                {account.proxy ? <span className="break-all">固定出口：{proxyDisplay(account.proxy)}</span> : <span>未绑定代理</span>}
+              </div>
+            </div>
+          </div>
+          <Badge tone={account.enabled ? "success" : "danger"}>{account.enabled ? "active" : "disabled"}</Badge>
         </div>
         <Field label="测试模型">
           <Select value={model} onChange={(event) => setModel(event.target.value)}>
@@ -4122,17 +4290,116 @@ function AccountTestForm({
           </Select>
         </Field>
         <Field label="测试消息">
-          <Textarea value={message} onChange={(event) => setMessage(event.target.value)} className="min-h-24" />
+          <Textarea value={message} onChange={(event) => setMessage(event.target.value)} className="min-h-20" />
         </Field>
-        <div className="flex justify-end">
-          <Button type="submit" disabled={mutation.isPending || !model.trim() || !message.trim()}>
-            {mutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-            发送测试
-          </Button>
-        </div>
+        <AccountTestConsole result={result} model={model} message={message} />
       </form>
-    </>
+      <div className="flex flex-wrap justify-end gap-3 border-t bg-card px-6 py-4">
+        <Button type="button" variant="secondary" onClick={onClose}>
+          关闭
+        </Button>
+        <Button
+          type="button"
+          onClick={() => mutation.mutate()}
+          disabled={mutation.isPending || !model.trim() || !message.trim()}
+          className="min-w-36 bg-teal-600 text-white hover:bg-teal-700"
+        >
+          {mutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          {mutation.isPending ? "测试中..." : "开始测试"}
+        </Button>
+      </div>
+    </div>
   );
+}
+
+type AccountTestResultState = {
+  status: "idle" | "running" | "success" | "warning" | "error";
+  lines: string[];
+};
+
+function AccountTestConsole({
+  result,
+  model,
+  message
+}: {
+  result: AccountTestResultState;
+  model: string;
+  message: string;
+}) {
+  const statusTone =
+    result.status === "success" ? "text-emerald-400" : result.status === "error" ? "text-red-400" : result.status === "warning" ? "text-amber-300" : "text-sky-300";
+  return (
+    <div className="grid gap-3 rounded-lg border border-slate-700 bg-slate-950 p-4 font-mono text-sm leading-7 text-slate-300 shadow-inner">
+      <div className={cn("flex items-center gap-2", statusTone)}>
+        {result.status === "running" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+        <span>{result.status === "idle" ? "等待测试" : result.lines[0]}</span>
+      </div>
+      <div className="grid gap-0.5">
+        {result.status === "idle" ? (
+          <>
+            <ConsoleLine label="使用模型" value={model || "-"} tone="cyan" />
+            <ConsoleLine label="测试消息" value={`"${message || "hi"}"`} />
+            <ConsoleLine label="响应" value="测试完成后会显示在这里。" tone="muted" />
+          </>
+        ) : (
+          <div className="max-h-72 overflow-y-auto pr-1">
+            {result.lines.slice(1).map((line, index) => {
+              const [label, ...valueParts] = line.split("：");
+              const value = valueParts.join("：");
+              if (valueParts.length === 0) {
+                return (
+                  <div key={`${line}-${index}`} className={cn("whitespace-pre-wrap break-words", statusTone)}>
+                    {line}
+                  </div>
+                );
+              }
+              return <ConsoleLine key={`${line}-${index}`} label={label} value={value} tone={consoleLineTone(label)} />;
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ConsoleLine({ label, value, tone = "default" }: { label: string; value: string; tone?: "default" | "cyan" | "green" | "amber" | "red" | "muted" }) {
+  const toneClass =
+    tone === "cyan"
+      ? "text-cyan-300"
+      : tone === "green"
+        ? "text-emerald-300"
+        : tone === "amber"
+          ? "text-amber-300"
+          : tone === "red"
+            ? "text-red-300"
+            : tone === "muted"
+              ? "text-slate-400"
+              : "text-slate-300";
+  return (
+    <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-2">
+      <span className="text-slate-400">{label}：</span>
+      <span className={cn("min-w-0 whitespace-pre-wrap break-words", toneClass)}>{value}</span>
+    </div>
+  );
+}
+
+function consoleLineTone(label: string): "default" | "cyan" | "green" | "amber" | "red" | "muted" {
+  if (label.includes("已连接") || label.includes("响应")) {
+    return "green";
+  }
+  if (label.includes("模型")) {
+    return "cyan";
+  }
+  if (label.includes("异常")) {
+    return "amber";
+  }
+  if (label.includes("错误")) {
+    return "red";
+  }
+  if (label.includes("账号类型") || label.includes("发送测试消息")) {
+    return "muted";
+  }
+  return "default";
 }
 
 function OAuthForm({
@@ -4956,33 +5223,72 @@ function formatNumber(value?: number) {
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
 }
 
-function requestSuccessTone(value: number): {
+function formatMinute(value?: string) {
+  if (!value) {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "-";
+  }
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  });
+}
+
+function availabilityStatusForCount(requestCount: number, successCount: number) {
+  if (!requestCount) {
+    return "none";
+  }
+  const rate = (successCount * 100) / requestCount;
+  if (rate >= 90) {
+    return "healthy";
+  }
+  if (rate >= 10) {
+    return "degraded";
+  }
+  return "unhealthy";
+}
+
+function availabilityTone(status: string): {
   label: string;
-  badgeTone: "success" | "warning" | "danger";
+  badgeTone: "success" | "warning" | "danger" | "neutral";
   barClass: string;
   textClass: string;
 } {
-  if (value >= 80) {
+  if (status === "healthy") {
     return {
-      label: "良好",
+      label: "健康",
       badgeTone: "success",
-      barClass: "bg-emerald-600",
+      barClass: "bg-emerald-500",
       textClass: "text-emerald-700"
     };
   }
-  if (value >= 50) {
+  if (status === "degraded") {
     return {
-      label: "一般",
+      label: "波动",
       badgeTone: "warning",
       barClass: "bg-amber-500",
       textClass: "text-amber-700"
     };
   }
+  if (status === "unhealthy") {
+    return {
+      label: "异常",
+      badgeTone: "danger",
+      barClass: "bg-red-500",
+      textClass: "text-red-700"
+    };
+  }
   return {
-    label: "较低",
-    badgeTone: "danger",
-    barClass: "bg-red-600",
-    textClass: "text-red-700"
+    label: "暂无请求",
+    badgeTone: "neutral",
+    barClass: "bg-muted",
+    textClass: "text-muted-foreground"
   };
 }
 

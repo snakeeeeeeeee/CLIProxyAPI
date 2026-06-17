@@ -290,6 +290,26 @@ type AccountRuntimeCapacity struct {
 	Unavailable      bool   `json:"unavailable"`
 }
 
+// AccountAvailabilityBucket summarizes one minute of recent account traffic.
+type AccountAvailabilityBucket struct {
+	StartedAt    time.Time `json:"started_at"`
+	RequestCount int64     `json:"request_count"`
+	SuccessCount int64     `json:"success_count"`
+	SuccessRate  float64   `json:"success_rate"`
+	Status       string    `json:"status"`
+}
+
+// AccountAvailabilitySummary summarizes recent per-minute account availability.
+type AccountAvailabilitySummary struct {
+	WindowMinutes int                         `json:"window_minutes"`
+	RequestCount  int64                       `json:"request_count"`
+	SuccessCount  int64                       `json:"success_count"`
+	FailureCount  int64                       `json:"failure_count"`
+	SuccessRate   float64                     `json:"success_rate"`
+	Status        string                      `json:"status"`
+	Buckets       []AccountAvailabilityBucket `json:"buckets"`
+}
+
 // AccountCapacityPatch updates per-account capacity fields.
 type AccountCapacityPatch struct {
 	BaseRPM          *int `json:"base_rpm,omitempty"`
@@ -470,27 +490,29 @@ type ProxyResource struct {
 
 // ClaudeCodeAccount is one OAuth-backed Claude Code account row.
 type ClaudeCodeAccount struct {
-	ID                  string                  `json:"id"`
-	AuthID              string                  `json:"auth_id"`
-	CloakUserID         string                  `json:"cloak_user_id,omitempty"`
-	Email               string                  `json:"email"`
-	HasAuthData         bool                    `json:"has_auth_data"`
-	Enabled             bool                    `json:"enabled"`
-	Priority            int                     `json:"priority"`
-	ProxyResourceID     string                  `json:"proxy_resource_id,omitempty"`
-	Proxy               *ProxyResource          `json:"proxy,omitempty"`
-	Note                string                  `json:"note,omitempty"`
-	ExcludedModels      []string                `json:"excluded_models"`
-	Quota               *AccountQuota           `json:"quota,omitempty"`
-	Capacity            *AccountCapacityConfig  `json:"capacity,omitempty"`
-	RuntimeCapacity     *AccountRuntimeCapacity `json:"runtime_capacity,omitempty"`
-	ModelStatuses       []AccountModelStatus    `json:"model_statuses,omitempty"`
-	TestStatus          string                  `json:"test_status,omitempty"`
-	ConsecutiveFailures int                     `json:"consecutive_failures"`
-	LastTestAt          *time.Time              `json:"last_test_at,omitempty"`
-	LastError           string                  `json:"last_error,omitempty"`
-	CreatedAt           time.Time               `json:"created_at"`
-	UpdatedAt           time.Time               `json:"updated_at"`
+	ID                  string                      `json:"id"`
+	AuthID              string                      `json:"auth_id"`
+	CloakUserID         string                      `json:"cloak_user_id,omitempty"`
+	Email               string                      `json:"email"`
+	HasAuthData         bool                        `json:"has_auth_data"`
+	TokenExpiresAt      *time.Time                  `json:"token_expires_at,omitempty"`
+	Enabled             bool                        `json:"enabled"`
+	Priority            int                         `json:"priority"`
+	ProxyResourceID     string                      `json:"proxy_resource_id,omitempty"`
+	Proxy               *ProxyResource              `json:"proxy,omitempty"`
+	Note                string                      `json:"note,omitempty"`
+	ExcludedModels      []string                    `json:"excluded_models"`
+	Quota               *AccountQuota               `json:"quota,omitempty"`
+	Capacity            *AccountCapacityConfig      `json:"capacity,omitempty"`
+	RuntimeCapacity     *AccountRuntimeCapacity     `json:"runtime_capacity,omitempty"`
+	Availability        *AccountAvailabilitySummary `json:"availability,omitempty"`
+	ModelStatuses       []AccountModelStatus        `json:"model_statuses,omitempty"`
+	TestStatus          string                      `json:"test_status,omitempty"`
+	ConsecutiveFailures int                         `json:"consecutive_failures"`
+	LastTestAt          *time.Time                  `json:"last_test_at,omitempty"`
+	LastError           string                      `json:"last_error,omitempty"`
+	CreatedAt           time.Time                   `json:"created_at"`
+	UpdatedAt           time.Time                   `json:"updated_at"`
 }
 
 // AccountQuota is the latest Claude OAuth usage snapshot for one account.

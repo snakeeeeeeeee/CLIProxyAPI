@@ -950,6 +950,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/claude-code-account-pool/accounts/:id/model-status", s.mgmt.ListClaudeCodeAccountModelStatus)
 		mgmt.DELETE("/claude-code-account-pool/accounts/:id", s.mgmt.DeleteClaudeCodeAccount)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/test", s.mgmt.TestClaudeCodeAccount)
+		mgmt.POST("/claude-code-account-pool/accounts/:id/token/refresh", s.mgmt.RefreshClaudeCodeAccountToken)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/quota/refresh", s.mgmt.RefreshClaudeCodeAccountQuota)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/bind-proxy", s.mgmt.BindClaudeCodeAccountProxy)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/unbind-proxy", s.mgmt.UnbindClaudeCodeAccountProxy)

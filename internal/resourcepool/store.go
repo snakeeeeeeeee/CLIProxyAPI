@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1247,7 +1248,7 @@ func generateClaudeCodeCloakUserID() string {
 // ListAccounts returns all Claude Code account rows.
 func (s *Store) ListAccounts(ctx context.Context) ([]ClaudeCodeAccount, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END,
+SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
        a.email, a.enabled, a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
@@ -1293,7 +1294,7 @@ func (s *Store) GetAccount(ctx context.Context, id string) (*ClaudeCodeAccount, 
 		return nil, fmt.Errorf("account id is required")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END,
+SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
        a.email, a.enabled, a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
@@ -1336,7 +1337,7 @@ func (s *Store) GetAccountByAuthID(ctx context.Context, authID string) (*ClaudeC
 		return nil, fmt.Errorf("auth id is required")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END,
+SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
        a.email, a.enabled, a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
@@ -1758,7 +1759,7 @@ func (s *Store) FindAccountOverlay(ctx context.Context, authID, email string) (*
 		return nil, false, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END,
+SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
        a.email, a.enabled, a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
@@ -1904,7 +1905,7 @@ func scanAccountWithProxy(rows interface {
 }) (ClaudeCodeAccount, error) {
 	var account ClaudeCodeAccount
 	var enabled, hasAuthData int
-	var excludedJSON string
+	var authJSON, excludedJSON string
 	var accountCreatedRaw, accountUpdatedRaw string
 	var accountLastTestRaw sql.NullString
 	var quotaStatus, quotaWindowsJSON, quotaRawJSON, quotaLastError, quotaCheckedRaw sql.NullString
@@ -1917,6 +1918,7 @@ func scanAccountWithProxy(rows interface {
 		&account.AuthID,
 		&account.CloakUserID,
 		&hasAuthData,
+		&authJSON,
 		&account.Email,
 		&enabled,
 		&account.Priority,
@@ -1953,6 +1955,7 @@ func scanAccountWithProxy(rows interface {
 	}
 	account.Enabled = enabled != 0
 	account.HasAuthData = hasAuthData != 0
+	account.TokenExpiresAt = tokenExpiresAtFromAuthJSON(authJSON)
 	account.TestStatus = normalizeAccountTestStatus(account.TestStatus)
 	account.LastTestAt = parseNullTime(accountLastTestRaw)
 	account.CreatedAt = parseDBTime(accountCreatedRaw)
@@ -2198,6 +2201,84 @@ func nullString(v sql.NullString) string {
 		return ""
 	}
 	return v.String
+}
+
+func tokenExpiresAtFromAuthJSON(raw string) *time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil
+	}
+	for _, meta := range []map[string]any{payload, nestedAuthMetadata(payload, "metadata"), nestedAuthMetadata(payload, "token")} {
+		for _, key := range []string{"expired", "expire", "expires_at", "expiresAt", "expiry", "expires"} {
+			if ts, ok := parseAuthTokenExpiry(meta[key]); ok && !ts.IsZero() {
+				return &ts
+			}
+		}
+	}
+	return nil
+}
+
+func nestedAuthMetadata(payload map[string]any, key string) map[string]any {
+	if payload == nil {
+		return nil
+	}
+	if nested, ok := payload[key].(map[string]any); ok {
+		return nested
+	}
+	if raw, ok := payload[key].(string); ok && strings.TrimSpace(raw) != "" {
+		var nested map[string]any
+		if err := json.Unmarshal([]byte(raw), &nested); err == nil {
+			return nested
+		}
+	}
+	if nested, ok := payload[key].(json.RawMessage); ok && len(nested) > 0 {
+		var meta map[string]any
+		if err := json.Unmarshal(nested, &meta); err == nil {
+			return meta
+		}
+	}
+	return nil
+}
+
+func parseAuthTokenExpiry(value any) (time.Time, bool) {
+	switch v := value.(type) {
+	case string:
+		raw := strings.TrimSpace(v)
+		if raw == "" {
+			return time.Time{}, false
+		}
+		for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
+			if ts, err := time.Parse(layout, raw); err == nil {
+				return ts, true
+			}
+		}
+		if unix, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			return normaliseAuthUnixTime(unix), true
+		}
+	case float64:
+		return normaliseAuthUnixTime(int64(v)), true
+	case int64:
+		return normaliseAuthUnixTime(v), true
+	case json.Number:
+		if unix, err := v.Int64(); err == nil {
+			return normaliseAuthUnixTime(unix), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func normaliseAuthUnixTime(raw int64) time.Time {
+	if raw <= 0 {
+		return time.Time{}
+	}
+	if raw > 1_000_000_000_000 {
+		return time.UnixMilli(raw)
+	}
+	return time.Unix(raw, 0)
 }
 
 func nullInt(v sql.NullInt64) int64 {

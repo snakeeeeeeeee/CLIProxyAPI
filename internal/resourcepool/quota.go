@@ -222,7 +222,7 @@ func refreshClaudeAccessToken(ctx context.Context, cfg *config.Config, auth *cor
 		return fmt.Errorf("missing refresh_token")
 	}
 	service := claudeauth.NewClaudeAuthWithProxyURL(cfg, auth.ProxyURL)
-	tokenData, err := service.RefreshTokensWithRetry(ctx, refreshToken, 3)
+	tokenData, err := service.RefreshClaudeCodeTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return err
 	}

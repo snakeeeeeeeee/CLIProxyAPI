@@ -1218,6 +1218,7 @@ const (
 	claudeCodeManagementIdentityPrompt  = "You are Claude Code, Anthropic's official CLI for Claude."
 	claudeCodeManagementFingerprintSalt = "59cf53e54c78"
 	claudeCodeManagementCCHSeed         = 0x6E52736AC806831E
+	claudeCodeAccountTestMaxTokens      = 1024
 )
 
 func buildClaudeCodeAccountTestBody(model, message, userID string) ([]byte, error) {
@@ -1253,7 +1254,7 @@ func buildClaudeCodeAccountTestPayload(model, message, userID string) map[string
 	}, "\n\n")
 	return map[string]any{
 		"model":      model,
-		"max_tokens": 16,
+		"max_tokens": claudeCodeAccountTestMaxTokens,
 		"system": []map[string]string{
 			{
 				"type": "text",
@@ -1432,6 +1433,13 @@ func (h *Handler) ensureClaudeCodeManagementAccessToken(ctx context.Context, sto
 	if strings.TrimSpace(accessToken) != "" && (!hasExpiry || time.Now().Add(2*time.Minute).Before(expiresAt)) {
 		return nil
 	}
+	return h.refreshClaudeCodeManagementAccessToken(ctx, store, auth)
+}
+
+func (h *Handler) refreshClaudeCodeManagementAccessToken(ctx context.Context, store *resourcepool.Store, auth *coreauth.Auth) error {
+	if auth == nil {
+		return errors.New("auth is nil")
+	}
 	refreshToken, _ := auth.Metadata["refresh_token"].(string)
 	if strings.TrimSpace(refreshToken) == "" {
 		return errors.New("missing refresh_token")
@@ -1440,7 +1448,7 @@ func (h *Handler) ensureClaudeCodeManagementAccessToken(ctx context.Context, sto
 	cfg := h.cfg
 	h.mu.Unlock()
 	service := claudeauth.NewClaudeAuthWithProxyURL(cfg, auth.ProxyURL)
-	tokenData, err := service.RefreshTokensWithRetry(ctx, refreshToken, 3)
+	tokenData, err := service.RefreshClaudeCodeTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return err
 	}
@@ -1910,6 +1918,39 @@ func (h *Handler) RefreshClaudeCodeAccountQuota(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"account": account, "warning": err.Error()})
 		return
 	}
+	c.JSON(http.StatusOK, gin.H{"account": account})
+}
+
+func (h *Handler) RefreshClaudeCodeAccountToken(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	account, err := store.GetAccount(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "account_not_found", "message": err.Error()})
+		return
+	}
+	auth, errAuth := h.storedClaudeCodeAuth(c.Request.Context(), account.ID)
+	if errAuth != nil {
+		c.JSON(http.StatusOK, gin.H{"account": account, "warning": errAuth.Error()})
+		return
+	}
+	if err := h.refreshClaudeCodeManagementAccessToken(c.Request.Context(), store, auth); err != nil {
+		if refreshed, errGet := store.GetAccount(c.Request.Context(), account.ID); errGet == nil {
+			account = refreshed
+		}
+		resourcepool.PublishAccountChanged(account.ID, "token")
+		resourcepool.PublishStatsChanged("account")
+		c.JSON(http.StatusOK, gin.H{"account": account, "warning": err.Error()})
+		return
+	}
+	if refreshed, errGet := store.GetAccount(c.Request.Context(), account.ID); errGet == nil {
+		account = refreshed
+	}
+	resourcepool.PublishAccountChanged(account.ID, "token")
+	resourcepool.PublishStatsChanged("account")
 	c.JSON(http.StatusOK, gin.H{"account": account})
 }
 
