@@ -19,6 +19,7 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 type cachedClaudeTraceConfig struct {
@@ -37,6 +38,7 @@ func (e *ClaudeExecutor) dumpClaudeAccountPoolTrace(ctx context.Context, auth *c
 	if e == nil || !isClaudeCodeAccountPoolTraceAuth(auth) || !isClaudeAccountPoolTraceScope(ctx, meta) {
 		return
 	}
+	e.logClaudeAccountPoolOutboundShape(ctx, auth, req, body, stream, statusCode, responseErr)
 	traceCfg, ok := e.effectiveClaudeTraceConfig(ctx)
 	if !ok || !traceCfg.Enabled {
 		return
@@ -60,17 +62,89 @@ func (e *ClaudeExecutor) dumpClaudeAccountPoolTrace(ctx context.Context, auth *c
 	}
 }
 
-func claudeAccountPoolTraceRequestMode(ctx context.Context, body []byte) string {
-	if headers := ginRequestHeaders(ctx); headers != nil {
-		if ua := strings.TrimSpace(headers.Get("User-Agent")); strings.HasPrefix(ua, "claude-cli/") {
-			return claudetrace.RequestModeRealClaudeCodePassthrough
-		}
+func (e *ClaudeExecutor) logClaudeAccountPoolOutboundShape(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request, body []byte, stream bool, statusCode int, responseErr error) {
+	if e == nil || e.cfg == nil || !e.cfg.ResourcePools.Enabled || auth == nil {
+		return
+	}
+	configPath := strings.TrimSpace(e.cfg.ResourcePools.ConfigFile)
+	if configPath == "" {
+		configPath = resourcepool.DefaultConfigFileName
 	}
 	shape := claudetrace.BuildBodyShape(body)
-	if shape.BillingBlockKind != "" && shape.ToolCount >= 10 {
-		return claudetrace.RequestModeRealClaudeCodePassthrough
+	mode := claudeAccountPoolTraceRequestMode(ctx, body)
+	headers := http.Header{}
+	if req != nil {
+		headers = req.Header
 	}
-	return claudetrace.RequestModeAPIMimic
+	errText := ""
+	if responseErr != nil {
+		errText = responseErr.Error()
+	}
+	accountID := ""
+	proxyID := ""
+	if auth.Attributes != nil {
+		accountID = auth.Attributes[resourcepool.AttrAccountID]
+		proxyID = auth.Attributes[resourcepool.AttrProxyResourceID]
+	}
+	path := ""
+	if req != nil && req.URL != nil {
+		path = req.URL.Path
+	}
+	entry := resourcepool.AccountPoolLogEntry{
+		Level:           "debug",
+		Event:           "outbound_shape",
+		Path:            path,
+		Model:           shape.Model,
+		AccountID:       accountID,
+		AuthID:          auth.ID,
+		ProxyResourceID: proxyID,
+		StatusCode:      statusCode,
+		Error:           errText,
+		Details: map[string]any{
+			"mode":                   mode,
+			"stream":                 stream,
+			"user_agent":             headers.Get("User-Agent"),
+			"x_app":                  headers.Get("X-App"),
+			"anthropic_version":      headers.Get("Anthropic-Version"),
+			"anthropic_beta":         headers.Get("Anthropic-Beta"),
+			"metadata_user_id_kind":  shape.MetadataUserIDKind,
+			"system_block_count":     shape.SystemBlockCount,
+			"billing_block_kind":     shape.BillingBlockKind,
+			"cch_signed":             claudeAccountPoolTraceCCHSigned(body),
+			"tls_profile":            claudeAccountPoolTraceTLSProfile(req),
+			"tool_count":             shape.ToolCount,
+			"has_thinking":           shape.HasThinking,
+			"has_context_management": shape.HasContextManagement,
+			"top_level_keys":         shape.TopLevelKeys,
+		},
+	}
+	if err := resourcepool.WriteAccountPoolLog(ctx, configPath, e.cfg, entry); err != nil {
+		helps.LogWithRequestID(ctx).WithError(err).Warn("claude account-pool outbound shape log failed")
+	}
+}
+
+func claudeAccountPoolTraceCCHSigned(body []byte) bool {
+	text := strings.TrimSpace(gjson.GetBytes(body, "system.0.text").String())
+	return strings.HasPrefix(text, "x-anthropic-billing-header:") && strings.Contains(text, "cch=") && !strings.Contains(text, "cch=00000;")
+}
+
+func claudeAccountPoolTraceTLSProfile(req *http.Request) string {
+	if req == nil || req.URL == nil {
+		return ""
+	}
+	if strings.EqualFold(req.URL.Scheme, "https") && strings.EqualFold(req.URL.Host, "api.anthropic.com") {
+		return claudeAccountPoolTLSProfileNodeJS
+	}
+	return "default"
+}
+
+func claudeAccountPoolTraceRequestMode(ctx context.Context, body []byte) string {
+	switch claudeCodeAccountPoolRequestMode(ctx, body) {
+	case claudeAccountPoolModePassthrough:
+		return claudetrace.RequestModeRealClaudeCodePassthrough
+	default:
+		return claudetrace.RequestModeAPIMimic
+	}
 }
 
 func isClaudeCodeAccountPoolTraceAuth(auth *cliproxyauth.Auth) bool {

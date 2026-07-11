@@ -92,6 +92,8 @@ func TestCompareReportsToolSchemaDifference(t *testing.T) {
 		"messages":[],
 		"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}]
 	}`)
+	realTrace.RequestMode = RequestModeRealClaudeCodePassthrough
+	oursTrace.RequestMode = RequestModeRealClaudeCodePassthrough
 	findings := CompareTracePair(realTrace, oursTrace, "trace")
 	if !hasFinding(findings, SeverityFatal, "tool_schema_hashes") {
 		t.Fatalf("findings = %+v, want fatal tool schema diff", findings)

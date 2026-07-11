@@ -59,7 +59,7 @@ func CaptureRequest(req *http.Request, opts CaptureOptions) Trace {
 }
 
 func InferRequestMode(headers map[string]string, shape BodyShape) string {
-	if looksLikeClaudeCodeHeader(headers) || looksLikeClaudeCodeBody(shape) {
+	if looksLikeClaudeCodeHeader(headers) && looksLikeClaudeCodeBody(shape) {
 		return RequestModeRealClaudeCodePassthrough
 	}
 	return RequestModeAPIMimic
@@ -75,6 +75,9 @@ func looksLikeClaudeCodeHeader(headers map[string]string) bool {
 }
 
 func looksLikeClaudeCodeBody(shape BodyShape) bool {
+	if shape.BillingBlockKind == "" || shape.MetadataUserIDKind == "" {
+		return false
+	}
 	if shape.BillingBlockKind != "" && shape.ToolCount >= 10 {
 		return true
 	}

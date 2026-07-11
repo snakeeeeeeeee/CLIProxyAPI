@@ -45,3 +45,10 @@
 - Reconciled plugin installation with official `v7.2.66` versioned artifact semantics and removed the obsolete HOME-only filename option.
 - Updated the local Codex catalog regression test to verify relative priority instead of the obsolete hard-coded catalog size.
 - First-pass targeted merge tests now pass across API, management, plugin store, HOME plugins, Gemini responses translator, SDK handlers, and SDK conductor packages.
+- Created merge commit `0ef20abd` with message `同步合并官方 v7.2.66 并保留二开能力`.
+- Reapplied `stash@{0}` without conflicts; all 12 pre-merge code/UI files are restored as working-tree changes and the stash remains as a safety copy.
+- Post-stash targeted tests passed for executor, Claude trace, resource pool, and frontend type checking.
+- Ran repository formatting with `gofmt -w .` successfully.
+- Final verification passed: `go test ./...`, required backend compile, frontend type-check, and frontend production build.
+- Confirmed the generated resource console was copied to `internal/resourcepool/console.html` before the backend compile.
+- Confirmed official `v7.2.66` is merged, the pre-merge backup branch remains, and the safety stash remains available until the uncommitted request-shape work is committed.

@@ -313,11 +313,12 @@ export interface ClaudeCodeProfile {
   metadata_user_id_mode?: string;
   updated_from?: string;
   updated_at?: string;
+  tls_profile?: string;
 }
 
 export interface ClaudeCodeProfileResponse {
   raw: ClaudeCodeProfile;
-  effective: Required<Pick<ClaudeCodeProfile, "version" | "user_agent" | "headers" | "betas" | "system_prompt" | "billing_block_enabled" | "metadata_user_id_mode">> &
+  effective: Required<Pick<ClaudeCodeProfile, "version" | "user_agent" | "headers" | "betas" | "system_prompt" | "billing_block_enabled" | "metadata_user_id_mode" | "tls_profile">> &
     Pick<ClaudeCodeProfile, "updated_from" | "updated_at">;
 }
 

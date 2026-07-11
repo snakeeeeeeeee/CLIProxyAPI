@@ -4,11 +4,11 @@
 Align `/claude-acc-pool/v1` outbound requests with real Claude Code behavior by separating real Claude Code passthrough from ordinary API mimicry, adding account-pool-only Node/Claude TLS selection, and improving trace/log diagnostics.
 
 ## Phases
-- [complete] Inspect current account-pool profile, body/header injection, CCH signing, trace dump, and uTLS implementation.
-- [complete] Implement strict passthrough/mimic mode detection, metadata compatibility, body sanitization order, and profile handling.
-- [complete] Add account-pool-only Claude Code/Node TLS profile selection and outbound shape logging.
-- [complete] Update trace diff/tests/UI summary where needed.
-- [complete] Run backend/frontend checks and feasible local trace/smoke verification.
+- [x] Inspect current account-pool profile, body/header injection, CCH signing, trace dump, and uTLS implementation.
+- [x] Implement strict passthrough/mimic mode detection, metadata compatibility, body sanitization order, and profile handling.
+- [x] Add account-pool-only Claude Code/Node TLS profile selection and outbound shape logging.
+- [x] Update trace diff/tests/UI summary where needed.
+- [x] Run backend/frontend checks and feasible local trace/smoke verification.
 
 ## Constraints
 - Do not modify original `/v1/*`, ordinary Claude API Pool, or unrelated providers.
@@ -31,13 +31,13 @@ Align `/claude-acc-pool/v1` outbound requests with real Claude Code behavior by 
 Merge the latest `router-for-me/CLIProxyAPI` `upstream/main` into the local `main` branch while preserving all secondary-development features and current uncommitted account-pool work.
 
 ## Phases
-- [complete] Read secondary-development docs and inventory local branch, remotes, commits, and dirty worktree.
-- [complete] Create recoverable safety points and fetch the latest official upstream refs.
-- [complete] Inspect upstream divergence and merge `upstream/main` into local `main`.
-- [complete] Resolve conflicts with priority on preserving account pool, proxy pool, console, trace, observability, and build/deploy customizations.
-- [in_progress] Reapply and reconcile the pre-merge uncommitted Claude Code request-shape work.
-- [pending] Run Go formatting, backend tests/build, and frontend type-check/build.
-- [pending] Review the final diff and report merged upstream version, preserved custom work, and any residual risks.
+- [x] Read secondary-development docs and inventory local branch, remotes, commits, and dirty worktree.
+- [x] Create recoverable safety points and fetch the latest official upstream refs.
+- [x] Inspect upstream divergence and merge `upstream/main` into local `main`.
+- [x] Resolve conflicts with priority on preserving account pool, proxy pool, console, trace, observability, and build/deploy customizations.
+- [x] Reapply and reconcile the pre-merge uncommitted Claude Code request-shape work.
+- [x] Run Go formatting, backend tests/build, and frontend type-check/build.
+- [x] Review the final diff and report merged upstream version, preserved custom work, and any residual risks.
 
 ## Merge Safety Rules
 - Keep a backup branch pointing to the pre-merge local `main` commit.
@@ -55,3 +55,12 @@ Merge the latest `router-for-me/CLIProxyAPI` `upstream/main` into the local `mai
 | Official plugin-store tests failed under mixed stable/versioned filename semantics | 1 | Adopted upstream's versioned artifact paths; retained upstream's existing loaded-plugin overwrite guard instead of the obsolete early lock/stable-path overlay. |
 | HOME plugin sync still set removed `VersionedFileName` | 1 | Removed the obsolete option because upstream now always installs versioned plugin artifacts. |
 | Codex catalog test hard-coded pre-upgrade priority `129` | 1 | Assert non-template priority is greater than the template priority, preserving the behavior under future catalog growth. |
+| Planning completion checker found zero phases | 1 | Converted legacy `[complete]` markers to standard Markdown `[x]` checkboxes. |
+
+## Completion Status
+
+### Phase 1: Claude Code Request Shape Alignment
+**Status:** complete
+
+### Phase 2: Official Upstream v7.2.66 Merge
+**Status:** complete

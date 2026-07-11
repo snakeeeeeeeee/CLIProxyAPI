@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -24,9 +25,34 @@ type utlsRoundTripper struct {
 	connections map[string]*http2.ClientConn
 	pending     map[string]*sync.Cond
 	dialer      proxy.Dialer
+	profile     utlsProfile
 }
 
-func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
+type utlsProfile string
+
+const (
+	utlsProfileChrome         utlsProfile = "chrome"
+	utlsProfileClaudeCodeNode utlsProfile = "claude-code-node"
+)
+
+type claudeCodeTLSProfileContextKey struct{}
+
+// WithClaudeCodeTLSProfile marks official Anthropic account-pool requests for
+// the Node.js/Claude Code uTLS profile. Other provider paths keep their legacy
+// TLS behavior.
+func WithClaudeCodeTLSProfile(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, claudeCodeTLSProfileContextKey{}, true)
+}
+
+func ClaudeCodeTLSProfileEnabled(ctx context.Context) bool {
+	enabled, _ := ctx.Value(claudeCodeTLSProfileContextKey{}).(bool)
+	return enabled
+}
+
+func newUtlsRoundTripper(proxyURL string, profile utlsProfile) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
 	if proxyURL != "" {
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
@@ -40,6 +66,7 @@ func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 		connections: make(map[string]*http2.ClientConn),
 		pending:     make(map[string]*sync.Cond),
 		dialer:      dialer,
+		profile:     profile,
 	}
 }
 
@@ -87,6 +114,13 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 
 	tlsConfig := &tls.Config{ServerName: host}
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
+	if t.profile == utlsProfileClaudeCodeNode {
+		tlsConn = tls.UClient(conn, tlsConfig, tls.HelloCustom)
+		if err := tlsConn.ApplyPreset(claudeCodeNodeClientHelloSpec()); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("apply claude code node tls preset: %w", err)
+		}
+	}
 
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
@@ -129,6 +163,40 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
+func claudeCodeNodeClientHelloSpec() *tls.ClientHelloSpec {
+	return &tls.ClientHelloSpec{
+		CipherSuites: []uint16{
+			0x1301, 0x1302, 0x1303,
+			0xc02b, 0xc02f, 0xc02c, 0xc030,
+			0xcca9, 0xcca8,
+			0xc009, 0xc013, 0xc00a, 0xc014,
+			0x009c, 0x009d,
+			0x002f, 0x0035,
+		},
+		CompressionMethods: []byte{0},
+		TLSVersMax:         tls.VersionTLS13,
+		TLSVersMin:         tls.VersionTLS10,
+		Extensions: []tls.TLSExtension{
+			&tls.SNIExtension{},
+			&tls.GREASEEncryptedClientHelloExtension{},
+			&tls.ExtendedMasterSecretExtension{},
+			&tls.RenegotiationInfoExtension{},
+			&tls.SupportedCurvesExtension{Curves: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384}},
+			&tls.SupportedPointsExtension{SupportedPoints: []byte{0}},
+			&tls.SessionTicketExtension{},
+			&tls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
+			&tls.StatusRequestExtension{},
+			&tls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []tls.SignatureScheme{
+				0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201,
+			}},
+			&tls.SCTExtension{},
+			&tls.KeyShareExtension{KeyShares: []tls.KeyShare{{Group: tls.X25519}}},
+			&tls.PSKKeyExchangeModesExtension{Modes: []uint8{uint8(tls.PskModeDHE)}},
+			&tls.SupportedVersionsExtension{Versions: []uint16{tls.VersionTLS13, tls.VersionTLS12}},
+		},
+	}
+}
+
 // utlsProtectedHosts contains the hosts that should use utls Chrome TLS fingerprint
 // to bypass Cloudflare's TLS fingerprinting.
 var utlsProtectedHosts = map[string]struct{}{
@@ -169,7 +237,11 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
+	profile := utlsProfileChrome
+	if ClaudeCodeTLSProfileEnabled(ctx) {
+		profile = utlsProfileClaudeCodeNode
+	}
+	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL, profile)
 	var standardTransport http.RoundTripper = http.DefaultTransport
 	if proxyURL != "" {
 		if transport := buildProxyTransport(proxyURL); transport != nil {

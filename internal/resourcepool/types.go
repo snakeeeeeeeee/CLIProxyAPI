@@ -215,6 +215,7 @@ type EffectiveClaudeCodeProfileConfig struct {
 	UpdatedAt           *time.Time        `json:"updated_at,omitempty"`
 	Locked              bool              `json:"locked"`
 	SystemPromptMode    string            `json:"system_prompt_mode"`
+	TLSProfile          string            `json:"tls_profile"`
 }
 
 // ClaudeCodeProfileSnapshot stores a versioned request-shape baseline fetched

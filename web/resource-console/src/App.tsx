@@ -1042,11 +1042,12 @@ function ClaudeCodeProfilePanel({
         <CardDescription>请求形态由后端内置维护，页面只展示当前生效摘要。</CardDescription>
       </CardHeader>
       <CardContent className="grid gap-4">
-        <div className="grid grid-cols-4 gap-3 max-[1180px]:grid-cols-2 max-[560px]:grid-cols-1">
+        <div className="grid grid-cols-5 gap-3 max-[1280px]:grid-cols-3 max-[760px]:grid-cols-2 max-[560px]:grid-cols-1">
           <ReadOnlyTile label="Claude Code 版本" value={effective?.version || "2.1.178"} />
           <ReadOnlyTile label="身份策略" value="账号固定 · 会话生成" />
           <ReadOnlyTile label="Billing/CCH" value={effective?.billing_block_enabled === false ? "关闭" : "内置签名"} />
           <ReadOnlyTile label="Prompt" value="完整静态提示词" />
+          <ReadOnlyTile label="TLS 指纹" value={effective?.tls_profile || "node-claude-code"} />
         </div>
 
         <div className="rounded-lg border bg-muted/30 p-3">
@@ -1085,7 +1086,7 @@ function ClaudeCodeProfilePanel({
         </div>
 
         <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm leading-6 text-emerald-900">
-          完整 Claude Code 静态提示词、billing block、CCH 签名和账号级 metadata.user_id 都由后端内置注入，不跟随 API 使用者变化。
+          完整 Claude Code 静态提示词、billing block、CCH 签名、账号级 metadata.user_id 和官方域名 TLS profile 都由后端内置维护，不跟随 API 使用者变化。
         </div>
       </CardContent>
     </Card>

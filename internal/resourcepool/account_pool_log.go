@@ -25,32 +25,33 @@ var accountPoolLogLevels = map[string]int{
 
 // AccountPoolLogEntry is one JSONL diagnostic line.
 type AccountPoolLogEntry struct {
-	Time            time.Time `json:"ts"`
-	Level           string    `json:"level"`
-	Event           string    `json:"event"`
-	RequestID       string    `json:"request_id,omitempty"`
-	Path            string    `json:"path,omitempty"`
-	Model           string    `json:"model,omitempty"`
-	RequestedModel  string    `json:"requested_model,omitempty"`
-	AccountID       string    `json:"account_id,omitempty"`
-	AuthID          string    `json:"auth_id,omitempty"`
-	ProxyResourceID string    `json:"proxy_resource_id,omitempty"`
-	Sticky          bool      `json:"sticky,omitempty"`
-	SessionKey      string    `json:"session_key,omitempty"`
-	InFlight        int64     `json:"in_flight,omitempty"`
-	Concurrency     int       `json:"concurrency_limit,omitempty"`
-	RPMUsed         int       `json:"rpm_used,omitempty"`
-	RPMLimit        int       `json:"rpm_limit,omitempty"`
-	Decision        string    `json:"decision,omitempty"`
-	Reason          string    `json:"reason,omitempty"`
-	StatusCode      int       `json:"status_code,omitempty"`
-	LatencyMS       int64     `json:"latency_ms,omitempty"`
-	InputTokens     int64     `json:"input_tokens,omitempty"`
-	OutputTokens    int64     `json:"output_tokens,omitempty"`
-	CacheReadTokens int64     `json:"cache_read_tokens,omitempty"`
-	CacheCreate     int64     `json:"cache_creation_tokens,omitempty"`
-	TotalTokens     int64     `json:"total_tokens,omitempty"`
-	Error           string    `json:"error,omitempty"`
+	Time            time.Time      `json:"ts"`
+	Level           string         `json:"level"`
+	Event           string         `json:"event"`
+	RequestID       string         `json:"request_id,omitempty"`
+	Path            string         `json:"path,omitempty"`
+	Model           string         `json:"model,omitempty"`
+	RequestedModel  string         `json:"requested_model,omitempty"`
+	AccountID       string         `json:"account_id,omitempty"`
+	AuthID          string         `json:"auth_id,omitempty"`
+	ProxyResourceID string         `json:"proxy_resource_id,omitempty"`
+	Sticky          bool           `json:"sticky,omitempty"`
+	SessionKey      string         `json:"session_key,omitempty"`
+	InFlight        int64          `json:"in_flight,omitempty"`
+	Concurrency     int            `json:"concurrency_limit,omitempty"`
+	RPMUsed         int            `json:"rpm_used,omitempty"`
+	RPMLimit        int            `json:"rpm_limit,omitempty"`
+	Decision        string         `json:"decision,omitempty"`
+	Reason          string         `json:"reason,omitempty"`
+	StatusCode      int            `json:"status_code,omitempty"`
+	LatencyMS       int64          `json:"latency_ms,omitempty"`
+	InputTokens     int64          `json:"input_tokens,omitempty"`
+	OutputTokens    int64          `json:"output_tokens,omitempty"`
+	CacheReadTokens int64          `json:"cache_read_tokens,omitempty"`
+	CacheCreate     int64          `json:"cache_creation_tokens,omitempty"`
+	TotalTokens     int64          `json:"total_tokens,omitempty"`
+	Error           string         `json:"error,omitempty"`
+	Details         map[string]any `json:"details,omitempty"`
 }
 
 // AccountPoolLogView is returned to management clients.

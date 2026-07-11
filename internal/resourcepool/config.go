@@ -619,6 +619,7 @@ func EffectiveClaudeCodeProfile(cfg ClaudeCodeProfile) EffectiveClaudeCodeProfil
 		UpdatedAt:           normalized.UpdatedAt,
 		Locked:              normalized.Locked,
 		SystemPromptMode:    normalized.SystemPromptMode,
+		TLSProfile:          "node-claude-code",
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1622,6 +1623,114 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolRequestShape(t *testing.T) {
 	}
 	if gjson.GetBytes(seenBody, "thinking").Exists() {
 		t.Fatalf("ordinary account-pool mimic request should not inject thinking: %s", seenBody)
+	}
+}
+
+func TestClaudeExecutor_ClaudeCodeAccountPoolRejectsSpoofedUAPassthrough(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"claude_oauth_pool": "true",
+		"cloak_user_id":     "user_be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714_account_11111111-2222-4333-8444-555555555555_session_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+	}, Metadata: map[string]any{"account_uuid": "11111111-2222-4333-8444-555555555555"}}
+	body := []byte(`{
+		"model":"claude-opus-4-8",
+		"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.181.abc; cc_entrypoint=cli; cch=12345;"}],
+		"metadata":{"user_id":"not-a-claude-code-user-id"},
+		"tools":[{"name":"fake","input_schema":{"type":"object"}}],
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	headers := http.Header{
+		"User-Agent":        []string{"claude-cli/2.1.181 (external, sdk-cli)"},
+		"Anthropic-Version": []string{"2023-06-01"},
+		"X-App":             []string{"cli"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/claude-acc-pool/v1/messages", nil)
+	req.Header = headers
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = req
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	if got := claudeCodeAccountPoolRequestMode(ctx, body); got != claudeAccountPoolModeAPIMimic {
+		t.Fatalf("request mode = %q, want api mimic for spoofed metadata", got)
+	}
+	out := applyClaudeCodeAccountPoolProfile(ctx, auth, body, cliproxyexecutor.Request{Payload: body}, cliproxyexecutor.Options{})
+	if got := gjson.GetBytes(out, "system.1.text").String(); got != "You are Claude Code, Anthropic's official CLI for Claude." {
+		t.Fatalf("spoofed request should be rebuilt as mimic, identity block=%q body=%s", got, out)
+	}
+}
+
+func TestClaudeExecutor_ClaudeCodeAccountPoolPassthroughKeepsClaudeCodeBody(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"claude_oauth_pool": "true",
+		"cloak_user_id":     "user_be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714_account_11111111-2222-4333-8444-555555555555_session_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+	}, Metadata: map[string]any{"account_uuid": "11111111-2222-4333-8444-555555555555"}}
+	inboundUserID := `{"device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","account_uuid":"22222222-2222-4222-8222-222222222222","session_id":"33333333-3333-4333-8333-333333333333"}`
+	body := []byte(`{
+		"model":"claude-opus-4-8",
+		"system":[
+			{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.181.abc; cc_entrypoint=cli; cch=12345;"},
+			{"type":"text","text":"client claude code identity"}
+		],
+		"metadata":{"user_id":` + strconv.Quote(inboundUserID) + `},
+		"tools":[{"name":"Bash","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],
+		"thinking":{"type":"adaptive"},
+		"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]},
+		"output_config":{"effort":"high"},
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	headers := http.Header{
+		"User-Agent":        []string{"claude-cli/2.1.181 (external, sdk-cli)"},
+		"Anthropic-Version": []string{"2023-06-01"},
+		"X-App":             []string{"sdk-cli"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/claude-acc-pool/v1/messages", nil)
+	req.Header = headers
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = req
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	if got := claudeCodeAccountPoolRequestMode(ctx, body); got != claudeAccountPoolModePassthrough {
+		t.Fatalf("request mode = %q, want passthrough", got)
+	}
+	out := applyClaudeCodeAccountPoolProfile(ctx, auth, body, cliproxyexecutor.Request{Payload: body}, cliproxyexecutor.Options{})
+	if got := len(gjson.GetBytes(out, "system").Array()); got != 2 {
+		t.Fatalf("passthrough should keep system blocks, got %d body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "system.1.text").String(); got != "client claude code identity" {
+		t.Fatalf("system block was rewritten: %q body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
+		t.Fatalf("tool name = %q, want Bash", got)
+	}
+	rewritten := gjson.GetBytes(out, "metadata.user_id").String()
+	parsed, ok := helps.ParseClaudeCodeMetadataUserID(rewritten)
+	if !ok {
+		t.Fatalf("rewritten metadata invalid: %q", rewritten)
+	}
+	if parsed.DeviceID != "be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714" {
+		t.Fatalf("metadata device_id = %q, want account-pool device id", parsed.DeviceID)
+	}
+	if parsed.SessionID != "33333333-3333-4333-8333-333333333333" {
+		t.Fatalf("metadata session_id = %q, want inbound session preserved", parsed.SessionID)
+	}
+}
+
+func TestClaudeExecutor_ClaudeCodeAccountPoolTLSProfileScope(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"claude_oauth_pool": "true"}}
+	ctx := withClaudeCodeAccountPoolTLSProfile(context.Background(), auth, "https://api.anthropic.com")
+	if !helps.ClaudeCodeTLSProfileEnabled(ctx) {
+		t.Fatal("expected Claude Code TLS profile for account-pool official Anthropic base URL")
+	}
+	ctx = withClaudeCodeAccountPoolTLSProfile(context.Background(), auth, "https://example.com")
+	if helps.ClaudeCodeTLSProfileEnabled(ctx) {
+		t.Fatal("did not expect Claude Code TLS profile for custom base URL")
+	}
+	ctx = withClaudeCodeAccountPoolTLSProfile(context.Background(), &cliproxyauth.Auth{Attributes: map[string]string{}}, "https://api.anthropic.com")
+	if helps.ClaudeCodeTLSProfileEnabled(ctx) {
+		t.Fatal("did not expect Claude Code TLS profile for non account-pool auth")
 	}
 }
 
