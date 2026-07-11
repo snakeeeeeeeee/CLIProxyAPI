@@ -1,22 +1,47 @@
-# Progress: Claude Code Account Pool Observability
+# Progress: Claude Code Account Pool Request Shape Alignment
 
 ## Session Log
-- Started implementation for account-pool observability, dedicated logs, unified metrics, and SSE-driven UI refresh.
-- Confirmed top metrics currently miss account-pool usage because old Claude API Pool metrics filter by `config:claude-api-pool[`.
-- Confirmed routing events table exists but route acquisition failures are not wired into it.
-- Replaced previous planning files with this task's current plan/findings/progress.
-- Added account-pool route event hook from `sdk/cliproxy/auth` into `internal/resourcepool`, recording selected/success/upstream_error/rejected decisions.
-- Added account-pool JSONL management APIs for log config, tail, clear, and download.
-- Reworked account-pool stats API to aggregate scoped route pressure plus SQLite usage ledger, local rejects, real token totals, and recent errors.
-- Updated resource console queries/SSE invalidation, top metrics, usage aggregation, routing event table, log panel, and account capacity display.
-- `go build -o test-output ./cmd/server` passed once after backend fixes; removed `test-output`.
-- `npm run type-check --prefix web/resource-console` passed.
-- Fixed the account-pool scheduler scope regression: `claude_oauth_pool=true` auths are eligible for `/claude-acc-pool` scope while `claude_api_pool=true` auths remain excluded.
+- Started implementation after user approved the request-shape alignment plan.
+- Re-read `2dev/迭代开发日志.md` and `2dev/2dev.md` per repository instructions.
+- Confirmed clean git worktree before making changes.
+- Confirmed local Claude Code CLI version is `2.1.181`.
+- Confirmed built-in account-pool profile remains `2.1.178`.
+- Inspected current executor, trace dump, profile, system prompt, and uTLS helper implementation.
+- Added explicit account-pool request modes: strict real Claude Code passthrough vs API mimic.
+- Passthrough now requires Claude CLI UA, valid Claude Code metadata, billing block, and required inbound headers.
+- Added account-pool body sanitize after final beta collection and before CCH signing.
+- Added context-scoped Claude Code/Node TLS profile selection for account-pool requests to official `api.anthropic.com`.
+- Added outbound shape JSONL log event using final outbound headers/body shape.
+- Added regression tests for spoofed UA falling back to mimic, real Claude Code passthrough preserving body shape, TLS profile scope, and trace diff mode behavior.
+- Added read-only `tls_profile` to account-pool profile API/UI summary.
+- Local targeted checks passed:
+  - `go test ./internal/runtime/executor ./internal/claudetrace ./internal/resourcepool`
+  - `npm run type-check --prefix web/resource-console`
+- Confirmed local Claude Code CLI is still `2.1.181 (Claude Code)`.
+- Confirmed trace tools run:
+  - `go run ./cmd/claude_trace_recorder --help`
+  - `go run ./cmd/claude_trace_diff --help`
 - Final verification passed:
   - `go test ./...`
   - `go build -o test-output ./cmd/server && rm -f test-output`
   - `npm run type-check --prefix web/resource-console`
   - `npm run build --prefix web/resource-console`
-- Local smoke used a temporary server on `127.0.0.1:28318` with a temporary management key. The real `/claude-acc-pool/v1/messages` request reached the selected OAuth account but failed upstream with `401 authentication_error: Invalid authentication credentials`; startup also reported `invalid_grant`, so this is a local OAuth credential issue rather than an observability wiring failure.
-- Smoke confirmed the failed request wrote `usage_failure`, `account_result`, and `route_upstream_error` JSONL records, appended selected/upstream_error routing events, updated stats/usage endpoints, and refreshed the account-pool UI through SSE. The UI showed recent `unauthorized` errors, card RPM `1/20`, separate concurrency/RPM/sticky buffer capacity, the logs panel, and recent routing events.
-- Fixed log download to use authenticated `fetch` with `X-Management-Key` and Blob download instead of putting the management key in the URL query. Re-ran `npm run type-check --prefix web/resource-console`, `npm run build --prefix web/resource-console`, and `go build -o test-output ./cmd/server && rm -f test-output`; all passed.
+- Real Anthropic smoke request was not sent automatically to avoid consuming OAuth quota or failing on external account/proxy state; the trace/CLI verification path is ready for a local manual run.
+
+## Official Upstream Merge Session (2026-07-11)
+- Started official upstream synchronization at the user's request.
+- Read `2dev/迭代开发日志.md` and `2dev/2dev.md` before touching the account-pool/proxy/build integration.
+- Confirmed the local checkout has an official `upstream` remote and a separate user-fork `origin` remote.
+- Confirmed the current request-shape implementation is still uncommitted and must be protected before merge.
+- Confirmed the current committed base already merged official `v7.2.42` in commit `37741a7e`.
+- Confirmed the pending code/UI diff has no whitespace errors and the planning records are the only files that need to remain visible while the code changes are stashed.
+- Created backup branch `codex/backup-main-before-upstream-20260711` at the pre-merge local `HEAD`.
+- Saved all pending code and UI changes in named stash `pre-upstream-merge-20260711-request-shape`; planning records remain visible in the worktree.
+- Fetched official upstream successfully: latest tag is `v7.2.66` at `e99a2056`.
+- Ran a non-mutating merge preview and identified eight first-pass conflict files before starting the real merge.
+- Started the real merge. It produced exactly the eight previewed conflicts and no unexpected conflict files.
+- Resolved and staged all eight content conflicts by composing official behavior with secondary-development hooks.
+- The first targeted build found one automatic-merge mismatch in plugin directory lookup; adjusted it to the upstream `pluginCandidateDirs` signature.
+- Reconciled plugin installation with official `v7.2.66` versioned artifact semantics and removed the obsolete HOME-only filename option.
+- Updated the local Codex catalog regression test to verify relative priority instead of the obsolete hard-coded catalog size.
+- First-pass targeted merge tests now pass across API, management, plugin store, HOME plugins, Gemini responses translator, SDK handlers, and SDK conductor packages.
