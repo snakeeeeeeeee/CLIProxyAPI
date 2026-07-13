@@ -62,6 +62,8 @@ type Handler struct {
 	pluginReleaseCache      map[string]pluginReleaseCacheEntry
 	claudeAPIPoolSync       func(context.Context) error
 	resourcePoolSync        func(context.Context) error
+	sessionKeyJobs          *sessionKeyJobManager
+	sessionKeyAuthFactory   sessionKeyAuthenticatorFactory
 }
 
 type configReloadSnapshot struct {
@@ -75,13 +77,15 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret = strings.TrimSpace(envSecret)
 
 	h := &Handler{
-		cfg:                 cfg,
-		configFilePath:      configFilePath,
-		failedAttempts:      make(map[string]*attemptInfo),
-		authManager:         manager,
-		tokenStore:          sdkAuth.GetTokenStore(),
-		allowRemoteOverride: envSecret != "",
-		envSecret:           envSecret,
+		cfg:                   cfg,
+		configFilePath:        configFilePath,
+		failedAttempts:        make(map[string]*attemptInfo),
+		authManager:           manager,
+		tokenStore:            sdkAuth.GetTokenStore(),
+		allowRemoteOverride:   envSecret != "",
+		envSecret:             envSecret,
+		sessionKeyJobs:        newSessionKeyJobManager(),
+		sessionKeyAuthFactory: defaultSessionKeyAuthenticatorFactory,
 	}
 	h.startAttemptCleanup()
 	return h

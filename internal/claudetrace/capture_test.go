@@ -18,6 +18,7 @@ func TestCaptureRequestRedactsSecretsAndUserContent(t *testing.T) {
 		t.Fatalf("NewRequest() error = %v", err)
 	}
 	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("X-Claude-Code-Session-Id", "session-secret")
 	req.Header.Set("X-App", "cli")
 
 	trace := CaptureRequest(req, CaptureOptions{
@@ -27,6 +28,9 @@ func TestCaptureRequestRedactsSecretsAndUserContent(t *testing.T) {
 	})
 	if got := trace.Headers["Authorization"]; got != "<redacted>" {
 		t.Fatalf("Authorization header = %q, want redacted", got)
+	}
+	if got := trace.Headers["X-Claude-Code-Session-Id"]; got != "<redacted>" {
+		t.Fatalf("Session header = %q, want redacted", got)
 	}
 	rawBody, ok := trace.Body.(map[string]any)
 	if !ok {
@@ -39,6 +43,10 @@ func TestCaptureRequestRedactsSecretsAndUserContent(t *testing.T) {
 	userText := rawBody["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(map[string]any)
 	if userText["redacted"] != true || userText["length"].(int) == 0 {
 		t.Fatalf("user text not redacted: %+v", userText)
+	}
+	metadata := rawBody["metadata"].(map[string]any)["user_id"].(map[string]any)
+	if metadata["redacted"] != true || metadata["kind"] != "legacy_user_account_session" {
+		t.Fatalf("metadata.user_id not redacted: %+v", metadata)
 	}
 	if trace.BodyShape.SystemBlockCount != 1 || len(trace.BodyShape.SystemTextHashes) != 1 {
 		t.Fatalf("system shape = %+v, want one system hash", trace.BodyShape)
@@ -78,6 +86,23 @@ func TestCompareReportsMissingXApp(t *testing.T) {
 	findings := CompareTracePair(realTrace, oursTrace, "trace")
 	if !hasFinding(findings, SeverityFatal, "headers.x-app") {
 		t.Fatalf("findings = %+v, want fatal x-app missing", findings)
+	}
+}
+
+func TestCompareReportsSessionHeaderMetadataMismatch(t *testing.T) {
+	body := `{"model":"claude-opus-4-8","metadata":{"user_id":"{\"device_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"account_uuid\":\"11111111-2222-4333-8444-555555555555\",\"session_id\":\"11111111-2222-4333-8444-555555555555\"}"},"messages":[]}`
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("X-Claude-Code-Session-Id", "99999999-2222-4333-8444-555555555555")
+	trace := CaptureRequest(req, CaptureOptions{RequestBody: []byte(body)})
+	if trace.Session.Match {
+		t.Fatalf("session invariant = %+v, want mismatch", trace.Session)
+	}
+	findings := CompareTracePair(trace, trace, "trace")
+	if !hasFinding(findings, SeverityFatal, "session") {
+		t.Fatalf("findings = %+v, want fatal Session mismatch", findings)
 	}
 }
 
@@ -123,6 +148,43 @@ func TestCompareAPIMimicDoesNotFatalMissingClaudeCodeTools(t *testing.T) {
 	}
 	if !hasFinding(findings, SeverityInfo, "tool_count") {
 		t.Fatalf("findings = %+v, want info tool_count mismatch", findings)
+	}
+}
+
+func TestInferRequestKind(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body string
+		want string
+	}{
+		{name: "count tokens", path: "/v1/messages/count_tokens", body: `{}`, want: RequestKindCountTokens},
+		{name: "structured helper", path: "/v1/messages", body: `{"output_config":{"format":{"type":"json_schema"}},"messages":[{"role":"user","content":"title"}]}`, want: RequestKindStructuredHelper},
+		{name: "tool followup", path: "/v1/messages", body: `{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`, want: RequestKindToolFollowup},
+		{name: "interactive", path: "/v1/messages", body: `{"messages":[{"role":"user","content":"hi"}]}`, want: RequestKindInteractive},
+		{name: "other", path: "/v1/complete", body: `{}`, want: RequestKindOther},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := InferRequestKind(tt.path, []byte(tt.body)); got != tt.want {
+				t.Fatalf("InferRequestKind() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTraceGroupingIncludesRequestKind(t *testing.T) {
+	realInteractive := sampleTraceWithBody(t, `{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}`)
+	realHelper := sampleTraceWithBody(t, `{"model":"claude-opus-4-8","output_config":{"format":{"type":"json_schema"}},"messages":[{"role":"user","content":"title"}]}`)
+	oursInteractive := realInteractive
+	oursInteractive.Source = SourceOurs
+	oursHelper := realHelper
+	oursHelper.Source = SourceOurs
+	findings := CompareTraceSets([]Trace{realInteractive, realHelper}, []Trace{oursHelper, oursInteractive})
+	for _, item := range findings {
+		if item.Severity == SeverityFatal {
+			t.Fatalf("request-kind grouping produced fatal mismatch: %+v", item)
+		}
 	}
 }
 

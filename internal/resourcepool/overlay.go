@@ -44,7 +44,13 @@ func ApplyAuthOverlay(ctx context.Context, configPath string, cfg *config.Config
 	if err != nil {
 		return err
 	}
-	effectivePool := EffectiveClaudeCodePool(doc.ClaudeCode)
+	globalPool := EffectiveClaudeCodePool(doc.ClaudeCode)
+	effectivePool := globalPool
+	if poolConfigs, errConfigs := store.effectiveClaudeCodePools(ctx, globalPool); errConfigs == nil {
+		if poolConfig, okConfig := poolConfigs[normalizeAccountPoolID(overlay.Account.PoolID)]; okConfig {
+			effectivePool = poolConfig
+		}
+	}
 	effectiveProfile := EffectiveClaudeCodeProfile(doc.Profile)
 	usageOverheadsJSON := store.UsageOverheadMapJSON(ctx, effectivePool.Usage.ProfileFingerprint)
 	if auth.Attributes == nil {
@@ -52,6 +58,7 @@ func ApplyAuthOverlay(ctx context.Context, configPath string, cfg *config.Config
 	}
 	auth.Attributes[AttrClaudeOAuthPool] = "true"
 	auth.Attributes[AttrAccountID] = overlay.Account.ID
+	auth.Attributes[AttrAccountPoolID] = normalizeAccountPoolID(overlay.Account.PoolID)
 	if overlay.Account.ProxyResourceID != "" {
 		auth.Attributes[AttrProxyResourceID] = overlay.Account.ProxyResourceID
 	}
@@ -61,10 +68,13 @@ func ApplyAuthOverlay(ctx context.Context, configPath string, cfg *config.Config
 	if strings.TrimSpace(overlay.Account.Note) != "" {
 		auth.Attributes["note"] = strings.TrimSpace(overlay.Account.Note)
 	}
-	if !overlay.Account.Enabled {
+	if !overlay.Account.Schedulable || overlay.Account.HealthStatus == AccountHealthManualRecovery {
 		auth.Disabled = true
 		auth.Status = coreauth.StatusDisabled
 	}
+	auth.Attributes["account_schedulable"] = strconv.FormatBool(overlay.Account.Schedulable)
+	auth.Attributes["account_health_status"] = overlay.Account.HealthStatus
+	auth.Attributes["account_effective_schedulable"] = strconv.FormatBool(overlay.Account.EffectiveSchedulable)
 	if overlay.Proxy != nil && strings.TrimSpace(overlay.Proxy.ProxyURL) != "" {
 		auth.ProxyURL = strings.TrimSpace(overlay.Proxy.ProxyURL)
 	}
@@ -96,10 +106,15 @@ func ListStoredAuths(ctx context.Context, configPath string, cfg *config.Config)
 		return nil, err
 	}
 	effectivePool := EffectiveClaudeCodePool(doc.ClaudeCode)
+	poolConfigs, err := store.effectiveClaudeCodePools(ctx, effectivePool)
+	if err != nil {
+		return nil, err
+	}
 	effectiveProfile := EffectiveClaudeCodeProfile(doc.Profile)
 	usageOverheadsJSON := store.UsageOverheadMapJSON(ctx, effectivePool.Usage.ProfileFingerprint)
 	rows, err := store.db.QueryContext(ctx, `
-SELECT a.id, a.auth_id, a.cloak_user_id, a.auth_json, a.email, a.enabled, a.priority, COALESCE(a.proxy_resource_id, ''),
+SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, a.auth_json, a.email, a.enabled, a.health_status, a.blocked_until, a.blocked_reason, a.last_health_check_at, a.next_health_check_at,
+       a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.created_at, a.updated_at,
        p.id, p.name, p.proxy_url, p.exit_ip, p.enabled, p.health_status, p.latency_ms,
        p.consecutive_failures, p.last_checked_at, p.last_error, p.tags_json, p.note,
@@ -116,7 +131,7 @@ ORDER BY a.enabled DESC, a.updated_at DESC, a.email ASC
 		_ = rows.Close()
 	}()
 	for rows.Next() {
-		auth, err := scanStoredAuth(rows, cfg, effectivePool, effectiveProfile, usageOverheadsJSON)
+		auth, err := scanStoredAuth(rows, cfg, effectivePool, poolConfigs, effectiveProfile, usageOverheadsJSON)
 		if err != nil {
 			return nil, err
 		}
@@ -162,10 +177,15 @@ func GetStoredAuth(ctx context.Context, configPath string, cfg *config.Config, a
 		return nil, err
 	}
 	effectivePool := EffectiveClaudeCodePool(doc.ClaudeCode)
+	poolConfigs, err := store.effectiveClaudeCodePools(ctx, effectivePool)
+	if err != nil {
+		return nil, err
+	}
 	effectiveProfile := EffectiveClaudeCodeProfile(doc.Profile)
 	usageOverheadsJSON := store.UsageOverheadMapJSON(ctx, effectivePool.Usage.ProfileFingerprint)
 	rows, err := store.db.QueryContext(ctx, `
-SELECT a.id, a.auth_id, a.cloak_user_id, a.auth_json, a.email, a.enabled, a.priority, COALESCE(a.proxy_resource_id, ''),
+SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, a.auth_json, a.email, a.enabled, a.health_status, a.blocked_until, a.blocked_reason, a.last_health_check_at, a.next_health_check_at,
+       a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.created_at, a.updated_at,
        p.id, p.name, p.proxy_url, p.exit_ip, p.enabled, p.health_status, p.latency_ms,
        p.consecutive_failures, p.last_checked_at, p.last_error, p.tags_json, p.note,
@@ -186,7 +206,7 @@ WHERE a.id = ? AND TRIM(a.auth_json) <> ''
 		}
 		return nil, sql.ErrNoRows
 	}
-	auth, err := scanStoredAuth(rows, cfg, effectivePool, effectiveProfile, usageOverheadsJSON)
+	auth, err := scanStoredAuth(rows, cfg, effectivePool, poolConfigs, effectiveProfile, usageOverheadsJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -206,20 +226,27 @@ WHERE a.id = ? AND TRIM(a.auth_json) <> ''
 
 func scanStoredAuth(rows interface {
 	Scan(dest ...interface{}) error
-}, cfg *config.Config, poolCfg EffectiveClaudeCodePoolConfig, profile EffectiveClaudeCodeProfileConfig, usageOverheadsJSON string) (*coreauth.Auth, error) {
-	var accountID, authID, cloakUserID, authJSON, email, proxyResourceID, note, excludedJSON, accountCreatedRaw, accountUpdatedRaw string
+}, cfg *config.Config, globalPoolCfg EffectiveClaudeCodePoolConfig, poolConfigs map[string]EffectiveClaudeCodePoolConfig, profile EffectiveClaudeCodeProfileConfig, usageOverheadsJSON string) (*coreauth.Auth, error) {
+	var accountID, poolID, authID, cloakUserID, authJSON, email, healthStatus, blockedReason, proxyResourceID, note, excludedJSON, accountCreatedRaw, accountUpdatedRaw string
 	var enabled, priority int
+	var blockedUntilRaw, lastHealthCheckRaw, nextHealthCheckRaw sql.NullString
 	var proxyID sql.NullString
 	var proxyName, proxyURL, proxyExitIP, proxyHealth, proxyLastError, proxyTagsJSON, proxyNote sql.NullString
 	var proxyEnabled, proxyLatencyMS, proxyFailures sql.NullInt64
 	var proxyLastChecked, proxyCreatedRaw, proxyUpdatedRaw sql.NullString
 	if err := rows.Scan(
 		&accountID,
+		&poolID,
 		&authID,
 		&cloakUserID,
 		&authJSON,
 		&email,
 		&enabled,
+		&healthStatus,
+		&blockedUntilRaw,
+		&blockedReason,
+		&lastHealthCheckRaw,
+		&nextHealthCheckRaw,
 		&priority,
 		&proxyResourceID,
 		&note,
@@ -252,13 +279,12 @@ func scanStoredAuth(rows interface {
 	}
 	metadata["resource_pool_account"] = true
 	metadata["resource_pool_type"] = "claude-code"
+	metadata["resource_pool_id"] = normalizeAccountPoolID(poolID)
 	if strings.TrimSpace(proxyResourceID) != "" {
 		metadata["proxy_resource_id"] = strings.TrimSpace(proxyResourceID)
 	}
-	disabled := enabled == 0
-	if rawDisabled, ok := metadata["disabled"].(bool); ok && rawDisabled {
-		disabled = true
-	}
+	healthStatus = normalizeAccountHealthStatus(healthStatus)
+	disabled := enabled == 0 || healthStatus == AccountHealthManualRecovery
 	status := coreauth.StatusActive
 	if disabled {
 		status = coreauth.StatusDisabled
@@ -280,13 +306,19 @@ func scanStoredAuth(rows interface {
 		}
 	}
 	attrs := map[string]string{
-		"source":            "resource-pool:claude-code-account",
-		"auth_kind":         "oauth",
-		AttrClaudeOAuthPool: "true",
-		AttrAccountID:       accountID,
+		"source":                "resource-pool:claude-code-account",
+		"auth_kind":             "oauth",
+		AttrClaudeOAuthPool:     "true",
+		AttrAccountID:           accountID,
+		AttrAccountPoolID:       normalizeAccountPoolID(poolID),
+		"proxy_resource_bound":  strconv.FormatBool(strings.TrimSpace(proxyResourceID) != ""),
+		"account_schedulable":   strconv.FormatBool(enabled != 0),
+		"account_health_status": healthStatus,
 	}
 	if strings.TrimSpace(proxyResourceID) != "" {
 		attrs[AttrProxyResourceID] = strings.TrimSpace(proxyResourceID)
+		attrs["proxy_resource_enabled"] = strconv.FormatBool(proxyEnabled.Valid && proxyEnabled.Int64 != 0)
+		attrs["proxy_resource_health_status"] = strings.TrimSpace(proxyHealth.String)
 	}
 	if priority != 0 {
 		attrs["priority"] = strconv.Itoa(priority)
@@ -310,6 +342,10 @@ func scanStoredAuth(rows interface {
 	if proxyID.Valid && strings.TrimSpace(proxyURL.String) != "" {
 		auth.ProxyURL = strings.TrimSpace(proxyURL.String)
 	}
+	poolCfg := globalPoolCfg
+	if scoped, ok := poolConfigs[normalizeAccountPoolID(poolID)]; ok {
+		poolCfg = scoped
+	}
 	applyClaudeCodePoolAttributes(auth, poolCfg, profile, cloakUserID)
 	applyClaudeCodeUsageOverheadsAttribute(auth, usageOverheadsJSON)
 	if auth.CreatedAt.IsZero() {
@@ -321,6 +357,18 @@ func scanStoredAuth(rows interface {
 	coreauth.ApplyCustomHeadersFromMetadata(auth)
 	ApplyExcludedModelsOverlay(auth, decodeStringList(excludedJSON))
 	applyOAuthExcludedModels(auth, cfg)
+	account := &ClaudeCodeAccount{
+		PoolID:            normalizeAccountPoolID(poolID),
+		AuthID:            auth.ID,
+		Schedulable:       enabled != 0,
+		Enabled:           enabled != 0,
+		HealthStatus:      healthStatus,
+		BlockedUntil:      parseNullTime(blockedUntilRaw),
+		BlockedReason:     blockedReason,
+		LastHealthCheckAt: parseNullTime(lastHealthCheckRaw),
+		NextHealthCheckAt: parseNullTime(nextHealthCheckRaw),
+	}
+	ApplyAccountLifecycleRouting(account)
 	return auth, nil
 }
 
@@ -332,11 +380,8 @@ func applyClaudeCodePoolAttributes(auth *coreauth.Auth, poolCfg EffectiveClaudeC
 		auth.Attributes = make(map[string]string)
 	}
 	auth.Attributes[claudeapipool.AttrOAuthPool] = "true"
-	if poolCfg.PureMode {
-		auth.Attributes[claudeapipool.AttrPureMode] = "true"
-	} else {
-		delete(auth.Attributes, claudeapipool.AttrPureMode)
-	}
+	auth.Attributes[claudeapipool.AttrPureMode] = strconv.FormatBool(poolCfg.PureMode)
+	auth.Attributes[AttrAllowClientCacheTTL] = strconv.FormatBool(poolCfg.AllowClientCacheTTL)
 	mode := strings.TrimSpace(poolCfg.Cloak.Mode)
 	if mode == "" {
 		mode = "auto"
@@ -355,7 +400,7 @@ func applyClaudeCodePoolAttributes(auth *coreauth.Auth, poolCfg EffectiveClaudeC
 		delete(auth.Attributes, "cloak_sensitive_words")
 	}
 	applyClaudeCodeProfileAttributes(auth, profile)
-	applyClaudeCodeUsageAttributes(auth, poolCfg.Usage)
+	applyClaudeCodeUsageAttributes(auth, poolCfg.Usage, profile)
 }
 
 func applyClaudeCodeProfileAttributes(auth *coreauth.Auth, profile EffectiveClaudeCodeProfileConfig) {
@@ -366,6 +411,7 @@ func applyClaudeCodeProfileAttributes(auth *coreauth.Auth, profile EffectiveClau
 		auth.Attributes = make(map[string]string)
 	}
 	auth.Attributes[AttrProfileManaged] = "true"
+	auth.Attributes[AttrProfileRevision] = strings.TrimSpace(profile.Revision)
 	auth.Attributes[AttrProfileVersion] = strings.TrimSpace(profile.Version)
 	auth.Attributes[AttrProfileUserAgent] = strings.TrimSpace(profile.UserAgent)
 	auth.Attributes[AttrProfileSystemPrompt] = strings.TrimSpace(profile.SystemPrompt)
@@ -378,6 +424,13 @@ func applyClaudeCodeProfileAttributes(auth *coreauth.Auth, profile EffectiveClau
 	} else {
 		delete(auth.Attributes, AttrProfileHeadersJSON)
 	}
+	if len(profile.HeaderOrder) > 0 {
+		if raw, err := json.Marshal(profile.HeaderOrder); err == nil {
+			auth.Attributes[AttrProfileHeaderOrderJSON] = string(raw)
+		}
+	} else {
+		delete(auth.Attributes, AttrProfileHeaderOrderJSON)
+	}
 	if len(profile.Betas) > 0 {
 		if raw, err := json.Marshal(profile.Betas); err == nil {
 			auth.Attributes[AttrProfileBetasJSON] = string(raw)
@@ -387,7 +440,7 @@ func applyClaudeCodeProfileAttributes(auth *coreauth.Auth, profile EffectiveClau
 	}
 }
 
-func applyClaudeCodeUsageAttributes(auth *coreauth.Auth, usage EffectiveClaudeCodeUsageConfig) {
+func applyClaudeCodeUsageAttributes(auth *coreauth.Auth, usage EffectiveClaudeCodeUsageConfig, profile EffectiveClaudeCodeProfileConfig) {
 	if auth == nil {
 		return
 	}
@@ -397,7 +450,7 @@ func applyClaudeCodeUsageAttributes(auth *coreauth.Auth, usage EffectiveClaudeCo
 	auth.Attributes[AttrCleanInputTokens] = strconv.FormatBool(usage.CleanInputTokens)
 	overhead := usage.SystemPromptOverheadTokens
 	if overhead <= 0 {
-		overhead = DefaultCleanInputOverheadTokens
+		overhead = ClaudeCodeProfileInjectedOverheadTokens(profile)
 	}
 	auth.Attributes[AttrCleanInputDefaultOverhead] = strconv.FormatInt(overhead, 10)
 	auth.Attributes[AttrProfileFingerprint] = strings.TrimSpace(usage.ProfileFingerprint)
@@ -428,7 +481,7 @@ func applyClaudeCodeCapacityAttributes(auth *coreauth.Auth, capacity *AccountCap
 	auth.Attributes[AttrCapacityBaseRPM] = strconv.Itoa(capacity.BaseRPM)
 	auth.Attributes[AttrCapacityConcurrencyLimit] = strconv.Itoa(capacity.ConcurrencyLimit)
 	auth.Attributes[AttrCapacityMaxSessions] = strconv.Itoa(capacity.MaxSessions)
-	auth.Attributes[AttrCapacityStickyBuffer] = strconv.Itoa(capacity.StickyBuffer)
+	auth.Attributes[AttrCapacityStickyReserve] = strconv.Itoa(capacity.StickyConcurrencyReserve)
 }
 
 func applyOAuthExcludedModels(auth *coreauth.Auth, cfg *config.Config) {

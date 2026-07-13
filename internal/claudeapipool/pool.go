@@ -95,6 +95,14 @@ type EffectiveVirtualCacheConfig struct {
 type RoutingConfig struct {
 	PerAccountRPM            int    `yaml:"per-account-rpm,omitempty" json:"per-account-rpm,omitempty"`
 	PerAccountConcurrency    int    `yaml:"per-account-concurrency,omitempty" json:"per-account-concurrency,omitempty"`
+	StickyConcurrencyReserve int    `yaml:"sticky-concurrency-reserve,omitempty" json:"sticky-concurrency-reserve,omitempty"`
+	MaxSessions              int    `yaml:"max-sessions,omitempty" json:"max-sessions,omitempty"`
+	StickyWaitMS             int    `yaml:"sticky-wait-ms,omitempty" json:"sticky-wait-ms,omitempty"`
+	FallbackWaitMS           int    `yaml:"fallback-wait-ms,omitempty" json:"fallback-wait-ms,omitempty"`
+	MaxWaitersPerAccount     int    `yaml:"max-waiters-per-account,omitempty" json:"max-waiters-per-account,omitempty"`
+	MaxWaitersGlobal         int    `yaml:"max-waiters-global,omitempty" json:"max-waiters-global,omitempty"`
+	SessionAffinityTTLMS     int    `yaml:"session-affinity-ttl-ms,omitempty" json:"session-affinity-ttl-ms,omitempty"`
+	ActiveSessionIdleTTLMS   int    `yaml:"active-session-idle-ttl-ms,omitempty" json:"active-session-idle-ttl-ms,omitempty"`
 	MaxSwitches              int    `yaml:"max-switches,omitempty" json:"max-switches,omitempty"`
 	SwitchDelayMS            int    `yaml:"switch-delay-ms,omitempty" json:"switch-delay-ms,omitempty"`
 	RateLimitCooldownMS      int    `yaml:"rate-limit-cooldown-ms,omitempty" json:"rate-limit-cooldown-ms,omitempty"`
@@ -119,7 +127,14 @@ type RoutingConfig struct {
 type EffectiveRoutingConfig struct {
 	PerAccountRPM            int    `json:"per_account_rpm"`
 	PerAccountConcurrency    int    `json:"per_account_concurrency"`
-	StickyBuffer             int    `json:"-"`
+	StickyConcurrencyReserve int    `json:"sticky_concurrency_reserve"`
+	MaxSessions              int    `json:"max_sessions"`
+	StickyWaitMS             int    `json:"sticky_wait_ms"`
+	FallbackWaitMS           int    `json:"fallback_wait_ms"`
+	MaxWaitersPerAccount     int    `json:"max_waiters_per_account"`
+	MaxWaitersGlobal         int    `json:"max_waiters_global"`
+	SessionAffinityTTLMS     int    `json:"session_affinity_ttl_ms"`
+	ActiveSessionIdleTTLMS   int    `json:"active_session_idle_ttl_ms"`
 	MaxSwitches              int    `json:"max_switches"`
 	SwitchDelayMS            int    `json:"switch_delay_ms"`
 	RateLimitCooldownMS      int    `json:"rate_limit_cooldown_ms"`
@@ -425,6 +440,30 @@ func NormalizeRoutingConfig(cfg RoutingConfig) RoutingConfig {
 	if cfg.PerAccountConcurrency < 0 {
 		cfg.PerAccountConcurrency = 0
 	}
+	if cfg.StickyConcurrencyReserve < 0 {
+		cfg.StickyConcurrencyReserve = 0
+	}
+	if cfg.MaxSessions < 0 {
+		cfg.MaxSessions = 0
+	}
+	if cfg.StickyWaitMS < 0 {
+		cfg.StickyWaitMS = 0
+	}
+	if cfg.FallbackWaitMS < 0 {
+		cfg.FallbackWaitMS = 0
+	}
+	if cfg.MaxWaitersPerAccount < 0 {
+		cfg.MaxWaitersPerAccount = 0
+	}
+	if cfg.MaxWaitersGlobal < 0 {
+		cfg.MaxWaitersGlobal = 0
+	}
+	if cfg.SessionAffinityTTLMS < 0 {
+		cfg.SessionAffinityTTLMS = 0
+	}
+	if cfg.ActiveSessionIdleTTLMS < 0 {
+		cfg.ActiveSessionIdleTTLMS = 0
+	}
 	if cfg.MaxSwitches < 0 {
 		cfg.MaxSwitches = 0
 	}
@@ -569,9 +608,49 @@ func EffectiveRouting(cfg RoutingConfig) EffectiveRoutingConfig {
 	if cacheAffinityTTLMS <= 0 {
 		cacheAffinityTTLMS = int((5 * time.Minute) / time.Millisecond)
 	}
+	stickyConcurrencyReserve := cfg.StickyConcurrencyReserve
+	if stickyConcurrencyReserve <= 0 {
+		stickyConcurrencyReserve = 1
+	}
+	maxSessions := cfg.MaxSessions
+	if maxSessions <= 0 {
+		maxSessions = 30
+	}
+	stickyWaitMS := cfg.StickyWaitMS
+	if stickyWaitMS <= 0 {
+		stickyWaitMS = 2000
+	}
+	fallbackWaitMS := cfg.FallbackWaitMS
+	if fallbackWaitMS <= 0 {
+		fallbackWaitMS = 500
+	}
+	maxWaitersPerAccount := cfg.MaxWaitersPerAccount
+	if maxWaitersPerAccount <= 0 {
+		maxWaitersPerAccount = 5
+	}
+	maxWaitersGlobal := cfg.MaxWaitersGlobal
+	if maxWaitersGlobal <= 0 {
+		maxWaitersGlobal = 200
+	}
+	sessionAffinityTTLMS := cfg.SessionAffinityTTLMS
+	if sessionAffinityTTLMS <= 0 {
+		sessionAffinityTTLMS = int(time.Hour / time.Millisecond)
+	}
+	activeSessionIdleTTLMS := cfg.ActiveSessionIdleTTLMS
+	if activeSessionIdleTTLMS <= 0 {
+		activeSessionIdleTTLMS = int((5 * time.Minute) / time.Millisecond)
+	}
 	return EffectiveRoutingConfig{
 		PerAccountRPM:            perAccountRPM,
 		PerAccountConcurrency:    perAccountConcurrency,
+		StickyConcurrencyReserve: stickyConcurrencyReserve,
+		MaxSessions:              maxSessions,
+		StickyWaitMS:             stickyWaitMS,
+		FallbackWaitMS:           fallbackWaitMS,
+		MaxWaitersPerAccount:     maxWaitersPerAccount,
+		MaxWaitersGlobal:         maxWaitersGlobal,
+		SessionAffinityTTLMS:     sessionAffinityTTLMS,
+		ActiveSessionIdleTTLMS:   activeSessionIdleTTLMS,
 		MaxSwitches:              maxSwitches,
 		SwitchDelayMS:            switchDelayMS,
 		RateLimitCooldownMS:      rateLimitCooldownMS,
@@ -620,6 +699,14 @@ func RoutingConfigFromEffective(cfg EffectiveRoutingConfig) RoutingConfig {
 	return NormalizeRoutingConfig(RoutingConfig{
 		PerAccountRPM:            cfg.PerAccountRPM,
 		PerAccountConcurrency:    cfg.PerAccountConcurrency,
+		StickyConcurrencyReserve: cfg.StickyConcurrencyReserve,
+		MaxSessions:              cfg.MaxSessions,
+		StickyWaitMS:             cfg.StickyWaitMS,
+		FallbackWaitMS:           cfg.FallbackWaitMS,
+		MaxWaitersPerAccount:     cfg.MaxWaitersPerAccount,
+		MaxWaitersGlobal:         cfg.MaxWaitersGlobal,
+		SessionAffinityTTLMS:     cfg.SessionAffinityTTLMS,
+		ActiveSessionIdleTTLMS:   cfg.ActiveSessionIdleTTLMS,
 		MaxSwitches:              cfg.MaxSwitches,
 		SwitchDelayMS:            cfg.SwitchDelayMS,
 		RateLimitCooldownMS:      cfg.RateLimitCooldownMS,

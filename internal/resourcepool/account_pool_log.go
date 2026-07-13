@@ -41,6 +41,12 @@ type AccountPoolLogEntry struct {
 	Concurrency     int            `json:"concurrency_limit,omitempty"`
 	RPMUsed         int            `json:"rpm_used,omitempty"`
 	RPMLimit        int            `json:"rpm_limit,omitempty"`
+	Attempt         int            `json:"attempt,omitempty"`
+	SwitchCount     int            `json:"switch_count,omitempty"`
+	WaitMS          int64          `json:"wait_ms,omitempty"`
+	AffinityMode    string         `json:"affinity_mode,omitempty"`
+	PrimaryHit      bool           `json:"primary_hit,omitempty"`
+	BackupLane      bool           `json:"backup_lane,omitempty"`
 	Decision        string         `json:"decision,omitempty"`
 	Reason          string         `json:"reason,omitempty"`
 	StatusCode      int            `json:"status_code,omitempty"`

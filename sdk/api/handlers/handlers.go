@@ -67,6 +67,8 @@ var apiErrorLogSensitiveValuePattern = regexp.MustCompile(`(?i)\b(authorization|
 
 type pinnedAuthContextKey struct{}
 type poolScopeContextKey struct{}
+type accountPoolIDContextKey struct{}
+type accountPoolAPIKeyIDContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
 type disallowFreeAuthContextKey struct{}
@@ -145,6 +147,22 @@ func WithPoolScope(ctx context.Context, scope string) context.Context {
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, poolScopeContextKey{}, scope)
+}
+
+// WithAccountPoolIdentity records the authenticated pool and generated-key IDs.
+func WithAccountPoolIdentity(ctx context.Context, poolID, apiKeyID string) context.Context {
+	poolID = strings.TrimSpace(poolID)
+	apiKeyID = strings.TrimSpace(apiKeyID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if poolID != "" {
+		ctx = context.WithValue(ctx, accountPoolIDContextKey{}, poolID)
+	}
+	if apiKeyID != "" {
+		ctx = context.WithValue(ctx, accountPoolAPIKeyIDContextKey{}, apiKeyID)
+	}
+	return ctx
 }
 
 // WithSelectedAuthIDCallback returns a child context that receives the selected auth ID.
@@ -393,6 +411,15 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if poolScope := poolScopeFromContext(ctx); poolScope != "" {
 		meta[coreexecutor.PoolScopeMetadataKey] = poolScope
 	}
+	if poolID := accountPoolIDFromContext(ctx); poolID != "" {
+		meta[coreexecutor.AccountPoolIDMetadataKey] = poolID
+	}
+	if apiKeyID := accountPoolAPIKeyIDFromContext(ctx); apiKeyID != "" {
+		meta[coreexecutor.AccountPoolAPIKeyIDMetadataKey] = apiKeyID
+	}
+	if billing := coreusage.AccountPoolBillingFromContext(ctx); billing.PriceVersionID > 0 {
+		meta[coreexecutor.AccountPoolPriceVersionMetadataKey] = billing.PriceVersionID
+	}
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
 		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
 	}
@@ -497,6 +524,22 @@ func poolScopeFromContext(ctx context.Context) string {
 	default:
 		return ""
 	}
+}
+
+func accountPoolIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx.Value(accountPoolIDContextKey{}).(string)
+	return strings.TrimSpace(value)
+}
+
+func accountPoolAPIKeyIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx.Value(accountPoolAPIKeyIDContextKey{}).(string)
+	return strings.TrimSpace(value)
 }
 
 func selectedAuthIDCallbackFromContext(ctx context.Context) func(string) {
@@ -664,6 +707,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	if c != nil && c.Request != nil {
 		requestCtx = c.Request.Context()
 	}
+	parentCtx = inheritRequestExecutionContext(parentCtx, requestCtx)
 
 	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {
 		if requestID := logging.GetRequestID(requestCtx); requestID != "" {
@@ -755,6 +799,34 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 
 		cancel()
 	}
+}
+
+func inheritRequestExecutionContext(parentCtx, requestCtx context.Context) context.Context {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	if requestCtx == nil {
+		return parentCtx
+	}
+	if authID := pinnedAuthIDFromContext(requestCtx); authID != "" {
+		parentCtx = WithPinnedAuthID(parentCtx, authID)
+	}
+	if scope := poolScopeFromContext(requestCtx); scope != "" {
+		parentCtx = WithPoolScope(parentCtx, scope)
+	}
+	parentCtx = WithAccountPoolIdentity(parentCtx, accountPoolIDFromContext(requestCtx), accountPoolAPIKeyIDFromContext(requestCtx))
+	billing := coreusage.AccountPoolBillingFromContext(requestCtx)
+	parentCtx = coreusage.WithAccountPoolBilling(parentCtx, billing.PoolID, billing.APIKeyID, billing.PriceVersionID)
+	if callback := selectedAuthIDCallbackFromContext(requestCtx); callback != nil {
+		parentCtx = WithSelectedAuthIDCallback(parentCtx, callback)
+	}
+	if sessionID := executionSessionIDFromContext(requestCtx); sessionID != "" {
+		parentCtx = WithExecutionSessionID(parentCtx, sessionID)
+	}
+	if disallowFreeAuthFromContext(requestCtx) {
+		parentCtx = WithDisallowFreeAuth(parentCtx)
+	}
+	return parentCtx
 }
 
 // StartNonStreamingKeepAlive emits blank lines every 5 seconds while waiting for a non-streaming response.

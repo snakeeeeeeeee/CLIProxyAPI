@@ -882,21 +882,26 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride_On403(t *testing.
 
 func TestManager_MarkResult_PoolAuth529UsesPoolCooldown(t *testing.T) {
 	m := NewManager(nil, nil, nil)
-	oldRouting := claudeapipool.CurrentRoutingConfig()
-	claudeapipool.SetRoutingConfig(claudeapipool.EffectiveRoutingConfig{
+	routingScope := cliproxyexecutor.ClaudeAccountPoolRoutingScope("default")
+	oldRouting := claudeapipool.CurrentScopedRoutingConfig(routingScope)
+	claudeapipool.SetScopedRoutingConfig(routingScope, claudeapipool.EffectiveRoutingConfig{
 		OverloadCooldownMS:      2500,
 		OverloadMaxCooldownMS:   2500,
 		RateLimitCooldownMS:     1000,
 		RateLimitMaxCooldownMS:  1000,
 		SameAccountRetryDelayMS: 1500,
 	})
-	t.Cleanup(func() { claudeapipool.SetRoutingConfig(oldRouting) })
+	t.Cleanup(func() {
+		claudeapipool.SetScopedRoutingConfig(routingScope, oldRouting)
+		claudeapipool.ResetScopedRouteCooling(routingScope, "pool-529")
+	})
 
 	auth := &Auth{
 		ID:       "pool-529",
 		Provider: "claude",
 		Attributes: map[string]string{
-			claudeapipool.AttrPool: "true",
+			claudeapipool.AttrOAuthPool:                "true",
+			cliproxyexecutor.AccountPoolIDAttributeKey: "default",
 		},
 	}
 	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
@@ -905,7 +910,8 @@ func TestManager_MarkResult_PoolAuth529UsesPoolCooldown(t *testing.T) {
 
 	model := "claude-opus"
 	before := time.Now()
-	m.MarkResult(context.Background(), Result{
+	requestContext := ContextWithClaudePoolScope(context.Background(), cliproxyexecutor.PoolScopeClaudeAccountPool)
+	m.MarkResult(requestContext, Result{
 		AuthID:   auth.ID,
 		Provider: "claude",
 		Model:    model,
@@ -924,7 +930,7 @@ func TestManager_MarkResult_PoolAuth529UsesPoolCooldown(t *testing.T) {
 	if !state.Unavailable || state.NextRetryAfter.Before(before.Add(2*time.Second)) || state.NextRetryAfter.After(before.Add(4*time.Second)) {
 		t.Fatalf("pool 529 cooldown = %v, want about 2.5s after %v", state.NextRetryAfter, before)
 	}
-	routeStatus := claudeapipool.RouteStatusFor(auth.ID, model)
+	routeStatus := claudeapipool.ScopedRouteStatusFor(routingScope, auth.ID, model)
 	if !routeStatus.Cooling {
 		t.Fatalf("route status should be cooling: %#v", routeStatus)
 	}

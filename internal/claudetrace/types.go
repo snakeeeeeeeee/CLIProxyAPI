@@ -7,13 +7,19 @@ import (
 )
 
 const (
-	SchemaVersion = 1
+	SchemaVersion = 3
 
 	SourceReal = "real"
 	SourceOurs = "ours"
 
 	RequestModeRealClaudeCodePassthrough = "real-claude-code-passthrough"
 	RequestModeAPIMimic                  = "api-mimic"
+
+	RequestKindInteractive      = "interactive"
+	RequestKindStructuredHelper = "structured-helper"
+	RequestKindCountTokens      = "count_tokens"
+	RequestKindToolFollowup     = "tool-followup"
+	RequestKindOther            = "other"
 
 	SeverityFatal          = "fatal"
 	SeverityWarn           = "warn"
@@ -37,24 +43,64 @@ type CaptureOptions struct {
 	ResponseError     string
 	Stream            bool
 	RequestMode       string
+	RequestKind       string
+	TLSProfile        string
+	TLSJA3            string
+	TLSJA4            string
+	TLSALPN           string
+	RawHeaderOrder    []string
 }
 
 type Trace struct {
-	SchemaVersion int               `json:"schema_version"`
-	Source        string            `json:"source"`
-	RequestMode   string            `json:"request_mode,omitempty"`
-	CapturedAt    time.Time         `json:"captured_at"`
-	Method        string            `json:"method"`
-	Path          string            `json:"path"`
-	Query         string            `json:"query,omitempty"`
-	URL           string            `json:"url,omitempty"`
-	Stream        bool              `json:"stream"`
-	StatusCode    int               `json:"status_code,omitempty"`
-	RequestID     string            `json:"request_id,omitempty"`
-	Headers       map[string]string `json:"headers"`
-	Body          any               `json:"body,omitempty"`
-	BodyShape     BodyShape         `json:"body_shape"`
-	ResponseError string            `json:"response_error,omitempty"`
+	SchemaVersion  int               `json:"schema_version"`
+	Source         string            `json:"source"`
+	RequestMode    string            `json:"request_mode,omitempty"`
+	RequestKind    string            `json:"request_kind,omitempty"`
+	CapturedAt     time.Time         `json:"captured_at"`
+	Method         string            `json:"method"`
+	Path           string            `json:"path"`
+	HTTPProtocol   string            `json:"http_protocol,omitempty"`
+	Accept         string            `json:"accept,omitempty"`
+	AcceptEncoding string            `json:"accept_encoding,omitempty"`
+	TLSProfile     string            `json:"tls_profile,omitempty"`
+	TLSFingerprint TLSFingerprint    `json:"tls_fingerprint"`
+	RawHeaderOrder []string          `json:"raw_header_order,omitempty"`
+	Stainless      StainlessTuple    `json:"stainless"`
+	Session        SessionInvariant  `json:"session"`
+	Query          string            `json:"query,omitempty"`
+	URL            string            `json:"url,omitempty"`
+	Stream         bool              `json:"stream"`
+	StatusCode     int               `json:"status_code,omitempty"`
+	RequestID      string            `json:"request_id,omitempty"`
+	Headers        map[string]string `json:"headers"`
+	Body           any               `json:"body,omitempty"`
+	BodyShape      BodyShape         `json:"body_shape"`
+	ResponseError  string            `json:"response_error,omitempty"`
+}
+
+type TLSFingerprint struct {
+	JA3  string `json:"ja3,omitempty"`
+	JA4  string `json:"ja4,omitempty"`
+	ALPN string `json:"alpn,omitempty"`
+}
+
+// SessionInvariant records only structural consistency. Session values are
+// intentionally excluded from trace files.
+type SessionInvariant struct {
+	HeaderPresent   bool `json:"header_present"`
+	MetadataPresent bool `json:"metadata_present"`
+	Match           bool `json:"match"`
+}
+
+type StainlessTuple struct {
+	Lang           string `json:"lang,omitempty"`
+	PackageVersion string `json:"package_version,omitempty"`
+	OS             string `json:"os,omitempty"`
+	Arch           string `json:"arch,omitempty"`
+	Runtime        string `json:"runtime,omitempty"`
+	RuntimeVersion string `json:"runtime_version,omitempty"`
+	RetryCount     string `json:"retry_count,omitempty"`
+	Timeout        string `json:"timeout,omitempty"`
 }
 
 type BodyShape struct {
@@ -64,6 +110,8 @@ type BodyShape struct {
 	SystemBlockCount     int        `json:"system_block_count"`
 	SystemTextHashes     []TextHash `json:"system_text_hashes,omitempty"`
 	BillingBlockKind     string     `json:"billing_block_kind,omitempty"`
+	BillingEntrypoint    string     `json:"billing_entrypoint,omitempty"`
+	BillingHasCCH        bool       `json:"billing_has_cch"`
 	MessageCount         int        `json:"message_count"`
 	UserTextHashes       []TextHash `json:"user_text_hashes,omitempty"`
 	ToolCount            int        `json:"tool_count"`

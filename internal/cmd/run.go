@@ -58,10 +58,6 @@ func StartServiceWithPluginHost(cfg *config.Config, configPath string, localPass
 	resourcepool.StartHealthChecker(runCtx, configPath, func() *config.Config {
 		return cfg
 	})
-	resourcepool.StartAccountQuotaRefresher(runCtx, configPath, func() *config.Config {
-		return cfg
-	})
-
 	service, err := builder.Build()
 	if err != nil {
 		log.Errorf("failed to build proxy service: %v", err)
@@ -98,10 +94,6 @@ func StartServiceBackgroundWithPluginHost(cfg *config.Config, configPath string,
 	resourcepool.StartHealthChecker(ctx, configPath, func() *config.Config {
 		return cfg
 	})
-	resourcepool.StartAccountQuotaRefresher(ctx, configPath, func() *config.Config {
-		return cfg
-	})
-
 	service, err := builder.Build()
 	if err != nil {
 		log.Errorf("failed to build proxy service: %v", err)

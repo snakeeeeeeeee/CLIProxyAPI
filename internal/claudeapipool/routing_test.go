@@ -82,10 +82,10 @@ func TestPoolRouterLimitsRPMAndConcurrencyPerAccount(t *testing.T) {
 	}
 }
 
-func TestPoolRouterStickyBufferExtendsAccountCapacity(t *testing.T) {
+func TestPoolRouterStickyReserveExtendsConcurrencyOnly(t *testing.T) {
 	router := newPoolRouter()
-	policy := EffectiveRouting(RoutingConfig{PerAccountRPM: 1, PerAccountConcurrency: 1})
-	policy.StickyBuffer = 1
+	policy := EffectiveRouting(RoutingConfig{PerAccountRPM: 3, PerAccountConcurrency: 1})
+	policy.StickyConcurrencyReserve = 1
 	now := time.Now()
 
 	lease, ok := router.tryAcquire("auth-1", "claude-opus", policy, false, now)
@@ -104,8 +104,8 @@ func TestPoolRouterStickyBufferExtendsAccountCapacity(t *testing.T) {
 	}
 
 	status := router.status("auth-1", "claude-opus", policy, now.Add(4*time.Second))
-	if status.RPMLimit != 2 || !status.Unavailable {
-		t.Fatalf("status with sticky buffer = %#v, want rpm limit 2 and unavailable", status)
+	if status.RPMLimit != 3 || !status.Unavailable {
+		t.Fatalf("status with sticky reserve = %#v, want rpm limit 3 and unavailable", status)
 	}
 	stickyLease.Release()
 	lease.Release()

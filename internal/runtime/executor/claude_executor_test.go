@@ -73,6 +73,36 @@ func assertClaudeFingerprint(t *testing.T, headers http.Header, userAgent, pkgVe
 	}
 }
 
+func TestClaudeCodeAccountPoolUsesBearerAuthAtAnthropic(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":           "sk-ant-oat-test",
+		"auth_kind":         "oauth",
+		"claude_oauth_pool": "true",
+	}}
+
+	prepareReq, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	if err := NewClaudeExecutor(&config.Config{}).PrepareRequest(prepareReq, auth); err != nil {
+		t.Fatalf("PrepareRequest() error = %v", err)
+	}
+	if got := prepareReq.Header.Get("Authorization"); got != "Bearer sk-ant-oat-test" || prepareReq.Header.Get("x-api-key") != "" {
+		t.Fatalf("PrepareRequest auth headers = Authorization %q x-api-key %q", got, prepareReq.Header.Get("x-api-key"))
+	}
+
+	headerReq := newClaudeHeaderTestRequest(t, nil)
+	if err := applyClaudeHeaders(headerReq, auth, "sk-ant-oat-test", false, nil, &config.Config{}, "claude-sonnet-4-6"); err != nil {
+		t.Fatalf("applyClaudeHeaders() error = %v", err)
+	}
+	if got := headerReq.Header.Get("Authorization"); got != "Bearer sk-ant-oat-test" || headerReq.Header.Get("x-api-key") != "" {
+		t.Fatalf("message auth headers = Authorization %q x-api-key %q", got, headerReq.Header.Get("x-api-key"))
+	}
+	if beta := headerReq.Header.Get("Anthropic-Beta"); !strings.Contains(beta, "oauth-2025-04-20") {
+		t.Fatalf("Anthropic-Beta = %q, want OAuth credential beta", beta)
+	}
+}
+
 func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true
@@ -1239,6 +1269,46 @@ func TestClaudeExecutor_ExecuteStreamStripsOpenAIEncryptedThinkingBeforeUpstream
 	}
 }
 
+func TestClaudeExecutor_ExecuteStreamAccountPoolDefaultsCacheTTLToOneHour(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":           "sk-ant-oat-test",
+		"base_url":          server.URL,
+		"claude_oauth_pool": "true",
+		"cloak_user_id":     helps.GenerateFakeUserID(),
+	}}
+	payload := []byte(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"5m"}}]}]}`)
+	result, err := NewClaudeExecutor(&config.Config{}).ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected chunk error: %v", chunk.Err)
+		}
+	}
+	for _, path := range []string{
+		"system.1.cache_control.ttl",
+		"system.2.cache_control.ttl",
+		"messages.0.content.0.cache_control.ttl",
+	} {
+		if got := gjson.GetBytes(seenBody, path).String(); got != "1h" {
+			t.Fatalf("%s = %q, want 1h; body=%s", path, got, seenBody)
+		}
+	}
+}
+
 func TestClaudeExecutor_ExecuteStreamDirectPassthroughEmitsCompleteSSEEvents(t *testing.T) {
 	firstData := `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`
 	secondData := `{"type":"message_stop"}`
@@ -1519,7 +1589,7 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolUsesBuiltinFullProfile(t *testing.T
 	if len(seenBody) == 0 {
 		t.Fatal("expected upstream body to be captured")
 	}
-	if seenUA != "claude-cli/2.1.178 (external, sdk-cli)" {
+	if seenUA != "claude-cli/2.1.207 (external, sdk-cli)" {
 		t.Fatalf("User-Agent = %q, want builtin Claude Code UA", seenUA)
 	}
 	if !strings.Contains(seenBeta, "claude-code-20250219") || strings.Contains(seenBeta, "oauth-2025-04-20") {
@@ -1531,14 +1601,17 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolUsesBuiltinFullProfile(t *testing.T
 		t.Fatalf("expected 3 builtin system blocks, got %d: %s", len(blocks), string(seenBody))
 	}
 	billingHeader := blocks[0].Get("text").String()
-	if !strings.HasPrefix(billingHeader, "x-anthropic-billing-header: cc_version=2.1.178.") {
-		t.Fatalf("billing header = %q, want builtin 2.1.178 header", billingHeader)
+	if !strings.HasPrefix(billingHeader, "x-anthropic-billing-header: cc_version=2.1.207.") {
+		t.Fatalf("billing header = %q, want builtin 2.1.207 header", billingHeader)
 	}
-	if strings.Contains(billingHeader, "cch=00000;") {
-		t.Fatalf("billing header should be signed before upstream, got %q", billingHeader)
+	if !strings.Contains(billingHeader, "cc_entrypoint=sdk-cli;") || strings.Contains(billingHeader, "cch=") {
+		t.Fatalf("billing header = %q, want sdk-cli without CCH", billingHeader)
 	}
-	if got := blocks[1].Get("text").String(); got != "You are Claude Code, Anthropic's official CLI for Claude." {
+	if got := blocks[1].Get("text").String(); got != "You are a Claude agent, built on Anthropic's Claude Agent SDK." {
 		t.Fatalf("identity block = %q", got)
+	}
+	if blocks[0].Get("cache_control").Exists() || blocks[1].Get("cache_control.type").String() != "ephemeral" || blocks[2].Get("cache_control.type").String() != "ephemeral" {
+		t.Fatalf("unexpected system cache layout: %s", seenBody)
 	}
 	if got := blocks[2].Get("text").String(); got != expectedClaudeCodeStaticPrompt() {
 		t.Fatalf("static prompt block did not use builtin full Claude Code prompt")
@@ -1557,8 +1630,8 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolUsesBuiltinFullProfile(t *testing.T
 	if !strings.HasPrefix(strings.TrimSpace(userID), "{") {
 		t.Fatalf("metadata.user_id = %q, want JSON format for builtin Claude Code profile", userID)
 	}
-	if got := gjson.GetBytes(seenBody, "messages.0.content").String(); !strings.Contains(got, "Use the available tools when needed") || strings.Contains(got, "Custom downstream system.") {
-		t.Fatalf("forwarded system reminder was not sanitized for OAuth account pool: %q", got)
+	if got := gjson.GetBytes(seenBody, "messages.0.content").String(); !strings.Contains(got, "Custom downstream system.") || !strings.Contains(got, "<system-reminder>") {
+		t.Fatalf("forwarded system reminder did not preserve client semantics: %q", got)
 	}
 }
 
@@ -1577,6 +1650,7 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolRequestShape(t *testing.T) {
 	executor := NewClaudeExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
 		"api_key":                    "sk-ant-oat-test",
+		"auth_kind":                  "oauth",
 		"base_url":                   server.URL,
 		"claude_oauth_pool":          "true",
 		"cloak_user_id":              "user_be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714_account_11111111-2222-4333-8444-555555555555_session_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
@@ -1592,28 +1666,36 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolRequestShape(t *testing.T) {
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	if seenHeaders.Get("User-Agent") != "claude-cli/2.1.178 (external, sdk-cli)" {
+	if seenHeaders.Get("User-Agent") != "claude-cli/2.1.207 (external, sdk-cli)" {
 		t.Fatalf("User-Agent = %q", seenHeaders.Get("User-Agent"))
 	}
 	if seenHeaders.Get("X-Client-Request-Id") != "" {
 		t.Fatalf("X-Client-Request-Id should not be synthesized for account pool: %q", seenHeaders.Get("X-Client-Request-Id"))
 	}
-	if seenHeaders.Get("Anthropic-Dangerous-Direct-Browser-Access") != "" {
-		t.Fatalf("browser access header should not be sent for account pool")
+	if seenHeaders.Get("Anthropic-Dangerous-Direct-Browser-Access") != "true" {
+		t.Fatalf("browser access header = %q, want true", seenHeaders.Get("Anthropic-Dangerous-Direct-Browser-Access"))
+	}
+	if seenHeaders.Get("X-Stainless-Os") != "MacOS" || seenHeaders.Get("X-Stainless-Arch") != "arm64" {
+		t.Fatalf("platform tuple = %q/%q, want MacOS/arm64", seenHeaders.Get("X-Stainless-Os"), seenHeaders.Get("X-Stainless-Arch"))
+	}
+	metadata, ok := helps.ParseClaudeCodeMetadataUserID(gjson.GetBytes(seenBody, "metadata.user_id").String())
+	if !ok || metadata.SessionID == "" || seenHeaders.Get("X-Claude-Code-Session-Id") != metadata.SessionID {
+		t.Fatalf("Session header = %q metadata = %+v", seenHeaders.Get("X-Claude-Code-Session-Id"), metadata)
 	}
 	beta := seenHeaders.Get("Anthropic-Beta")
 	for _, want := range []string{
 		"claude-code-20250219",
 		"mid-conversation-system-2026-04-07",
-		"advisor-tool-2026-03-01",
-		"effort-2025-11-24",
 	} {
 		if !strings.Contains(beta, want) {
 			t.Fatalf("Anthropic-Beta = %q, missing %q", beta, want)
 		}
 	}
-	if strings.Contains(beta, "oauth-2025-04-20") {
-		t.Fatalf("Anthropic-Beta = %q, should not force oauth beta", beta)
+	if !strings.Contains(beta, "oauth-2025-04-20") {
+		t.Fatalf("Anthropic-Beta = %q, missing OAuth credential beta", beta)
+	}
+	if strings.Contains(beta, "advisor-tool-2026-03-01") || strings.Contains(beta, "effort-2025-11-24") || strings.Contains(beta, "extended-cache-ttl-2025-04-11") {
+		t.Fatalf("Anthropic-Beta = %q, contains unsupported default beta", beta)
 	}
 	if strings.Contains(beta, "context-1m-2025-08-07") {
 		t.Fatalf("Anthropic-Beta = %q, should not add long-context beta by default", beta)
@@ -1655,7 +1737,7 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolRejectsSpoofedUAPassthrough(t *test
 		t.Fatalf("request mode = %q, want api mimic for spoofed metadata", got)
 	}
 	out := applyClaudeCodeAccountPoolProfile(ctx, auth, body, cliproxyexecutor.Request{Payload: body}, cliproxyexecutor.Options{})
-	if got := gjson.GetBytes(out, "system.1.text").String(); got != "You are Claude Code, Anthropic's official CLI for Claude." {
+	if got := gjson.GetBytes(out, "system.1.text").String(); got != "You are a Claude agent, built on Anthropic's Claude Agent SDK." {
 		t.Fatalf("spoofed request should be rebuilt as mimic, identity block=%q body=%s", got, out)
 	}
 }
@@ -1669,8 +1751,8 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolPassthroughKeepsClaudeCodeBody(t *t
 	body := []byte(`{
 		"model":"claude-opus-4-8",
 		"system":[
-			{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.181.abc; cc_entrypoint=cli; cch=12345;"},
-			{"type":"text","text":"client claude code identity"}
+			{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.207.abc; cc_entrypoint=sdk-cli;"},
+			{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK.","cache_control":{"type":"ephemeral"}}
 		],
 		"metadata":{"user_id":` + strconv.Quote(inboundUserID) + `},
 		"tools":[{"name":"Bash","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],
@@ -1680,9 +1762,11 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolPassthroughKeepsClaudeCodeBody(t *t
 		"messages":[{"role":"user","content":"hi"}]
 	}`)
 	headers := http.Header{
-		"User-Agent":        []string{"claude-cli/2.1.181 (external, sdk-cli)"},
-		"Anthropic-Version": []string{"2023-06-01"},
-		"X-App":             []string{"sdk-cli"},
+		"User-Agent":               []string{"claude-cli/2.1.207 (external, sdk-cli)"},
+		"Anthropic-Version":        []string{"2023-06-01"},
+		"X-App":                    []string{"sdk-cli"},
+		"Anthropic-Beta":           []string{"claude-code-20250219,interleaved-thinking-2025-05-14"},
+		"X-Claude-Code-Session-Id": []string{"33333333-3333-4333-8333-333333333333"},
 	}
 	req := httptest.NewRequest(http.MethodPost, "http://localhost/claude-acc-pool/v1/messages", nil)
 	req.Header = headers
@@ -1699,7 +1783,7 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolPassthroughKeepsClaudeCodeBody(t *t
 	if got := len(gjson.GetBytes(out, "system").Array()); got != 2 {
 		t.Fatalf("passthrough should keep system blocks, got %d body=%s", got, out)
 	}
-	if got := gjson.GetBytes(out, "system.1.text").String(); got != "client claude code identity" {
+	if got := gjson.GetBytes(out, "system.1.text").String(); got != "You are a Claude agent, built on Anthropic's Claude Agent SDK." {
 		t.Fatalf("system block was rewritten: %q body=%s", got, out)
 	}
 	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
@@ -1715,6 +1799,125 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolPassthroughKeepsClaudeCodeBody(t *t
 	}
 	if parsed.SessionID != "33333333-3333-4333-8333-333333333333" {
 		t.Fatalf("metadata session_id = %q, want inbound session preserved", parsed.SessionID)
+	}
+}
+
+func TestClaudeExecutor_ClaudeCodeAccountPoolPassthroughPreservesHeadersAndAppliesCachePolicy(t *testing.T) {
+	var seenBody []byte
+	var seenHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBody, _ = io.ReadAll(r.Body)
+		seenHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-opus-4-8","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	const sessionID = "33333333-3333-4333-8333-333333333333"
+	inboundUserID := `{"device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","account_uuid":"22222222-2222-4222-8222-222222222222","session_id":"` + sessionID + `"}`
+	payload := []byte(`{
+		"model":"claude-opus-4-8",
+		"max_tokens":64,
+		"system":[
+			{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.207.abc; cc_entrypoint=sdk-cli;"},
+			{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK.","cache_control":{"type":"ephemeral","ttl":"5m"}},
+			{"type":"text","text":"client stable prompt","cache_control":{"type":"ephemeral"}}
+		],
+		"metadata":{"user_id":` + strconv.Quote(inboundUserID) + `},
+		"tools":[{"name":"Read","input_schema":{"type":"object"}}],
+		"thinking":{"type":"adaptive"},
+		"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]},
+		"output_config":{"effort":"high"},
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	inboundHeaders := http.Header{
+		"User-Agent":                  []string{"claude-cli/2.1.207 (external, sdk-cli)"},
+		"Anthropic-Version":           []string{"2023-06-01"},
+		"Anthropic-Beta":              []string{"claude-code-20250219,effort-2025-11-24"},
+		"X-App":                       []string{"cli"},
+		"X-Claude-Code-Session-Id":    []string{sessionID},
+		"X-Stainless-Package-Version": []string{"0.94.0"},
+		"X-Stainless-Runtime":         []string{"node"},
+		"X-Stainless-Runtime-Version": []string{"v26.3.0"},
+		"Accept":                      []string{"application/json"},
+		"Accept-Encoding":             []string{"gzip, deflate, br, zstd"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/claude-acc-pool/v1/messages", nil)
+	req.Header = inboundHeaders
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = req
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":           "sk-ant-oat-test",
+		"auth_kind":         "oauth",
+		"base_url":          server.URL,
+		"claude_oauth_pool": "true",
+		"cloak_user_id":     "user_be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714_account_11111111-2222-4333-8444-555555555555_session_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+	}, Metadata: map[string]any{"account_uuid": "11111111-2222-4333-8444-555555555555"}}
+	if _, err := NewClaudeExecutor(&config.Config{}).Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	for _, key := range []string{"User-Agent", "Anthropic-Beta", "X-App", "X-Claude-Code-Session-Id", "X-Stainless-Package-Version", "X-Stainless-Runtime-Version", "Accept", "Accept-Encoding"} {
+		if seenHeaders.Get(key) != inboundHeaders.Get(key) {
+			t.Fatalf("header %s = %q, want %q", key, seenHeaders.Get(key), inboundHeaders.Get(key))
+		}
+	}
+	if strings.Contains(seenHeaders.Get("Anthropic-Beta"), "oauth-2025-04-20") {
+		t.Fatalf("passthrough injected OAuth beta: %q", seenHeaders.Get("Anthropic-Beta"))
+	}
+	if gjson.GetBytes(seenBody, "system.2.text").String() != "client stable prompt" ||
+		gjson.GetBytes(seenBody, "tools.0.name").String() != "Read" ||
+		gjson.GetBytes(seenBody, "tools.0.cache_control").Exists() ||
+		gjson.GetBytes(seenBody, "thinking.type").String() != "adaptive" ||
+		gjson.GetBytes(seenBody, "output_config.effort").String() != "high" {
+		t.Fatalf("passthrough body shape changed: %s", seenBody)
+	}
+	for _, path := range []string{"system.1.cache_control.ttl", "system.2.cache_control.ttl"} {
+		if got := gjson.GetBytes(seenBody, path).String(); got != "1h" {
+			t.Fatalf("%s = %q, want default 1h; body=%s", path, got, seenBody)
+		}
+	}
+	metadata, ok := helps.ParseClaudeCodeMetadataUserID(gjson.GetBytes(seenBody, "metadata.user_id").String())
+	if !ok || metadata.SessionID != sessionID || metadata.AccountUUID != "11111111-2222-4333-8444-555555555555" {
+		t.Fatalf("rewritten metadata = %+v, ok=%v", metadata, ok)
+	}
+}
+
+func TestClaudeExecutor_ClaudeCodeAccountPoolRequestModeCompatibility(t *testing.T) {
+	const sessionID = "33333333-3333-4333-8333-333333333333"
+	metadata := `{"device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","account_uuid":"22222222-2222-4222-8222-222222222222","session_id":"` + sessionID + `"}`
+	tests := []struct {
+		name    string
+		ua      string
+		billing string
+		want    string
+	}{
+		{name: "new no CCH", ua: "claude-cli/2.1.207 (external, sdk-cli)", billing: "x-anthropic-billing-header: cc_version=2.1.207.abc; cc_entrypoint=sdk-cli;", want: claudeAccountPoolModePassthrough},
+		{name: "legacy CCH", ua: "claude-cli/2.1.181 (external, sdk-cli)", billing: "x-anthropic-billing-header: cc_version=2.1.181.abc; cc_entrypoint=cli; cch=12345;", want: claudeAccountPoolModePassthrough},
+		{name: "version mismatch", ua: "claude-cli/2.1.207 (external, sdk-cli)", billing: "x-anthropic-billing-header: cc_version=2.1.181.abc; cc_entrypoint=cli; cch=12345;", want: claudeAccountPoolModeAPIMimic},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(`{"system":[{"type":"text","text":` + strconv.Quote(tt.billing) + `},{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."}],"metadata":{"user_id":` + strconv.Quote(metadata) + `},"messages":[{"role":"user","content":"hi"}]}`)
+			req := httptest.NewRequest(http.MethodPost, "http://localhost/claude-acc-pool/v1/messages", nil)
+			req.Header = http.Header{
+				"User-Agent":               []string{tt.ua},
+				"Anthropic-Version":        []string{"2023-06-01"},
+				"Anthropic-Beta":           []string{"claude-code-20250219"},
+				"X-App":                    []string{"cli"},
+				"X-Claude-Code-Session-Id": []string{sessionID},
+			}
+			ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ginCtx.Request = req
+			ctx := context.WithValue(context.Background(), "gin", ginCtx)
+			if got := claudeCodeAccountPoolRequestMode(ctx, body); got != tt.want {
+				t.Fatalf("request mode = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1772,21 +1975,51 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolPreservesCachedSystemBlocks(t *test
 		t.Fatal("expected upstream body to be captured")
 	}
 	blocks := gjson.GetBytes(seenBody, "system").Array()
-	if len(blocks) != 4 {
-		t.Fatalf("expected 3 injected blocks plus 1 cached block, got %d: %s", len(blocks), seenBody)
-	}
-	if got := blocks[3].Get("text").String(); got != "CACHE_ME" {
-		t.Fatalf("cached system block text = %q, want CACHE_ME; body=%s", got, seenBody)
-	}
-	if got := blocks[3].Get("cache_control.type").String(); got != "ephemeral" {
-		t.Fatalf("cached system block cache_control.type = %q, want ephemeral; body=%s", got, seenBody)
+	if len(blocks) != 3 {
+		t.Fatalf("expected only 3 injected blocks, got %d: %s", len(blocks), seenBody)
 	}
 	userContent := gjson.GetBytes(seenBody, "messages.0.content").String()
-	if strings.Contains(userContent, "CACHE_ME") {
-		t.Fatalf("cached system block should not be moved into user content: %q", userContent)
+	if !strings.Contains(userContent, "CACHE_ME") || !strings.Contains(userContent, "Do not cache this plain instruction.") {
+		t.Fatalf("client system semantics were not moved into the reminder: %q", userContent)
 	}
-	if !strings.Contains(userContent, "Use the available tools when needed") || strings.Contains(userContent, "Do not cache this plain instruction.") {
-		t.Fatalf("plain system reminder was not sanitized for OAuth account pool: %q", userContent)
+	for _, path := range []string{"system.1.cache_control.ttl", "system.2.cache_control.ttl"} {
+		if got := gjson.GetBytes(seenBody, path).String(); got != "1h" {
+			t.Fatalf("%s = %q, want 1h: %s", path, got, seenBody)
+		}
+	}
+}
+
+func TestClaudeExecutor_ClaudeCodeAccountPoolAllowsExplicitClientCacheTTL(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-opus-4-8","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":                            "sk-ant-oat-test",
+		"base_url":                           server.URL,
+		"claude_oauth_pool":                  "true",
+		"cloak_user_id":                      helps.GenerateFakeUserID(),
+		resourcepool.AttrAllowClientCacheTTL: "true",
+	}}
+	payload := []byte(`{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"5m"}}]}]}`)
+	if _, err := NewClaudeExecutor(&config.Config{}).Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	for _, path := range []string{"system.1.cache_control.ttl", "system.2.cache_control.ttl"} {
+		if got := gjson.GetBytes(seenBody, path).String(); got != "1h" {
+			t.Fatalf("%s = %q, want default 1h; body=%s", path, got, seenBody)
+		}
+	}
+	if got := gjson.GetBytes(seenBody, "messages.0.content.0.cache_control.ttl").String(); got != "5m" {
+		t.Fatalf("explicit client TTL = %q, want 5m; body=%s", got, seenBody)
 	}
 }
 
@@ -1822,28 +2055,32 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolPreservesExplicitLongContextBeta(t 
 func TestClaudeExecutor_ClaudeCodeAccountPoolModelSpecificBetas(t *testing.T) {
 	tests := []struct {
 		model   string
+		body    []byte
 		want    []string
 		notWant []string
 	}{
 		{
 			model:   "claude-haiku-4-5-20251001",
-			want:    []string{"interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "claude-code-20250219", "advisor-tool-2026-03-01"},
-			notWant: []string{"context-1m-2025-08-07", "effort-2025-11-24", "mid-conversation-system-2026-04-07"},
+			body:    []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+			want:    []string{"interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05"},
+			notWant: []string{"claude-code-20250219", "context-1m-2025-08-07", "effort-2025-11-24", "mid-conversation-system-2026-04-07", "advisor-tool-2026-03-01"},
 		},
 		{
 			model:   "claude-sonnet-4-6",
-			want:    []string{"claude-code-20250219", "interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "advisor-tool-2026-03-01", "effort-2025-11-24"},
-			notWant: []string{"context-1m-2025-08-07", "mid-conversation-system-2026-04-07"},
+			body:    []byte(`{"output_config":{"effort":"high"}}`),
+			want:    []string{"claude-code-20250219", "interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "effort-2025-11-24"},
+			notWant: []string{"context-1m-2025-08-07", "mid-conversation-system-2026-04-07", "advisor-tool-2026-03-01"},
 		},
 		{
 			model:   "claude-opus-4-8",
-			want:    []string{"claude-code-20250219", "interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "mid-conversation-system-2026-04-07", "advisor-tool-2026-03-01", "effort-2025-11-24"},
-			notWant: []string{"context-1m-2025-08-07"},
+			body:    []byte(`{"output_config":{"format":{"type":"json_schema"}}}`),
+			want:    []string{"claude-code-20250219", "interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "mid-conversation-system-2026-04-07", "structured-outputs-2025-12-15"},
+			notWant: []string{"context-1m-2025-08-07", "effort-2025-11-24", "advisor-tool-2026-03-01"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.model, func(t *testing.T) {
-			beta := strings.Join(claudeCodeAccountPoolBetasForModel(tt.model), ",")
+			beta := strings.Join(claudeCodeAccountPoolBetasForModel(tt.model, tt.body), ",")
 			for _, want := range tt.want {
 				if !strings.Contains(beta, want) {
 					t.Fatalf("beta %q missing %q", beta, want)
@@ -1855,6 +2092,26 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolModelSpecificBetas(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestClaudeExecutor_ClaudeCodeAccountPoolFinalBetasFilterUnsupportedClientFlags(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	betas := strings.Join(claudeCodeAccountPoolFinalBetas("claude-sonnet-4-6", body, []string{
+		"context-1m-2025-08-07",
+		"advisor-tool-2026-03-01",
+		"oauth-2025-04-20",
+		"extended-cache-ttl-2025-04-11",
+		"effort-2025-11-24",
+		"structured-outputs-2025-12-15",
+	}), ",")
+	if !strings.Contains(betas, "context-1m-2025-08-07") {
+		t.Fatalf("final betas = %q, want explicit long-context beta", betas)
+	}
+	for _, unsupported := range []string{"advisor-tool-2026-03-01", "oauth-2025-04-20", "extended-cache-ttl-2025-04-11", "effort-2025-11-24", "structured-outputs-2025-12-15"} {
+		if strings.Contains(betas, unsupported) {
+			t.Fatalf("final betas = %q, should not contain unsupported %q", betas, unsupported)
+		}
 	}
 }
 
@@ -1877,7 +2134,7 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolThinkingPreservesClientIntent(t *te
 	}
 }
 
-func TestClaudeExecutor_ClaudeCodeAccountPoolSessionIDIsStableByConversation(t *testing.T) {
+func TestClaudeExecutor_ClaudeCodeAccountPoolSessionIDIsRandomWithoutExplicitSession(t *testing.T) {
 	var userIDs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1932,11 +2189,24 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolSessionIDIsStableByConversation(t *
 	if first.DeviceID != second.DeviceID || first.AccountUUID != second.AccountUUID {
 		t.Fatalf("account identity changed across calls: first=%+v second=%+v", first, second)
 	}
-	if first.SessionID != second.SessionID {
-		t.Fatalf("same conversation session_id changed: %q vs %q", first.SessionID, second.SessionID)
+	if first.SessionID == second.SessionID {
+		t.Fatalf("requests without explicit session reused session_id %q", first.SessionID)
 	}
-	if first.SessionID == third.SessionID {
-		t.Fatalf("different conversation reused session_id %q", first.SessionID)
+	if first.SessionID == third.SessionID || second.SessionID == third.SessionID {
+		t.Fatalf("request-level sessions were reused: first=%q second=%q third=%q", first.SessionID, second.SessionID, third.SessionID)
+	}
+}
+
+func TestClaudeExecutor_ClaudeCodeAccountPoolExplicitSessionIsStable(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		resourcepool.AttrAccountID: "account-a",
+	}}
+	payload := []byte(`{"conversation_id":"conversation-123","messages":[{"role":"user","content":"hi"}]}`)
+	req := cliproxyexecutor.Request{Payload: payload}
+	first := claudeCodeAccountPoolSessionID(context.Background(), auth, payload, req, cliproxyexecutor.Options{})
+	second := claudeCodeAccountPoolSessionID(context.Background(), auth, payload, req, cliproxyexecutor.Options{})
+	if first == "" || second != first {
+		t.Fatalf("explicit session IDs = %q/%q, want a stable derived session", first, second)
 	}
 }
 
@@ -1948,7 +2218,7 @@ func TestClaudeExecutor_CleanInputTokensRewriteNonStream(t *testing.T) {
 		"claude_code_usage_overheads_json":                `{"claude-opus-4-8":1909}`,
 	}}
 	payload := []byte(`{"usage":{"input_tokens":1910,"output_tokens":7,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"iterations":[{"input_tokens":1908,"output_tokens":13,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"type":"message"}]},"debug":{"input_tokens":1910}}`)
-	rewritten := rewriteClaudeUsageForCleanInput(auth, "claude-opus-4-8", payload, false, 0)
+	rewritten := rewriteClaudeUsageForCleanInput(auth, "claude-opus-4-8", payload, false, newClaudeCleanUsagePolicy(auth, false, payload, 0))
 	if got := gjson.GetBytes(rewritten, "usage.input_tokens").Int(); got != 1 {
 		t.Fatalf("input_tokens = %d, want 1; payload=%s", got, rewritten)
 	}
@@ -2067,7 +2337,7 @@ func TestClaudeExecutor_CleanInputTokensKeepsMinimumOne(t *testing.T) {
 		"claude_code_clean_input_default_overhead_tokens": "1909",
 	}}
 	payload := []byte(`{"usage":{"input_tokens":10,"output_tokens":1}}`)
-	rewritten := rewriteClaudeUsageForCleanInput(auth, "claude-3-5-haiku-latest", payload, false, 0)
+	rewritten := rewriteClaudeUsageForCleanInput(auth, "claude-3-5-haiku-latest", payload, false, newClaudeCleanUsagePolicy(auth, false, payload, 0))
 	if got := gjson.GetBytes(rewritten, "usage.input_tokens").Int(); got != 1 {
 		t.Fatalf("input_tokens = %d, want minimum 1", got)
 	}
@@ -2080,7 +2350,7 @@ func TestClaudeExecutor_CleanInputTokensDisabledDoesNotRewrite(t *testing.T) {
 		"claude_code_clean_input_default_overhead_tokens": "1909",
 	}}
 	payload := []byte(`{"usage":{"input_tokens":1910,"output_tokens":1}}`)
-	rewritten := rewriteClaudeUsageForCleanInput(auth, "claude-opus-4-8", payload, false, 0)
+	rewritten := rewriteClaudeUsageForCleanInput(auth, "claude-opus-4-8", payload, false, newClaudeCleanUsagePolicy(auth, false, payload, 0))
 	if string(rewritten) != string(payload) {
 		t.Fatalf("payload rewritten while disabled: %s", rewritten)
 	}
@@ -2093,13 +2363,109 @@ func TestClaudeExecutor_CleanInputTokensRewriteStreamMessageUsage(t *testing.T) 
 		"claude_code_clean_input_default_overhead_tokens": "1909",
 	}}
 	line := []byte(`data: {"type":"message_start","message":{"usage":{"input_tokens":1910,"output_tokens":0,"iterations":[{"input_tokens":1908,"output_tokens":13,"type":"message"}]}}}`)
-	rewritten := rewriteClaudeStreamUsageForCleanInput(auth, "claude-opus-4-8", line, 0)
+	rewritten := rewriteClaudeStreamUsageForCleanInput(auth, "claude-opus-4-8", line, newClaudeCleanUsagePolicy(auth, false, line, 0))
 	payload := strings.TrimSpace(strings.TrimPrefix(string(rewritten), "data:"))
 	if got := gjson.Get(payload, "message.usage.input_tokens").Int(); got != 1 {
 		t.Fatalf("stream message input_tokens = %d, want 1; line=%s", got, rewritten)
 	}
 	if got := gjson.Get(payload, "message.usage.iterations.0.input_tokens").Int(); got != 1 {
 		t.Fatalf("stream iterations input_tokens = %d, want 1; line=%s", got, rewritten)
+	}
+}
+
+func TestClaudeExecutor_PureModeCleansGatewayOwnedCacheUsage(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"claude_oauth_pool":                               "true",
+		claudeapipool.AttrPureMode:                        "true",
+		"claude_code_clean_input_default_overhead_tokens": "18387",
+	}}
+	payload := []byte(`{"usage":{"input_tokens":78,"cache_creation_input_tokens":2386,"cache_read_input_tokens":15933,"cache_creation":{"ephemeral_5m_input_tokens":2386,"ephemeral_1h_input_tokens":0},"iterations":[{"input_tokens":78,"output_tokens":191,"cache_read_input_tokens":15933,"cache_creation_input_tokens":2386,"cache_creation":{"ephemeral_5m_input_tokens":2386,"ephemeral_1h_input_tokens":0},"type":"message"}],"output_tokens":191}}`)
+	policy := claudeCleanUsagePolicy{Enabled: true, VisibleInputFloor: 10}
+
+	rewritten := rewriteClaudeUsageForCleanInput(auth, "claude-opus-4-8", payload, false, policy)
+	for _, path := range []string{
+		"usage.input_tokens",
+		"usage.iterations.0.input_tokens",
+	} {
+		if got := gjson.GetBytes(rewritten, path).Int(); got != 10 {
+			t.Fatalf("%s = %d, want 10; payload=%s", path, got, rewritten)
+		}
+	}
+	for _, path := range []string{
+		"usage.cache_creation_input_tokens",
+		"usage.cache_read_input_tokens",
+		"usage.cache_creation.ephemeral_5m_input_tokens",
+		"usage.cache_creation.ephemeral_1h_input_tokens",
+		"usage.iterations.0.cache_creation_input_tokens",
+		"usage.iterations.0.cache_read_input_tokens",
+		"usage.iterations.0.cache_creation.ephemeral_5m_input_tokens",
+		"usage.iterations.0.cache_creation.ephemeral_1h_input_tokens",
+	} {
+		if got := gjson.GetBytes(rewritten, path).Int(); got != 0 {
+			t.Fatalf("%s = %d, want 0; payload=%s", path, got, rewritten)
+		}
+	}
+	if got := gjson.GetBytes(rewritten, "usage.output_tokens").Int(); got != 191 {
+		t.Fatalf("output_tokens = %d, want unchanged 191", got)
+	}
+}
+
+func TestClaudeExecutor_PureModeDoesNotMoveUncalibratedGatewayCacheIntoInput(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"claude_oauth_pool":                               "true",
+		claudeapipool.AttrPureMode:                        "true",
+		"claude_code_clean_input_default_overhead_tokens": "1049",
+	}}
+	payload := []byte(`{"usage":{"input_tokens":12,"cache_creation_input_tokens":0,"cache_read_input_tokens":1620,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":4}}`)
+	policy := claudeCleanUsagePolicy{Enabled: true, VisibleInputFloor: 7}
+
+	rewritten := rewriteClaudeUsageForCleanInput(auth, "claude-opus-4-8", payload, false, policy)
+	if got := gjson.GetBytes(rewritten, "usage.input_tokens").Int(); got != 12 {
+		t.Fatalf("input_tokens = %d, want original uncached input 12; payload=%s", got, rewritten)
+	}
+	if got := gjson.GetBytes(rewritten, "usage.cache_creation_input_tokens").Int(); got != 0 {
+		t.Fatalf("cache_creation_input_tokens = %d, want 0; payload=%s", got, rewritten)
+	}
+	if got := gjson.GetBytes(rewritten, "usage.cache_read_input_tokens").Int(); got != 0 {
+		t.Fatalf("cache_read_input_tokens = %d, want 0; payload=%s", got, rewritten)
+	}
+}
+
+func TestClaudeExecutor_PureModePreservesClientOwnedCacheRemainder(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"claude_oauth_pool":                               "true",
+		claudeapipool.AttrPureMode:                        "true",
+		"claude_code_clean_input_default_overhead_tokens": "100",
+	}}
+	payload := []byte(`{"usage":{"input_tokens":20,"cache_creation_input_tokens":80,"cache_read_input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":80,"ephemeral_1h_input_tokens":0},"output_tokens":5}}`)
+	policy := claudeCleanUsagePolicy{Enabled: true, PreserveClientCache: true}
+
+	rewritten := rewriteClaudeUsageForCleanInput(auth, "claude-opus-4-8", payload, false, policy)
+	if got := gjson.GetBytes(rewritten, "usage.input_tokens").Int(); got != 20 {
+		t.Fatalf("input_tokens = %d, want 20; payload=%s", got, rewritten)
+	}
+	if got := gjson.GetBytes(rewritten, "usage.cache_read_input_tokens").Int(); got != 0 {
+		t.Fatalf("cache_read_input_tokens = %d, want 0; payload=%s", got, rewritten)
+	}
+	if got := gjson.GetBytes(rewritten, "usage.cache_creation_input_tokens").Int(); got != 30 {
+		t.Fatalf("cache_creation_input_tokens = %d, want 30; payload=%s", got, rewritten)
+	}
+	if got := gjson.GetBytes(rewritten, "usage.cache_creation.ephemeral_5m_input_tokens").Int(); got != 30 {
+		t.Fatalf("ephemeral_5m_input_tokens = %d, want 30; payload=%s", got, rewritten)
+	}
+}
+
+func TestClaudeExecutor_PureModeDoesNotCleanPassthroughUsage(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"claude_oauth_pool":        "true",
+		claudeapipool.AttrPureMode: "true",
+	}}
+	payload := []byte(`{"usage":{"input_tokens":78,"cache_creation_input_tokens":2386,"cache_read_input_tokens":15933,"output_tokens":1}}`)
+	policy := newClaudeCleanUsagePolicy(auth, true, payload, 10)
+
+	rewritten := rewriteClaudeUsageForCleanInput(auth, "claude-opus-4-8", payload, false, policy)
+	if string(rewritten) != string(payload) {
+		t.Fatalf("passthrough usage was rewritten: %s", rewritten)
 	}
 }
 
@@ -2295,6 +2661,49 @@ func TestNormalizeCacheControlTTL_DowngradesLaterOneHourBlocks(t *testing.T) {
 	}
 	if gjson.GetBytes(out, "messages.0.content.0.cache_control.ttl").Exists() {
 		t.Fatalf("messages.0.content.0.cache_control.ttl should be removed after a default-5m block")
+	}
+}
+
+func TestApplyClaudeCodeAccountPoolCacheTTLPolicyDefaultsAllBreakpointsToOneHour(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"claude_oauth_pool": "true"}}
+	payload := []byte(`{
+		"cache_control":{"type":"ephemeral"},
+		"tools":[{"name":"Read","cache_control":{"type":"ephemeral","ttl":"5m"}}],
+		"system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]
+	}`)
+	out := applyClaudeCodeAccountPoolCacheTTLPolicy(auth, payload)
+	for _, path := range []string{
+		"cache_control.ttl",
+		"tools.0.cache_control.ttl",
+		"system.0.cache_control.ttl",
+		"messages.0.content.0.cache_control.ttl",
+	} {
+		if got := gjson.GetBytes(out, path).String(); got != "1h" {
+			t.Fatalf("%s = %q, want 1h; body=%s", path, got, out)
+		}
+	}
+}
+
+func TestApplyClaudeCodeAccountPoolCacheTTLPolicyAllowsExplicitClientTTL(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"claude_oauth_pool":                  "true",
+		resourcepool.AttrAllowClientCacheTTL: "true",
+	}}
+	payload := []byte(`{
+		"cache_control":{"type":"ephemeral"},
+		"tools":[{"name":"Read","cache_control":{"type":"ephemeral","ttl":"5m"}}],
+		"system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]
+	}`)
+	out := applyClaudeCodeAccountPoolCacheTTLPolicy(auth, payload)
+	if got := gjson.GetBytes(out, "tools.0.cache_control.ttl").String(); got != "5m" {
+		t.Fatalf("explicit client TTL = %q, want 5m; body=%s", got, out)
+	}
+	for _, path := range []string{"cache_control.ttl", "system.0.cache_control.ttl", "messages.0.content.0.cache_control.ttl"} {
+		if got := gjson.GetBytes(out, path).String(); got != "1h" {
+			t.Fatalf("%s = %q, want default 1h; body=%s", path, got, out)
+		}
 	}
 }
 
@@ -2496,6 +2905,11 @@ func TestClaudeExecutor_CountTokens_StripsAccountPoolMetadata(t *testing.T) {
 	}
 	if got := gjson.GetBytes(seenBody, "system.2.text").String(); !strings.Contains(got, helps.ClaudeCodeIntro) {
 		t.Fatalf("count_tokens account-pool body missing Claude Code static prompt: %s", seenBody)
+	}
+	for _, path := range []string{"system.1.cache_control.ttl", "system.2.cache_control.ttl"} {
+		if got := gjson.GetBytes(seenBody, path).String(); got != "1h" {
+			t.Fatalf("%s = %q, want 1h: %s", path, got, seenBody)
+		}
 	}
 }
 

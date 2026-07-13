@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -123,6 +124,24 @@ func TestProxyAndStore(ctx context.Context, store *Store, proxyID string, health
 		return nil, errUpdate
 	}
 	PublishProxyChanged(proxy.ID, "health")
+	routingScope := ""
+	var boundPoolID string
+	if err := store.db.QueryRowContext(ctx, `SELECT pool_id FROM claude_code_accounts WHERE proxy_resource_id = ?`, proxy.ID).Scan(&boundPoolID); err == nil {
+		routingScope = AccountRoutingScope(boundPoolID)
+	}
+	if result.HealthStatus == HealthHealthy {
+		if routingScope != "" {
+			claudeapipool.ClearScopedProxyBlock(routingScope, proxy.ID)
+		}
+	} else if result.HealthStatus == HealthUnhealthy {
+		cooldown := healthCfg.Interval * 2
+		if cooldown < 10*time.Minute {
+			cooldown = 10 * time.Minute
+		}
+		if routingScope != "" {
+			claudeapipool.BlockScopedProxy(routingScope, proxy.ID, cooldown)
+		}
+	}
 	if errTest != nil {
 		return result, errTest
 	}

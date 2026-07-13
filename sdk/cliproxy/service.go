@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/resourcepool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
@@ -30,6 +31,7 @@ import (
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -678,6 +680,27 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	}
 	s.completeModelRegistrationForAuth(ctx, auth)
 	s.syncPluginRuntime(ctx)
+}
+
+func (s *Service) syncRefreshedResourcePoolAuth(ctx context.Context, auth *coreauth.Auth) error {
+	if s == nil || s.coreManager == nil {
+		return fmt.Errorf("core auth manager is unavailable")
+	}
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return fmt.Errorf("refreshed auth is missing an id")
+	}
+	existing, ok := s.coreManager.GetByID(auth.ID)
+	if !ok || existing == nil {
+		return fmt.Errorf("runtime auth %s is unavailable", auth.ID)
+	}
+	updated := auth.Clone()
+	updated.CreatedAt = existing.CreatedAt
+	if _, err := s.coreManager.Update(coreauth.WithSkipPersist(ctx), updated); err != nil {
+		return err
+	}
+	routingScope := coreexecutor.ClaudeAccountPoolRoutingScope(auth.Attributes[coreexecutor.AccountPoolIDAttributeKey])
+	claudeapipool.ClearScopedAccountBlock(routingScope, auth.ID)
+	return nil
 }
 
 func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth *coreauth.Auth) *coreauth.Auth {
@@ -1765,6 +1788,14 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		log.Info("file watcher started for config and auth directory changes")
 		s.syncPluginModelRuntime(ctx)
+	}
+
+	if s.cfg != nil && s.cfg.ResourcePools.Enabled && !homeEnabled {
+		resourcepool.StartAccountQuotaRefresher(ctx, s.configPath, func() *config.Config {
+			s.cfgMu.RLock()
+			defer s.cfgMu.RUnlock()
+			return s.cfg
+		}, s.syncRefreshedResourcePoolAuth)
 	}
 
 	s.registerModelRefreshCallback()

@@ -52,3 +52,21 @@ export function successRate(runtime?: AccountRuntime) {
 export function tagsText(tags?: string[]) {
   return tags?.filter(Boolean).join(", ") || "-";
 }
+
+export function formatTokens(value = 0) {
+  if (!Number.isFinite(value) || value <= 0) return "0";
+  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(value >= 10_000_000_000 ? 1 : 2)}B`;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 1 : 2)}K`;
+  return Math.round(value).toLocaleString("zh-CN");
+}
+
+export function formatUSD(value = 0) {
+  if (!Number.isFinite(value)) return "$0.00";
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: value < 1 ? 4 : 2 }).format(value);
+}
+
+export function formatPercent(value = 0) {
+  if (!Number.isFinite(value)) return "0%";
+  return `${value.toFixed(value >= 99 || Number.isInteger(value) ? 0 : 1)}%`;
+}

@@ -14,6 +14,10 @@ const (
 	EventModelChanged  = "model_changed"
 	EventConfigChanged = "config_changed"
 	EventStatsChanged  = "stats_changed"
+	EventSessionKeyJob = "session_key_job_changed"
+	EventPoolChanged   = "pool_changed"
+	EventAPIKeyChanged = "api_key_changed"
+	EventPricingChange = "pricing_changed"
 )
 
 // Event is a lightweight notification that tells management clients which
@@ -62,6 +66,22 @@ func PublishConfigChanged(action string) {
 
 func PublishStatsChanged(action string) {
 	PublishEvent(Event{Type: EventStatsChanged, Resource: "stats", Action: action})
+}
+
+func PublishSessionKeyJobChanged(id, action string) {
+	PublishEvent(Event{Type: EventSessionKeyJob, Resource: "session_key_job", ID: id, Action: action})
+}
+
+func PublishPoolChanged(id, action string) {
+	PublishEvent(Event{Type: EventPoolChanged, Resource: "account_pool", ID: id, Action: action})
+}
+
+func PublishAPIKeyChanged(id, action string) {
+	PublishEvent(Event{Type: EventAPIKeyChanged, Resource: "api_key", ID: id, Action: action})
+}
+
+func PublishPricingChanged(id, action string) {
+	PublishEvent(Event{Type: EventPricingChange, Resource: "model_price", ID: id, Action: action})
 }
 
 func (h *eventHub) subscribe(ctx context.Context) (<-chan Event, func()) {

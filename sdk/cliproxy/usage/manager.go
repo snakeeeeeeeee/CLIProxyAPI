@@ -51,19 +51,51 @@ type Failure struct {
 
 // Detail holds the token usage breakdown.
 type Detail struct {
-	InputTokens         int64
-	OutputTokens        int64
-	ReasoningTokens     int64
-	CachedTokens        int64
-	CacheReadTokens     int64
-	CacheCreationTokens int64
-	TotalTokens         int64
-	ResponseServiceTier string
+	InputTokens           int64
+	OutputTokens          int64
+	ReasoningTokens       int64
+	CachedTokens          int64
+	CacheReadTokens       int64
+	CacheCreationTokens   int64
+	CacheCreation5mTokens int64
+	CacheCreation1hTokens int64
+	TotalTokens           int64
+	ResponseServiceTier   string
 }
 
 type requestedModelAliasContextKey struct{}
 type reasoningEffortContextKey struct{}
 type serviceTierContextKey struct{}
+type accountPoolBillingContextKey struct{}
+
+// AccountPoolBillingIdentity carries non-secret accounting dimensions through retries.
+type AccountPoolBillingIdentity struct {
+	PoolID         string
+	APIKeyID       string
+	PriceVersionID int64
+}
+
+// WithAccountPoolBilling pins account-pool billing identity to a request context.
+func WithAccountPoolBilling(ctx context.Context, poolID, apiKeyID string, priceVersionID int64) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	identity := AccountPoolBillingIdentity{
+		PoolID:         strings.TrimSpace(poolID),
+		APIKeyID:       strings.TrimSpace(apiKeyID),
+		PriceVersionID: priceVersionID,
+	}
+	return context.WithValue(ctx, accountPoolBillingContextKey{}, identity)
+}
+
+// AccountPoolBillingFromContext returns the pinned non-secret billing identity.
+func AccountPoolBillingFromContext(ctx context.Context) AccountPoolBillingIdentity {
+	if ctx == nil {
+		return AccountPoolBillingIdentity{}
+	}
+	identity, _ := ctx.Value(accountPoolBillingContextKey{}).(AccountPoolBillingIdentity)
+	return identity
+}
 
 // WithRequestedModelAlias stores the client-requested model name for usage sinks.
 func WithRequestedModelAlias(ctx context.Context, alias string) context.Context {

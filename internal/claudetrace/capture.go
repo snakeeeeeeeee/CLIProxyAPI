@@ -15,12 +15,13 @@ import (
 )
 
 var sensitiveHeaders = map[string]bool{
-	"authorization":       true,
-	"x-api-key":           true,
-	"api-key":             true,
-	"proxy-authorization": true,
-	"cookie":              true,
-	"set-cookie":          true,
+	"authorization":            true,
+	"x-api-key":                true,
+	"api-key":                  true,
+	"proxy-authorization":      true,
+	"cookie":                   true,
+	"set-cookie":               true,
+	"x-claude-code-session-id": true,
 }
 
 func CaptureRequest(req *http.Request, opts CaptureOptions) Trace {
@@ -28,23 +29,35 @@ func CaptureRequest(req *http.Request, opts CaptureOptions) Trace {
 		SchemaVersion: SchemaVersion,
 		Source:        strings.TrimSpace(opts.Source),
 		RequestMode:   strings.TrimSpace(opts.RequestMode),
+		RequestKind:   strings.TrimSpace(opts.RequestKind),
 		CapturedAt:    time.Now().UTC(),
 		Headers:       RedactHeaders(nil),
 		Stream:        opts.Stream,
 		StatusCode:    opts.StatusCode,
 		ResponseError: strings.TrimSpace(opts.ResponseError),
+		TLSProfile:    strings.TrimSpace(opts.TLSProfile),
+		TLSFingerprint: TLSFingerprint{
+			JA3:  strings.TrimSpace(opts.TLSJA3),
+			JA4:  strings.TrimSpace(opts.TLSJA4),
+			ALPN: strings.TrimSpace(opts.TLSALPN),
+		},
+		RawHeaderOrder: normalizeHeaderOrder(opts.RawHeaderOrder),
 	}
 	if trace.Source == "" {
 		trace.Source = SourceReal
 	}
 	if req != nil {
 		trace.Method = req.Method
+		trace.HTTPProtocol = req.Proto
 		if req.URL != nil {
 			trace.Path = req.URL.Path
 			trace.Query = req.URL.RawQuery
 			trace.URL = redactURL(req.URL)
 		}
 		trace.Headers = RedactHeaders(req.Header)
+		trace.Accept = req.Header.Get("Accept")
+		trace.AcceptEncoding = req.Header.Get("Accept-Encoding")
+		trace.Stainless = stainlessTuple(req.Header)
 		if !trace.Stream {
 			trace.Stream = requestLooksStreaming(req.Header, opts.RequestBody)
 		}
@@ -52,10 +65,88 @@ func CaptureRequest(req *http.Request, opts CaptureOptions) Trace {
 	trace.RequestID = requestID(opts.ResponseHeaders)
 	trace.Body = RedactBody(opts.RequestBody, opts.RedactUserContent)
 	trace.BodyShape = BuildBodyShape(opts.RequestBody)
+	trace.Session = buildSessionInvariant(req, opts.RequestBody)
+	if trace.RequestKind == "" {
+		trace.RequestKind = InferRequestKind(trace.Path, opts.RequestBody)
+	}
 	if trace.RequestMode == "" {
 		trace.RequestMode = InferRequestMode(trace.Headers, trace.BodyShape)
 	}
 	return trace
+}
+
+func buildSessionInvariant(req *http.Request, body []byte) SessionInvariant {
+	headerSession := ""
+	if req != nil {
+		headerSession = strings.TrimSpace(req.Header.Get("X-Claude-Code-Session-Id"))
+	}
+	metadataSession := metadataSessionID(gjson.GetBytes(body, "metadata.user_id").String())
+	return SessionInvariant{
+		HeaderPresent:   headerSession != "",
+		MetadataPresent: metadataSession != "",
+		Match:           headerSession != "" && metadataSession != "" && strings.EqualFold(headerSession, metadataSession),
+	}
+}
+
+func metadataSessionID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if gjson.Valid(value) {
+		return strings.TrimSpace(gjson.Get(value, "session_id").String())
+	}
+	const marker = "_session_"
+	if index := strings.LastIndex(strings.ToLower(value), marker); index >= 0 {
+		return strings.TrimSpace(value[index+len(marker):])
+	}
+	return ""
+}
+
+func normalizeHeaderOrder(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		key := strings.ToLower(value)
+		if value == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+// InferRequestKind separates interactive requests from helper and follow-up traffic.
+func InferRequestKind(path string, body []byte) string {
+	if strings.HasSuffix(strings.TrimSpace(path), "/messages/count_tokens") {
+		return RequestKindCountTokens
+	}
+	if !strings.HasSuffix(strings.TrimSpace(path), "/messages") || !gjson.ValidBytes(body) {
+		return RequestKindOther
+	}
+	messages := gjson.GetBytes(body, "messages")
+	toolFollowup := false
+	messages.ForEach(func(_, message gjson.Result) bool {
+		content := message.Get("content")
+		content.ForEach(func(_, part gjson.Result) bool {
+			kind := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+			if kind == "tool_use" || kind == "tool_result" {
+				toolFollowup = true
+				return false
+			}
+			return true
+		})
+		return !toolFollowup
+	})
+	if toolFollowup {
+		return RequestKindToolFollowup
+	}
+	if gjson.GetBytes(body, "output_config.format").Exists() && len(gjson.GetBytes(body, "tools").Array()) == 0 {
+		return RequestKindStructuredHelper
+	}
+	return RequestKindInteractive
 }
 
 func InferRequestMode(headers map[string]string, shape BodyShape) string {
@@ -126,6 +217,8 @@ func BuildBodyShape(raw []byte) BodyShape {
 		SystemBlockCount:     countSystemBlocks(root.Get("system")),
 		SystemTextHashes:     systemTextHashes(root.Get("system")),
 		BillingBlockKind:     billingBlockKind(root.Get("system")),
+		BillingEntrypoint:    billingEntrypoint(root.Get("system")),
+		BillingHasCCH:        billingHasCCH(root.Get("system")),
 		MessageCount:         len(root.Get("messages").Array()),
 		UserTextHashes:       userTextHashes(root.Get("messages")),
 		ToolCount:            len(root.Get("tools").Array()),
@@ -137,6 +230,19 @@ func BuildBodyShape(raw []byte) BodyShape {
 		TopLevelKeys:         topLevelKeys(root),
 	}
 	return shape
+}
+
+func stainlessTuple(headers http.Header) StainlessTuple {
+	return StainlessTuple{
+		Lang:           headers.Get("X-Stainless-Lang"),
+		PackageVersion: headers.Get("X-Stainless-Package-Version"),
+		OS:             headers.Get("X-Stainless-OS"),
+		Arch:           headers.Get("X-Stainless-Arch"),
+		Runtime:        headers.Get("X-Stainless-Runtime"),
+		RuntimeVersion: headers.Get("X-Stainless-Runtime-Version"),
+		RetryCount:     headers.Get("X-Stainless-Retry-Count"),
+		Timeout:        headers.Get("X-Stainless-Timeout"),
+	}
 }
 
 func redactJSONValue(value any, path string) any {
@@ -151,6 +257,13 @@ func redactJSONValue(value any, path string) any {
 			lower := strings.ToLower(key)
 			if lower == "authorization" || lower == "x-api-key" || lower == "api_key" || lower == "access_token" || lower == "refresh_token" {
 				out[key] = "<redacted>"
+				continue
+			}
+			if strings.EqualFold(childPath, "metadata.user_id") {
+				out[key] = map[string]any{
+					"redacted": true,
+					"kind":     metadataUserIDKind(fmt.Sprint(child)),
+				}
 				continue
 			}
 			if shouldRedactText(childPath, key, child) {
@@ -332,6 +445,31 @@ func billingBlockKind(system gjson.Result) string {
 		return "billing_no_cch"
 	}
 	return "none"
+}
+
+func billingEntrypoint(system gjson.Result) string {
+	first := system.Get("0.text").String()
+	if first == "" && system.Type == gjson.String {
+		first = system.String()
+	}
+	const marker = "cc_entrypoint="
+	index := strings.Index(first, marker)
+	if index < 0 {
+		return ""
+	}
+	value := first[index+len(marker):]
+	if end := strings.IndexByte(value, ';'); end >= 0 {
+		value = value[:end]
+	}
+	return strings.TrimSpace(value)
+}
+
+func billingHasCCH(system gjson.Result) bool {
+	first := system.Get("0.text").String()
+	if first == "" && system.Type == gjson.String {
+		first = system.String()
+	}
+	return strings.Contains(first, "cch=")
 }
 
 func metadataUserIDKind(value string) string {

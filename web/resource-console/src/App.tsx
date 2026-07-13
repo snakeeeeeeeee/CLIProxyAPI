@@ -8,10 +8,12 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
+  ArrowRightLeft,
   ArrowRight,
   Cable,
   Check,
   CheckCircle2,
+  CircleHelp,
   Clock3,
   Database,
   Download,
@@ -24,10 +26,13 @@ import {
   FileText,
   Home,
   KeyRound,
+  LayoutGrid,
   Link2Off,
+  List,
   Loader2,
   LogIn,
   LogOut,
+  MoreHorizontal,
   Network,
   Play,
   Plus,
@@ -35,13 +40,14 @@ import {
   Search,
   Settings2,
   ShieldAlert,
-  SlidersHorizontal,
   Trash2,
   Unlink,
   UserRoundCog,
-  UsersRound
+  UsersRound,
+  X
 } from "lucide-react";
-import { FormEvent, ReactNode, RefObject, UIEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, ReactNode, RefObject, UIEvent, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   AccountRow,
   AccountAvailabilitySummary,
@@ -49,12 +55,16 @@ import {
   AccountCapacity,
   AccountModelStatus,
   AccountQuota,
+  QuotaWindowState,
   ClaudeCodeAccount,
   ClaudeCodeProfileResponse,
   ClaudeCodeProfileSnapshot,
-  CloakEffectiveConfig,
   ClaudeCodeModel,
   ClaudeCodeModelPayload,
+  ClaudeCodeAccountPool,
+  ClaudeCodePoolAPIKey,
+  ModelPriceVersion,
+  UsageWindow,
   ClaudeCodePoolConfigResponse,
   ClaudeCodePoolEffectiveConfig,
   ClaudeCodePoolRawConfig,
@@ -69,13 +79,13 @@ import {
   RoutingEvent,
   UsageSummary,
   UsageCalibrationResponse,
-  VirtualCacheEffectiveConfig,
   api,
   getManagementKey,
   isManagementAuthError,
   managementEventsURL,
   setManagementKey
 } from "./api";
+import { AppShell, type ConsoleSection } from "./components/AppShell";
 import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
@@ -91,13 +101,21 @@ import { Label } from "./components/ui/label";
 import { Progress } from "./components/ui/progress";
 import { Select } from "./components/ui/select";
 import { Textarea } from "./components/ui/textarea";
-import { formatTime, healthText, proxyDisplay, successRate } from "./format";
+import { formatTime, formatUSD, healthText, proxyDisplay, successRate } from "./format";
 import { cn } from "./lib/utils";
+import { OverviewPage } from "./pages/OverviewPage";
+import { PoolsPage } from "./pages/PoolsPage";
+import { APIKeysPage } from "./pages/APIKeysPage";
+import { ModelPricingPage } from "./pages/ModelPricingPage";
+import { PoolDetailPage, type PoolDetailTab } from "./pages/PoolDetailPage";
+import { PoolEventsPage } from "./pages/PoolEventsPage";
+import { PoolStrategyPage } from "./pages/PoolStrategyPage";
 
-type View = "home" | "accounts" | "proxies";
+type View = "overview" | "pools" | "pool" | "api-keys" | "proxies" | "models" | "settings";
 type Route = View | "login";
+const routingEventsPageSize = 20;
 type ModalState =
-  | { type: "oauth" }
+  | { type: "oauth"; poolID: string }
   | { type: "proxy"; proxy?: ProxyResource }
   | { type: "import" }
   | { type: "bind"; account: ClaudeCodeAccount }
@@ -109,16 +127,30 @@ interface ToastState {
   tone: "default" | "danger";
 }
 
-function routeFromHash(): Route {
-  const normalized = window.location.hash.replace(/^#\/?/, "").split("?")[0].split("&")[0];
-  if (normalized === "accounts" || normalized === "proxies" || normalized === "login") {
-    return normalized;
-  }
-  return "home";
+interface RouteLocation {
+  route: Route;
+  poolID: string;
+  poolTab: PoolDetailTab;
 }
 
-function routeHash(route: Route) {
-  return route === "home" ? "#/" : `#/${route}`;
+function routeFromHash(): RouteLocation {
+  const normalized = window.location.hash.replace(/^#\/?/, "").split("?")[0].split("&")[0];
+  const parts = normalized.split("/").filter(Boolean).map(decodeURIComponent);
+  if (parts[0] === "pools" && parts[1]) {
+    const tab = (["overview", "accounts", "api-keys", "events", "strategy"] as PoolDetailTab[]).includes(parts[2] as PoolDetailTab) ? parts[2] as PoolDetailTab : "overview";
+    return { route: "pool", poolID: parts[1], poolTab: tab };
+  }
+  if (parts[0] === "accounts") return { route: "pool", poolID: "default", poolTab: "accounts" };
+  if (["pools", "api-keys", "proxies", "models", "settings", "login"].includes(parts[0])) {
+    return { route: parts[0] as Route, poolID: "", poolTab: "overview" };
+  }
+  return { route: "overview", poolID: "", poolTab: "overview" };
+}
+
+function routeHash(location: RouteLocation) {
+  if (location.route === "overview") return "#/";
+  if (location.route === "pool") return `#/pools/${encodeURIComponent(location.poolID || "default")}/${location.poolTab}`;
+  return `#/${location.route}`;
 }
 
 function emitHashChange() {
@@ -129,14 +161,14 @@ function emitHashChange() {
   }
 }
 
-function replaceHashRoute(route: Route) {
-  const hash = routeHash(route);
+function replaceHashRoute(location: RouteLocation) {
+  const hash = routeHash(location);
   window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${hash}`);
   emitHashChange();
 }
 
-function pushHashRoute(route: Route) {
-  const hash = routeHash(route);
+function pushHashRoute(location: RouteLocation) {
+  const hash = routeHash(location);
   if (window.location.hash === hash) {
     emitHashChange();
     return;
@@ -146,20 +178,24 @@ function pushHashRoute(route: Route) {
 
 function App() {
   const initialManagementKey = getManagementKey();
-  const [route, setRoute] = useState<Route>(() => (initialManagementKey.trim() ? routeFromHash() : "login"));
-  const [afterLoginRoute, setAfterLoginRoute] = useState<View>(() => {
-    const initialRoute = routeFromHash();
-    return initialRoute === "login" ? "home" : initialRoute;
-  });
+  const initialLocation = routeFromHash();
+  const [location, setLocation] = useState<RouteLocation>(() => initialManagementKey.trim() ? initialLocation : { route: "login", poolID: "", poolTab: "overview" });
+  const [afterLoginRoute, setAfterLoginRoute] = useState<RouteLocation>(() => initialLocation.route === "login" ? { route: "overview", poolID: "", poolTab: "overview" } : initialLocation);
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>("30d");
+  const [routingEventsPage, setRoutingEventsPage] = useState(1);
   const [authRequired, setAuthRequired] = useState(false);
   const [managementKey, setManagementKeyState] = useState(initialManagementKey);
   const [modal, setModal] = useState<ModalState>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
   const queryClient = useQueryClient();
+  const route = location.route;
   const hasManagementKey = managementKey.trim().length > 0;
   const dataEnabled = hasManagementKey && !authRequired && route !== "login";
-  const view: View = route === "login" ? afterLoginRoute : route;
-  const accountDataEnabled = dataEnabled && view === "accounts";
+  const activeLocation = route === "login" ? afterLoginRoute : location;
+  const view = activeLocation.route as View;
+  const currentPoolID = view === "pool" ? (activeLocation.poolID || "default") : "";
+  const poolListUsageWindow: UsageWindow = view === "overview" ? usageWindow : "all";
+  const accountDataEnabled = dataEnabled && (view === "pool" || view === "settings");
 
   const showToast = (message: string, tone: ToastState["tone"] = "default") => {
     setToast({ message, tone });
@@ -168,7 +204,7 @@ function App() {
   };
 
   useEffect(() => {
-    const syncRoute = () => setRoute(routeFromHash());
+    const syncRoute = () => setLocation(routeFromHash());
     syncRoute();
     window.addEventListener("hashchange", syncRoute);
     return () => window.removeEventListener("hashchange", syncRoute);
@@ -177,44 +213,65 @@ function App() {
   useEffect(() => {
     if (!hasManagementKey) {
       if (route !== "login") {
-        setAfterLoginRoute(view);
+        setAfterLoginRoute(activeLocation);
       }
-      replaceHashRoute("login");
+      replaceHashRoute({ route: "login", poolID: "", poolTab: "overview" });
     }
-  }, [hasManagementKey, route, view]);
+  }, [hasManagementKey, route, activeLocation]);
+
+  useEffect(() => {
+    setRoutingEventsPage(1);
+  }, [currentPoolID, usageWindow]);
 
   const configQuery = useQuery({ queryKey: ["resource-config"], queryFn: api.config, enabled: dataEnabled });
-  const accountsQuery = useQuery({ queryKey: ["accounts"], queryFn: api.accounts, enabled: dataEnabled });
+  const poolsQuery = useQuery({ queryKey: ["account-pools", poolListUsageWindow], queryFn: () => api.accountPools(poolListUsageWindow), enabled: dataEnabled });
+  const accountsQuery = useQuery({ queryKey: ["accounts", currentPoolID, "30d"], queryFn: () => api.accounts(currentPoolID, "30d"), enabled: accountDataEnabled });
+  const apiKeysQuery = useQuery({ queryKey: ["pool-api-keys", currentPoolID, "all"], queryFn: () => api.poolAPIKeys(currentPoolID, "all"), enabled: dataEnabled });
   const proxiesQuery = useQuery({ queryKey: ["proxies"], queryFn: api.proxies, enabled: dataEnabled });
   const availableQuery = useQuery({ queryKey: ["available-proxies"], queryFn: api.availableProxies, enabled: dataEnabled });
   const poolConfigQuery = useQuery({ queryKey: ["account-pool-config"], queryFn: api.poolConfig, enabled: accountDataEnabled });
-  const poolProfileQuery = useQuery({ queryKey: ["account-pool-profile"], queryFn: api.poolProfile, enabled: accountDataEnabled });
+  const poolStrategyQuery = useQuery({
+    queryKey: ["account-pool-strategy", currentPoolID],
+    queryFn: () => api.accountPoolConfig(currentPoolID),
+    enabled: dataEnabled && view === "pool" && activeLocation.poolTab === "strategy" && currentPoolID.length > 0
+  });
+  const poolProfileQuery = useQuery({ queryKey: ["account-pool-profile"], queryFn: api.poolProfile, enabled: dataEnabled && view === "settings" });
   const profileSnapshotsQuery = useQuery({
     queryKey: ["account-pool-profile-snapshots"],
     queryFn: api.profileSnapshots,
-    enabled: accountDataEnabled
+    enabled: dataEnabled && view === "settings"
   });
-  const poolStatsQuery = useQuery({ queryKey: ["account-pool-stats"], queryFn: api.poolStats, enabled: accountDataEnabled, refetchInterval: 30_000 });
-  const poolModelsQuery = useQuery({ queryKey: ["account-pool-models"], queryFn: api.poolModels, enabled: accountDataEnabled });
-  const usageSummaryQuery = useQuery({ queryKey: ["account-pool-usage"], queryFn: api.usageSummary, enabled: accountDataEnabled, refetchInterval: 30_000 });
-  const routingEventsQuery = useQuery({ queryKey: ["account-pool-routing-events"], queryFn: api.routingEvents, enabled: accountDataEnabled, refetchInterval: 30_000 });
-  const logConfigQuery = useQuery({ queryKey: ["account-pool-log-config"], queryFn: api.poolLogConfig, enabled: accountDataEnabled });
-  const poolLogsQuery = useQuery({ queryKey: ["account-pool-logs"], queryFn: api.poolLogs, enabled: accountDataEnabled, refetchInterval: 30_000 });
+  const poolStatsQuery = useQuery({ queryKey: ["account-pool-stats", currentPoolID, usageWindow], queryFn: () => api.poolStats(currentPoolID, usageWindow), enabled: dataEnabled && (view === "overview" || view === "pool"), refetchInterval: 30_000 });
+  const poolModelsQuery = useQuery({ queryKey: ["account-pool-models"], queryFn: api.poolModels, enabled: dataEnabled && (view === "pool" || view === "models" || view === "settings") });
+  const modelPricesQuery = useQuery({ queryKey: ["model-prices"], queryFn: api.modelPrices, enabled: dataEnabled && (view === "models" || view === "pool") });
+  const usageSummaryQuery = useQuery({ queryKey: ["account-pool-usage", currentPoolID, usageWindow], queryFn: () => api.usageSummary(currentPoolID, usageWindow), enabled: dataEnabled && (view === "overview" || view === "pool"), refetchInterval: 30_000 });
+  const routingEventsQuery = useQuery({
+    queryKey: ["account-pool-routing-events", currentPoolID, usageWindow, routingEventsPage],
+    queryFn: () => api.routingEvents(currentPoolID, usageWindow, routingEventsPage, routingEventsPageSize),
+    enabled: dataEnabled && view === "pool" && activeLocation.poolTab === "events",
+    refetchInterval: 30_000
+  });
+  const logConfigQuery = useQuery({ queryKey: ["account-pool-log-config"], queryFn: api.poolLogConfig, enabled: dataEnabled && view === "settings" });
+  const poolLogsQuery = useQuery({ queryKey: ["account-pool-logs"], queryFn: api.poolLogs, enabled: dataEnabled && view === "settings", refetchInterval: 30_000 });
   const usageCalibrationsQuery = useQuery({
     queryKey: ["account-pool-usage-calibrations"],
     queryFn: api.usageCalibrations,
-    enabled: accountDataEnabled
+    enabled: dataEnabled && view === "settings"
   });
   const authError = [
     configQuery.error,
+    poolsQuery.error,
     accountsQuery.error,
+    apiKeysQuery.error,
     proxiesQuery.error,
     availableQuery.error,
     poolConfigQuery.error,
+    poolStrategyQuery.error,
     poolProfileQuery.error,
     profileSnapshotsQuery.error,
     poolStatsQuery.error,
     poolModelsQuery.error,
+    modelPricesQuery.error,
     usageSummaryQuery.error,
     routingEventsQuery.error,
     logConfigQuery.error,
@@ -230,22 +287,26 @@ function App() {
     setManagementKey("");
     setManagementKeyState("");
     if (route !== "login") {
-      setAfterLoginRoute(view);
-      replaceHashRoute("login");
+      setAfterLoginRoute(activeLocation);
+      replaceHashRoute({ route: "login", poolID: "", poolTab: "overview" });
     }
-  }, [authError, route, view]);
+  }, [authError, route, activeLocation]);
 
   const invalidateAll = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["resource-config"] }),
+      queryClient.invalidateQueries({ queryKey: ["account-pools"] }),
       queryClient.invalidateQueries({ queryKey: ["accounts"] }),
+      queryClient.invalidateQueries({ queryKey: ["pool-api-keys"] }),
       queryClient.invalidateQueries({ queryKey: ["proxies"] }),
       queryClient.invalidateQueries({ queryKey: ["available-proxies"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-config"] }),
+      queryClient.invalidateQueries({ queryKey: ["account-pool-strategy"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-profile"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-profile-snapshots"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-stats"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-models"] }),
+      queryClient.invalidateQueries({ queryKey: ["model-prices"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-usage"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-routing-events"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-log-config"] }),
@@ -270,12 +331,21 @@ function App() {
       invalidate(["resource-config", "account-pool-config", "account-pool-profile", "account-pool-profile-snapshots", "account-pool-stats", "account-pool-log-config"]);
     const onStatsChanged = () => invalidate(["account-pool-stats", "account-pool-usage", "account-pool-routing-events", "account-pool-logs", "accounts"]);
     const onModelChanged = () => invalidate(["account-pool-models"]);
+    const onPoolChanged = () => invalidate(["account-pools", "accounts", "pool-api-keys", "account-pool-stats", "account-pool-usage", "account-pool-strategy"]);
+    const onAPIKeyChanged = () => invalidate(["account-pools", "pool-api-keys", "account-pool-usage"]);
+    const onPricingChanged = () => invalidate(["model-prices", "account-pool-models", "account-pools", "accounts", "account-pool-stats", "account-pool-usage"]);
+    const onSessionKeyJobChanged = () =>
+      invalidate(["session-key-job", "resource-config", "accounts", "proxies", "available-proxies", "account-pool-stats"]);
 
     source.addEventListener("proxy_changed", onProxyChanged);
     source.addEventListener("account_changed", onAccountChanged);
     source.addEventListener("config_changed", onConfigChanged);
     source.addEventListener("stats_changed", onStatsChanged);
     source.addEventListener("model_changed", onModelChanged);
+    source.addEventListener("pool_changed", onPoolChanged);
+    source.addEventListener("api_key_changed", onAPIKeyChanged);
+    source.addEventListener("pricing_changed", onPricingChanged);
+    source.addEventListener("session_key_job_changed", onSessionKeyJobChanged);
 
     source.onerror = () => {
       // EventSource reconnects automatically; polling remains as a fallback.
@@ -287,6 +357,10 @@ function App() {
       source.removeEventListener("config_changed", onConfigChanged);
       source.removeEventListener("stats_changed", onStatsChanged);
       source.removeEventListener("model_changed", onModelChanged);
+      source.removeEventListener("pool_changed", onPoolChanged);
+      source.removeEventListener("api_key_changed", onAPIKeyChanged);
+      source.removeEventListener("pricing_changed", onPricingChanged);
+      source.removeEventListener("session_key_job_changed", onSessionKeyJobChanged);
       source.close();
     };
   }, [dataEnabled, queryClient]);
@@ -294,8 +368,10 @@ function App() {
   const accountPoolLoading =
     accountDataEnabled &&
     (poolConfigQuery.isLoading || poolProfileQuery.isLoading || profileSnapshotsQuery.isLoading || poolStatsQuery.isLoading || poolModelsQuery.isLoading);
-  const loading = configQuery.isLoading || accountsQuery.isLoading || proxiesQuery.isLoading || availableQuery.isLoading;
+  const loading = configQuery.isLoading || poolsQuery.isLoading || accountsQuery.isLoading || apiKeysQuery.isLoading || proxiesQuery.isLoading || availableQuery.isLoading;
+  const pools = poolsQuery.data?.items || [];
   const accounts = accountsQuery.data?.items || [];
+  const poolAPIKeys = apiKeysQuery.data?.items || [];
   const proxies = proxiesQuery.data?.items || [];
   const available = availableQuery.data?.items || [];
   const summary = configQuery.data?.summary;
@@ -304,33 +380,45 @@ function App() {
   const profileSnapshots = profileSnapshotsQuery.data?.items || [];
   const poolStats = poolStatsQuery.data?.stats;
   const poolModels = poolModelsQuery.data?.items || [];
+  const modelPrices = modelPricesQuery.data?.current;
   const usageSummary = usageSummaryQuery.data?.summary;
   const routingEvents = routingEventsQuery.data?.items || [];
+  const routingEventsTotal = routingEventsQuery.data?.total || 0;
+  const routingEventsPageCount = Math.max(1, Math.ceil(routingEventsTotal / routingEventsPageSize));
   const logConfig = logConfigQuery.data;
   const poolLogs = poolLogsQuery.data?.items || [];
   const usageCalibrations = usageCalibrationsQuery.data;
 
-  const pageTitle = view === "home" ? "资源池控制台" : view === "accounts" ? "Claude Code 账号池" : "代理 IP 池";
-  const pageSubtitle =
-    view === "home"
-      ? "从独立入口管理 Claude Code 账号池和静态出口代理，登录态与管理中心分开保存。"
-      : view === "accounts"
-      ? "OAuth 登录账号、固定出口绑定、健康度和保守调度集中管理。"
-      : "维护静态出口代理，后端定时检测健康度，账号绑定时只选择空闲可用代理。";
+  useEffect(() => {
+    if (routingEventsQuery.data && routingEventsPage > routingEventsPageCount) {
+      setRoutingEventsPage(routingEventsPageCount);
+    }
+  }, [routingEventsPage, routingEventsPageCount, routingEventsQuery.data]);
 
-  const navigate = (nextRoute: Route) => {
-    pushHashRoute(nextRoute);
+  const pageInfo: Record<View, [string, string]> = {
+    overview: ["总览", "全部账号池的健康、用量与成本"],
+    pools: ["账号池", "账号、API Key 与会话按池隔离"],
+    pool: ["账号池详情", "当前账号池的运行状态与资源"],
+    "api-keys": ["API Keys", "生成和管理绑定账号池的访问凭证"],
+    proxies: ["代理 IP", "维护账号登录和推理使用的固定出口"],
+    models: ["模型与价格", "模型映射与版本化标准计价"],
+    settings: ["系统设置", "全局调度、纯净模式、Profile 与日志"]
+  };
+  const [pageTitle, pageSubtitle] = pageInfo[view];
+
+  const navigate = (nextRoute: Route, poolID = "", poolTab: PoolDetailTab = "overview") => {
+    pushHashRoute({ route: nextRoute, poolID, poolTab });
   };
 
   const logout = async () => {
-    setAfterLoginRoute(view);
+    setAfterLoginRoute(activeLocation);
     setAuthRequired(false);
     setModal(null);
     setManagementKey("");
     setManagementKeyState("");
     await queryClient.cancelQueries();
     queryClient.clear();
-    replaceHashRoute("login");
+    replaceHashRoute({ route: "login", poolID: "", poolTab: "overview" });
     showToast("已退出资源池控制台");
   };
 
@@ -367,148 +455,99 @@ function App() {
     );
   }
 
+  const currentPool = pools.find((pool) => pool.id === currentPoolID);
+  const activeSection: ConsoleSection = view === "pool" ? "pools" : view;
+  const notify = (message: string, danger = false) => showToast(message, danger ? "danger" : "default");
+  const accountWorkspace = (forcedTab: "accounts" | "config") => (
+    <AccountsView
+      accounts={accounts}
+      pools={pools}
+      available={available}
+      loading={loading || accountPoolLoading}
+      config={poolConfig}
+      profile={poolProfile}
+      profileSnapshots={profileSnapshots}
+      stats={poolStats}
+      models={poolModels}
+      usage={usageSummary}
+      routingEvents={routingEvents}
+      logConfig={logConfig}
+      logs={poolLogs}
+      calibrations={usageCalibrations}
+      forcedTab={forcedTab}
+      onBind={(account) => setModal({ type: "bind", account })}
+      onTest={(account) => setModal({ type: "test-account", account, models: poolModels })}
+      onToast={showToast}
+      onDone={invalidateAll}
+    />
+  );
+  const headerActions = view === "pool" && activeLocation.poolTab === "accounts" ? (
+    <Button onClick={() => setModal({ type: "oauth", poolID: currentPoolID })}><KeyRound className="h-4 w-4" />新增账号</Button>
+  ) : view === "proxies" ? (
+    <><Button variant="outline" onClick={() => setModal({ type: "import" })}><CopyPlus className="h-4 w-4" />批量导入</Button><Button onClick={() => setModal({ type: "proxy" })}><Plus className="h-4 w-4" />新增代理</Button></>
+  ) : undefined;
+
   return (
-    <div className="grid min-h-dvh grid-cols-[260px_minmax(0,1fr)] max-[1024px]:grid-cols-1">
-      <aside className="border-r bg-card p-4 max-[1024px]:sticky max-[1024px]:top-0 max-[1024px]:z-20 max-[1024px]:grid max-[1024px]:gap-3 max-[1024px]:border-b max-[1024px]:border-r-0">
-        <div className="grid gap-1 border-b pb-4 max-[1024px]:border-b-0 max-[1024px]:pb-0">
-          <div className="flex items-center gap-2 text-base font-semibold">
-            <Network className="h-5 w-5 text-primary" />
-            资源池控制台
-          </div>
-          <p className="text-xs leading-5 text-muted-foreground">Claude Code 账号与静态出口代理</p>
-        </div>
-        <nav className="mt-5 grid gap-2 max-[1024px]:mt-0 max-[1024px]:grid-cols-[repeat(auto-fit,minmax(150px,1fr))]" aria-label="主导航">
-          <NavButton active={view === "home"} icon={Home} onClick={() => navigate("home")}>
-            入口
-          </NavButton>
-          <NavButton active={view === "accounts"} icon={UsersRound} onClick={() => navigate("accounts")}>
-            Claude Code 账号池
-          </NavButton>
-          <NavButton active={view === "proxies"} icon={Cable} onClick={() => navigate("proxies")}>
-            代理 IP 池
-          </NavButton>
-        </nav>
-        <div className="mt-5 grid gap-2 max-[1024px]:mt-0 max-[1024px]:max-w-sm">
-          <div className="rounded-lg border bg-muted/40 p-3">
-            <div className="flex items-center gap-2 text-sm font-medium">
-              <CheckCircle2 className="h-4 w-4 text-emerald-600" />
-              已登录
-            </div>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">管理 API 已授权，密钥仅在登录页输入。</p>
-          </div>
-          <Button variant="outline" onClick={logout}>
-            <LogOut className="h-4 w-4" />
-            退出登录
-          </Button>
-          <Button variant="outline" asChild>
-            <a href="/management.html#/" className="w-full">
-              <ExternalLink className="h-4 w-4" />
-              管理中心
-            </a>
-          </Button>
-        </div>
-      </aside>
-
-      <main className="min-w-0 overflow-x-hidden p-6 max-[640px]:p-4">
-        <header className="flex flex-wrap items-start justify-between gap-4">
-          <div className="grid gap-1">
-            <h1 className="text-2xl font-semibold leading-tight max-[640px]:text-xl">{pageTitle}</h1>
-            <p className="max-w-3xl text-sm leading-6 text-muted-foreground">{pageSubtitle}</p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={refresh} disabled={loading} title="刷新">
-              <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
-              刷新
-            </Button>
-            {view === "home" ? (
-              <Button variant="outline" asChild>
-                <a href="/management.html#/">
-                  <ExternalLink className="h-4 w-4" />
-                  返回管理中心
-                </a>
-              </Button>
-            ) : view === "accounts" ? (
-              <Button onClick={() => setModal({ type: "oauth" })}>
-                <KeyRound className="h-4 w-4" />
-                新增 OAuth 账号
-              </Button>
-            ) : (
-              <>
-                <Button onClick={() => setModal({ type: "proxy" })}>
-                  <Plus className="h-4 w-4" />
-                  新增代理
-                </Button>
-                <Button variant="outline" onClick={() => setModal({ type: "import" })}>
-                  <CopyPlus className="h-4 w-4" />
-                  批量导入
-                </Button>
-              </>
-            )}
-          </div>
-        </header>
-
-        <section className="mt-5 grid grid-cols-4 gap-3 max-[1024px]:grid-cols-2 max-[640px]:grid-cols-1">
-          {view === "home" ? (
-            <>
-              <StatCard label="账号总数" value={summary?.account_total || 0} icon={UsersRound} />
-              <StatCard label="已绑定代理" value={summary?.account_bound || 0} icon={Network} />
-              <StatCard label="代理总数" value={summary?.proxy_total || 0} icon={Cable} />
-              <StatCard label="空闲可用代理" value={available.length} icon={Activity} />
-            </>
-          ) : view === "accounts" ? (
-            <>
-              <StatCard label="账号总数" value={summary?.account_total || 0} icon={UsersRound} />
-              <StatCard label="启用账号" value={summary?.account_enabled || 0} icon={CheckCircle2} />
-              <StatCard label="已绑定代理" value={summary?.account_bound || 0} icon={Network} />
-              <StatCard label="空闲可用代理" value={available.length} icon={Activity} />
-            </>
-          ) : (
-            <>
-              <StatCard label="代理总数" value={summary?.proxy_total || 0} icon={Cable} />
-              <StatCard label="健康" value={summary?.proxy_healthy || 0} icon={CheckCircle2} />
-              <StatCard label="异常" value={summary?.proxy_unhealthy || 0} icon={ShieldAlert} />
-              <StatCard label="已绑定" value={summary?.proxy_bound || 0} icon={Network} />
-            </>
-          )}
-        </section>
-
-        <div className="mt-5">
-          {view === "home" ? (
-            <ResourceHome summary={summary} availableCount={available.length} loading={loading} />
-          ) : view === "accounts" ? (
-            <AccountsView
-              accounts={accounts}
-              available={available}
-              loading={loading || accountPoolLoading}
-              config={poolConfig}
-              profile={poolProfile}
-              profileSnapshots={profileSnapshots}
-              stats={poolStats}
-              models={poolModels}
-              usage={usageSummary}
-              routingEvents={routingEvents}
-              logConfig={logConfig}
-              logs={poolLogs}
-              calibrations={usageCalibrations}
-              onBind={(account) => setModal({ type: "bind", account })}
-              onTest={(account) => setModal({ type: "test-account", account, models: poolModels })}
-              onToast={showToast}
-              onDone={invalidateAll}
+    <AppShell
+      active={activeSection}
+      title={pageTitle}
+      subtitle={pageSubtitle}
+      loading={loading}
+      actions={headerActions}
+      onNavigate={(section) => navigate(section)}
+      onRefresh={refresh}
+      onLogout={logout}
+    >
+      {view === "overview" ? (
+        <OverviewPage pools={pools} stats={poolStats} window={usageWindow} loading={loading} onWindowChange={setUsageWindow} onOpenPool={(id) => navigate("pool", id)} />
+      ) : view === "pools" ? (
+        <PoolsPage pools={pools} onOpenPool={(id) => navigate("pool", id, "accounts")} onChanged={invalidateAll} notify={notify} />
+      ) : view === "api-keys" ? (
+        <APIKeysPage keys={poolAPIKeys} pools={pools} onChanged={invalidateAll} notify={notify} />
+      ) : view === "pool" ? (
+        <PoolDetailPage
+          pool={currentPool}
+          tab={activeLocation.poolTab}
+          stats={poolStats}
+          usage={usageSummary}
+          window={usageWindow}
+          onWindowChange={setUsageWindow}
+          onBack={() => navigate("pools")}
+          onTabChange={(tab) => navigate("pool", currentPoolID, tab)}
+        >
+          {activeLocation.poolTab === "accounts" ? accountWorkspace("accounts") : activeLocation.poolTab === "api-keys" ? (
+            <APIKeysPage keys={poolAPIKeys} pools={pools} poolID={currentPoolID} onChanged={invalidateAll} notify={notify} />
+          ) : activeLocation.poolTab === "events" ? (
+            <PoolEventsPage
+              events={routingEvents}
+              total={routingEventsTotal}
+              page={routingEventsPage}
+              pageSize={routingEventsPageSize}
+              loading={routingEventsQuery.isLoading || routingEventsQuery.isFetching}
+              onPageChange={setRoutingEventsPage}
             />
-          ) : (
-            <ProxyView
-              proxies={proxies}
-              loading={loading}
-              onEdit={(proxy) => setModal({ type: "proxy", proxy })}
-              onToast={showToast}
-              onDone={invalidateAll}
+          ) : activeLocation.poolTab === "strategy" ? (
+            <PoolStrategyPage
+              poolID={currentPoolID}
+              config={poolStrategyQuery.data}
+              loading={poolStrategyQuery.isLoading || poolStrategyQuery.isFetching}
+              error={poolStrategyQuery.error}
+              onChanged={invalidateAll}
+              notify={notify}
             />
-          )}
-        </div>
-      </main>
+          ) : null}
+        </PoolDetailPage>
+      ) : view === "proxies" ? (
+        <ProxyView proxies={proxies} loading={loading} onEdit={(proxy) => setModal({ type: "proxy", proxy })} onToast={showToast} onDone={invalidateAll} />
+      ) : view === "models" ? (
+        <ModelPricingPage models={poolModels} pricing={modelPrices} onChanged={invalidateAll} notify={notify} />
+      ) : (
+        accountWorkspace("config")
+      )}
 
       <ResourceModal
         modal={modal}
+        pools={pools}
         available={available}
         onClose={() => setModal(null)}
         onRefresh={invalidateAll}
@@ -521,7 +560,7 @@ function App() {
       />
 
       {toast ? <ToastView toast={toast} /> : null}
-    </div>
+    </AppShell>
   );
 }
 
@@ -592,94 +631,121 @@ function LoginPage({
 
 function ResourceHome({
   summary,
+  accounts,
+  proxies,
   availableCount,
   loading
 }: {
   summary?: { account_total: number; account_enabled: number; account_bound: number; proxy_total: number; proxy_healthy: number };
+  accounts: AccountRow[];
+  proxies: ProxyResource[];
   availableCount: number;
   loading: boolean;
 }) {
   if (loading) {
     return <LoadingPanel />;
   }
+  const expiringAccounts = accounts.filter(({ account }) => {
+    if (!account.token_expires_at) {
+      return false;
+    }
+    const expiresAt = new Date(account.token_expires_at).getTime();
+    return Number.isFinite(expiresAt) && expiresAt > Date.now() && expiresAt - Date.now() < 24 * 60 * 60 * 1000;
+  });
+  const lowQuotaAccounts = accounts.filter(({ account }) =>
+    (account.quota?.windows || []).some((window) => typeof window.remain_percent === "number" && window.remain_percent <= 10)
+  );
+  const unhealthyProxies = proxies.filter((proxy) => proxy.enabled && healthText(proxy.health_status, proxy.enabled) === "异常");
+  const failedAccounts = accounts.filter(({ account }) => Boolean(account.last_error));
+  const issues = [
+    { label: "Token 24 小时内过期", count: expiringAccounts.length, href: "#/accounts", tone: "warning" as const },
+    { label: "额度低于 10%", count: lowQuotaAccounts.length, href: "#/accounts", tone: "danger" as const },
+    { label: "异常代理", count: unhealthyProxies.length, href: "#/proxies", tone: "danger" as const },
+    { label: "账号最近有错误", count: failedAccounts.length, href: "#/accounts", tone: "warning" as const }
+  ];
   return (
-    <div className="grid gap-5">
-      <div className="grid grid-cols-2 gap-4 max-[860px]:grid-cols-1">
-        <EntryCard
+    <div className="grid gap-4">
+      <section className="overview-band grid grid-cols-2 divide-x rounded-lg border bg-card max-[760px]:grid-cols-1 max-[760px]:divide-x-0 max-[760px]:divide-y">
+        <ResourceOverview
           href="#/accounts"
           icon={UsersRound}
           title="Claude Code 账号池"
-          description="管理 OAuth 登录账号、代理绑定、健康度和冷却状态。"
+          status={`${summary?.account_enabled || 0} 个启用`}
           metrics={[
             ["账号", summary?.account_total || 0],
-            ["启用", summary?.account_enabled || 0],
-            ["已绑 IP", summary?.account_bound || 0]
+            ["已绑定代理", summary?.account_bound || 0],
+            ["最近错误", failedAccounts.length]
           ]}
         />
-        <EntryCard
+        <ResourceOverview
           href="#/proxies"
           icon={Cable}
           title="代理 IP 池"
-          description="维护静态出口代理，查看健康检测、延迟、占用和解绑。"
+          status={`${summary?.proxy_healthy || 0} 个健康`}
           metrics={[
             ["代理", summary?.proxy_total || 0],
-            ["健康", summary?.proxy_healthy || 0],
-            ["空闲可用", availableCount]
+            ["空闲可用", availableCount],
+            ["异常", unhealthyProxies.length]
           ]}
         />
-      </div>
-      <Card>
-        <CardHeader>
-          <CardTitle>入口方式</CardTitle>
-          <CardDescription>
-            资源池控制台使用独立页面和独立 hash 深链，后续同步上游管理面板时冲突最小。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-3 text-sm leading-6 text-muted-foreground">
-          <p>
-            常用地址：<span className="font-medium text-foreground">/account-pool.html#/accounts</span> 和{" "}
-            <span className="font-medium text-foreground">/account-pool.html#/proxies</span>。
-          </p>
-          <p>未登录时会自动进入本页自己的登录页，不读取 management.html 保存的登录状态。</p>
-        </CardContent>
-      </Card>
+      </section>
+
+      <section className="rounded-lg border bg-card">
+        <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
+          <div>
+            <h2 className="text-sm font-semibold">待处理事项</h2>
+            <p className="mt-0.5 text-xs text-muted-foreground">根据当前账号和代理状态汇总</p>
+          </div>
+          <Badge tone={issues.some((item) => item.count > 0) ? "warning" : "success"}>
+            {issues.reduce((sum, item) => sum + item.count, 0)} 项
+          </Badge>
+        </div>
+        <div className="grid grid-cols-2 max-[760px]:grid-cols-1">
+          {issues.map((issue) => (
+            <a key={issue.label} href={issue.href} className="issue-row flex items-center justify-between gap-3 border-b px-4 py-3 text-sm even:border-l max-[760px]:even:border-l-0">
+              <span className="flex min-w-0 items-center gap-2">
+                <span className={cn("h-2 w-2 shrink-0 rounded-full", issue.count === 0 ? "bg-slate-300" : issue.tone === "danger" ? "bg-red-500" : "bg-amber-500")} />
+                <span className="truncate">{issue.label}</span>
+              </span>
+              <span className={cn("font-semibold tabular-nums", issue.count > 0 && issue.tone === "danger" ? "text-red-700" : issue.count > 0 ? "text-amber-700" : "text-muted-foreground")}>{issue.count}</span>
+            </a>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
 
-function EntryCard({
+function ResourceOverview({
   href,
   icon: Icon,
   title,
-  description,
+  status,
   metrics
 }: {
   href: string;
   icon: typeof UsersRound;
   title: string;
-  description: string;
+  status: string;
   metrics: Array<[string, number]>;
 }) {
   return (
-    <a
-      href={href}
-      className="group grid min-h-56 gap-5 rounded-lg border bg-card p-5 text-foreground shadow-none transition-colors hover:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-accent text-accent-foreground">
-          <Icon className="h-5 w-5" />
+    <a href={href} className="resource-overview group grid gap-4 p-5 text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground"><Icon className="h-4 w-4" /></div>
+          <div className="min-w-0">
+            <h2 className="truncate text-base font-semibold">{title}</h2>
+            <p className="text-xs text-muted-foreground">{status}</p>
+          </div>
         </div>
-        <ArrowRight className="h-5 w-5 text-muted-foreground transition-transform group-hover:translate-x-1 group-hover:text-primary" />
+        <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-primary" />
       </div>
-      <div className="grid gap-2">
-        <h2 className="text-lg font-semibold leading-tight">{title}</h2>
-        <p className="text-sm leading-6 text-muted-foreground">{description}</p>
-      </div>
-      <dl className="grid grid-cols-3 gap-2">
+      <dl className="grid grid-cols-3 gap-4">
         {metrics.map(([label, value]) => (
-          <div key={label} className="rounded-lg border bg-muted/35 p-3">
+          <div key={label} className="min-w-0">
             <dt className="text-xs text-muted-foreground">{label}</dt>
-            <dd className="mt-1 text-xl font-semibold leading-none">{value}</dd>
+            <dd className="mt-1 text-xl font-semibold leading-none tabular-nums">{value}</dd>
           </div>
         ))}
       </dl>
@@ -703,8 +769,8 @@ function NavButton({
       type="button"
       onClick={onClick}
       className={cn(
-        "flex min-h-11 items-center gap-2 rounded-lg px-3 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        active ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground"
+        "flex min-h-10 items-center gap-2 rounded-lg px-3 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-[900px]:justify-center max-[520px]:px-2",
+        active ? "bg-primary/10 font-medium text-primary" : "text-muted-foreground hover:bg-muted hover:text-foreground"
       )}
     >
       <Icon className="h-4 w-4 shrink-0" />
@@ -728,24 +794,9 @@ function ToastView({ toast }: { toast: ToastState }) {
   );
 }
 
-function StatCard({ label, value, icon: Icon }: { label: string; value: number; icon: typeof UsersRound }) {
-  return (
-    <Card className="shadow-none">
-      <CardContent className="flex items-center justify-between gap-3 p-4">
-        <div className="grid gap-1">
-          <span className="text-sm text-muted-foreground">{label}</span>
-          <strong className="text-2xl leading-none">{value}</strong>
-        </div>
-        <div className="rounded-lg bg-accent p-2 text-accent-foreground">
-          <Icon className="h-5 w-5" />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 function AccountsView({
   accounts,
+  pools,
   available,
   loading,
   config,
@@ -758,12 +809,14 @@ function AccountsView({
   logConfig,
   logs,
   calibrations,
+  forcedTab,
   onBind,
   onTest,
   onToast,
   onDone
 }: {
   accounts: AccountRow[];
+  pools: ClaudeCodeAccountPool[];
   available: ProxyResource[];
   loading: boolean;
   config?: ClaudeCodePoolConfigResponse;
@@ -776,22 +829,59 @@ function AccountsView({
   logConfig?: { raw: AccountPoolLogRawConfig; effective: AccountPoolLogEffectiveConfig };
   logs: AccountPoolLogLine[];
   calibrations?: UsageCalibrationResponse;
+  forcedTab?: "accounts" | "metrics" | "usage" | "events" | "config";
   onBind: (account: ClaudeCodeAccount) => void;
   onTest: (account: ClaudeCodeAccount) => void;
   onToast: (message: string, tone?: ToastState["tone"]) => void;
   onDone: () => Promise<void>;
 }) {
   const effectiveConfig = config?.effective || defaultPoolEffectiveConfig();
-  const [activeTab, setActiveTab] = useState<"accounts" | "config">("accounts");
+  const [selectedTab, setSelectedTab] = useState<"accounts" | "metrics" | "usage" | "events" | "config">("accounts");
+  const activeTab = forcedTab || selectedTab;
+  const [searchQuery, setSearchQuery] = useState("");
+	  const [statusFilter, setStatusFilter] = useState<"all" | "available" | "checking" | "cooling" | "error" | "disabled">("all");
+  const [viewMode, setViewMode] = useState<"cards" | "table">("cards");
   const [selectedIDs, setSelectedIDs] = useState<string[]>([]);
   const [page, setPage] = useState(1);
   const [detailRow, setDetailRow] = useState<AccountRow | null>(null);
+  const [moveRow, setMoveRow] = useState<AccountRow | null>(null);
   const selectedSet = useMemo(() => new Set(selectedIDs), [selectedIDs]);
   const selectedCount = selectedIDs.length;
   const pageSize = 10;
-  const pageCount = Math.max(1, Math.ceil(accounts.length / pageSize));
+  const filteredAccounts = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    return accounts.filter((row) => {
+      const account = row.account;
+      const matchesQuery = !query || [account.email, account.auth_id, account.proxy?.name, account.proxy?.exit_ip]
+        .some((value) => (value || "").toLowerCase().includes(query));
+      if (!matchesQuery) {
+        return false;
+      }
+      const runtimeStatus = row.runtime?.status || "active";
+      if (statusFilter === "available") {
+	        return account.effective_schedulable;
+	      }
+	      if (statusFilter === "checking") {
+	        return account.health_status === "checking";
+      }
+      if (statusFilter === "cooling") {
+        return Boolean(account.runtime_capacity?.account_cooling || account.runtime_capacity?.cooling_until || runtimeStatus === "cooling");
+      }
+      if (statusFilter === "error") {
+        return Boolean(account.last_error || account.quota?.status === "error" || account.availability?.status === "unhealthy");
+      }
+      if (statusFilter === "disabled") {
+	        return !account.schedulable || runtimeStatus === "disabled";
+      }
+      return true;
+    });
+  }, [accounts, searchQuery, statusFilter]);
+  const pageCount = Math.max(1, Math.ceil(filteredAccounts.length / pageSize));
   const currentPage = Math.min(page, pageCount);
-  const pageRows = useMemo(() => accounts.slice((currentPage - 1) * pageSize, currentPage * pageSize), [accounts, currentPage]);
+  const pageRows = useMemo(
+    () => filteredAccounts.slice((currentPage - 1) * pageSize, currentPage * pageSize),
+    [filteredAccounts, currentPage]
+  );
   const pageIDs = pageRows.map((row) => row.account.id);
   const pageSelected = pageIDs.length > 0 && pageIDs.every((id) => selectedSet.has(id));
   const pagePartiallySelected = pageIDs.some((id) => selectedSet.has(id)) && !pageSelected;
@@ -799,8 +889,11 @@ function AccountsView({
     setSelectedIDs((current) => current.filter((id) => accounts.some((row) => row.account.id === id)));
   }, [accounts]);
   useEffect(() => {
-    setPage((current) => Math.min(current, Math.max(1, Math.ceil(accounts.length / pageSize))));
-  }, [accounts.length]);
+    setPage(1);
+  }, [searchQuery, statusFilter]);
+  useEffect(() => {
+    setPage((current) => Math.min(current, Math.max(1, Math.ceil(filteredAccounts.length / pageSize))));
+  }, [filteredAccounts.length]);
 
   const setAccountSelected = (id: string, selected: boolean) => {
     setSelectedIDs((current) => {
@@ -826,8 +919,8 @@ function AccountsView({
   const clearSelection = () => setSelectedIDs([]);
 
   const patchMutation = useMutation({
-    mutationFn: ({ accountID, enabled }: { accountID: string; enabled: boolean }) =>
-      api.patchAccount(accountID, { enabled } as Partial<ClaudeCodeAccount>),
+	    mutationFn: ({ accountID, schedulable }: { accountID: string; schedulable: boolean }) =>
+	      api.patchAccount(accountID, { schedulable } as Partial<ClaudeCodeAccount>),
     onSuccess: async () => {
       await onDone();
       onToast("账号状态已更新");
@@ -858,7 +951,17 @@ function AccountsView({
     },
     onError: (error) => onToast(`删除失败：${errorMessage(error)}`, "danger")
   });
-  const quotaMutation = useMutation({
+	const moveMutation = useMutation({
+		mutationFn: ({ accountID, poolID }: { accountID: string; poolID: string }) => api.moveAccount(accountID, poolID),
+		onSuccess: async () => {
+			setMoveRow(null);
+			setDetailRow(null);
+			await onDone();
+			onToast("账号已移动到目标池");
+		},
+		onError: (error) => onToast(`移动失败：${errorMessage(error)}`, "danger")
+	});
+	  const quotaMutation = useMutation({
     mutationFn: api.refreshAccountQuota,
     onSuccess: async (data) => {
       await onDone();
@@ -869,7 +972,15 @@ function AccountsView({
       }
     },
     onError: (error) => onToast(`额度刷新失败：${errorMessage(error)}`, "danger")
-  });
+	  });
+	  const recheckMutation = useMutation({
+	    mutationFn: api.recheckAccount,
+	    onSuccess: async () => {
+	      await onDone();
+	      onToast("账号检查通过，已恢复调度");
+	    },
+	    onError: (error) => onToast(`重新检查失败：${errorMessage(error)}`, "danger")
+	  });
   const tokenMutation = useMutation({
     mutationFn: api.refreshAccountToken,
     onSuccess: async (data) => {
@@ -914,63 +1025,83 @@ function AccountsView({
   }
 
   return (
-    <div className="grid gap-5">
-      <PublicAPIPanel modelsCount={models.filter((model) => model.enabled).length} />
-      <AccountPoolMetrics stats={stats} usage={usage} config={effectiveConfig} />
-      <SegmentedTabs
+    <div className="grid gap-4">
+      {!forcedTab ? <SegmentedTabs
         value={activeTab}
-        onChange={setActiveTab}
+        onChange={setSelectedTab}
         items={[
-          { value: "accounts", label: "账号卡片" },
+          { value: "accounts", label: "账号" },
+          { value: "metrics", label: "运行指标" },
+          { value: "usage", label: "用量" },
+          { value: "events", label: "事件与日志" },
           { value: "config", label: "配置" }
         ]}
-      />
+      /> : null}
 
       {activeTab === "accounts" ? (
-        <AccountCardsPanel
-          rows={pageRows}
-          total={accounts.length}
-          page={currentPage}
-          pageCount={pageCount}
-          pageSelected={pageSelected}
-          pagePartiallySelected={pagePartiallySelected}
-          selectedSet={selectedSet}
-          selectedCount={selectedCount}
-          pending={batchMutation.isPending}
-          availableCount={available.length}
-          onPageChange={setPage}
-          onSelectPage={(selected) => setAllSelected(pageIDs, selected)}
-          onSelectAccount={setAccountSelected}
-          onRunBatch={runBatch}
-          onClearSelection={clearSelection}
-          onDetails={setDetailRow}
-          onTest={onTest}
-          onBind={onBind}
-          onUnbind={(account) => unbindMutation.mutate(account.id)}
-          onReset={(account) => resetMutation.mutate(account.id)}
-          onRefreshQuota={(account) => quotaMutation.mutate(account.id)}
-          quotaPending={quotaMutation.isPending}
-          onToggle={(account) => patchMutation.mutate({ accountID: account.id, enabled: !account.enabled })}
-          onDelete={(account) => {
-            if (window.confirm("确认删除这个账号？绑定代理会自动释放。")) {
-              deleteMutation.mutate(account.id);
-            }
-          }}
-        />
+        <div className="grid gap-3">
+          <AccountWorkspaceToolbar
+            query={searchQuery}
+            status={statusFilter}
+            viewMode={viewMode}
+            total={accounts.length}
+            filtered={filteredAccounts.length}
+            onQueryChange={setSearchQuery}
+            onStatusChange={setStatusFilter}
+            onViewModeChange={setViewMode}
+          />
+          <AccountCardsPanel
+            rows={pageRows}
+            total={filteredAccounts.length}
+            page={currentPage}
+            pageCount={pageCount}
+            pageSelected={pageSelected}
+            pagePartiallySelected={pagePartiallySelected}
+            selectedSet={selectedSet}
+            selectedCount={selectedCount}
+            pending={batchMutation.isPending}
+            availableCount={available.length}
+            viewMode={viewMode}
+            onPageChange={setPage}
+            onSelectPage={(selected) => setAllSelected(pageIDs, selected)}
+            onSelectAccount={setAccountSelected}
+            onRunBatch={runBatch}
+            onClearSelection={clearSelection}
+            onDetails={setDetailRow}
+            onTest={onTest}
+            onBind={onBind}
+            onUnbind={(account) => unbindMutation.mutate(account.id)}
+            onReset={(account) => resetMutation.mutate(account.id)}
+            onRefreshQuota={(account) => quotaMutation.mutate(account.id)}
+            quotaPending={quotaMutation.isPending}
+			onMove={(row) => setMoveRow(row)}
+	            onToggle={(account) => patchMutation.mutate({ accountID: account.id, schedulable: !account.schedulable })}
+            onDelete={(account) => {
+              if (window.confirm("确认删除这个账号？绑定代理会自动释放。")) {
+                deleteMutation.mutate(account.id);
+              }
+            }}
+          />
+        </div>
+      ) : activeTab === "metrics" ? (
+        <AccountPoolMetrics stats={stats} usage={usage} config={effectiveConfig} compactUsage />
+      ) : activeTab === "usage" ? (
+        <div className="grid gap-4">
+          <AccountUsagePanel stats={stats} usage={usage} />
+          <CleanInputUsagePanel config={effectiveConfig} calibrations={calibrations} accounts={accounts} models={models} onDone={onDone} onToast={onToast} />
+        </div>
+      ) : activeTab === "events" ? (
+        <div className="grid gap-4">
+          <RoutingEventsPanel events={routingEvents} />
+          <AccountPoolLogPanel config={logConfig?.effective || effectiveConfig.log} raw={logConfig?.raw} logs={logs} onDone={onDone} onToast={onToast} />
+        </div>
       ) : (
         <div className="grid gap-5">
+          <PublicAPIPanel modelsCount={models.filter((model) => model.enabled).length} />
           <ClaudeCodeProfilePanel profile={profile} />
           <ClaudeCodeProfileSnapshotsPanel snapshots={profileSnapshots} profile={profile} onDone={onDone} onToast={onToast} />
-          <div className="grid grid-cols-2 gap-5 max-[1180px]:grid-cols-1">
-            <AccountPoolConfigPanel config={effectiveConfig} path={config?.path} onDone={onDone} onToast={onToast} />
-            <VirtualCachePanel config={effectiveConfig} stats={stats} onDone={onDone} onToast={onToast} />
-          </div>
-          <CloakConfigPanel config={effectiveConfig} onDone={onDone} onToast={onToast} />
+          <AccountPoolConfigPanel config={effectiveConfig} path={config?.path} onDone={onDone} onToast={onToast} />
           <RoutingProtectionPanel config={effectiveConfig} onDone={onDone} onToast={onToast} />
-          <ModelManagementPanel models={models} accounts={accounts} onDone={onDone} onToast={onToast} />
-          <CleanInputUsagePanel config={effectiveConfig} calibrations={calibrations} accounts={accounts} models={models} onDone={onDone} onToast={onToast} />
-          <AccountPoolLogPanel config={logConfig?.effective || effectiveConfig.log} raw={logConfig?.raw} logs={logs} onDone={onDone} onToast={onToast} />
-          <RoutingEventsPanel events={routingEvents} />
         </div>
       )}
 
@@ -984,9 +1115,13 @@ function AccountsView({
         onReset={(account) => resetMutation.mutate(account.id)}
         onRefreshQuota={(account) => quotaMutation.mutate(account.id)}
         quotaPending={quotaMutation.isPending}
+		pools={pools}
+		onMove={(account) => setMoveRow({ account, runtime: detailRow?.runtime })}
         onRefreshToken={(account) => tokenMutation.mutate(account.id)}
-        tokenPending={tokenMutation.isPending}
-        onToggle={(account) => patchMutation.mutate({ accountID: account.id, enabled: !account.enabled })}
+	        tokenPending={tokenMutation.isPending}
+	        onRecheck={(account) => recheckMutation.mutate(account.id)}
+	        recheckPending={recheckMutation.isPending}
+	        onToggle={(account) => patchMutation.mutate({ accountID: account.id, schedulable: !account.schedulable })}
         onDelete={(account) => {
           if (window.confirm("确认删除这个账号？绑定代理会自动释放。")) {
             deleteMutation.mutate(account.id);
@@ -994,6 +1129,18 @@ function AccountsView({
           }
         }}
       />
+	  <MoveAccountDialog
+		row={moveRow}
+		pools={pools}
+		open={moveRow !== null}
+		pending={moveMutation.isPending}
+		onClose={() => setMoveRow(null)}
+		onMove={(poolID) => {
+			if (moveRow) {
+				moveMutation.mutate({ accountID: moveRow.account.id, poolID });
+			}
+		}}
+	  />
     </div>
   );
 }
@@ -1042,17 +1189,30 @@ function ClaudeCodeProfilePanel({
         <CardDescription>请求形态由后端内置维护，页面只展示当前生效摘要。</CardDescription>
       </CardHeader>
       <CardContent className="grid gap-4">
-        <div className="grid grid-cols-5 gap-3 max-[1280px]:grid-cols-3 max-[760px]:grid-cols-2 max-[560px]:grid-cols-1">
-          <ReadOnlyTile label="Claude Code 版本" value={effective?.version || "2.1.178"} />
-          <ReadOnlyTile label="身份策略" value="账号固定 · 会话生成" />
-          <ReadOnlyTile label="Billing/CCH" value={effective?.billing_block_enabled === false ? "关闭" : "内置签名"} />
-          <ReadOnlyTile label="Prompt" value="完整静态提示词" />
-          <ReadOnlyTile label="TLS 指纹" value={effective?.tls_profile || "node-claude-code"} />
+        <div className="grid grid-cols-6 gap-3 max-[1280px]:grid-cols-3 max-[760px]:grid-cols-2 max-[560px]:grid-cols-1">
+          <ReadOnlyTile label="Claude Code 版本" value={effective?.version || "2.1.207"} />
+          <ReadOnlyTile label="Profile Revision" value={effective?.revision || "2.1.207-r2"} />
+          <ReadOnlyTile label="平台" value={`${effective?.headers?.["X-Stainless-Os"] || "MacOS"} · ${effective?.headers?.["X-Stainless-Arch"] || "arm64"}`} />
+          <ReadOnlyTile label="Billing" value={effective?.billing_block_enabled === false ? "关闭" : "sdk-cli · 无 CCH"} />
+          <ReadOnlyTile label="Prompt" value="稳定工具无关" />
+          <ReadOnlyTile label="传输" value={`${effective?.tls_profile || "node-macos-arm64-http1"} · ${effective?.tls_alpn || "http/1.1"}`} />
         </div>
 
         <div className="rounded-lg border bg-muted/30 p-3">
           <div className="text-xs font-medium text-muted-foreground">User-Agent</div>
-          <div className="mt-1 break-all font-mono text-sm">{effective?.user_agent || "claude-cli/2.1.178 (external, sdk-cli)"}</div>
+          <div className="mt-1 break-all font-mono text-sm">{effective?.user_agent || "claude-cli/2.1.207 (external, sdk-cli)"}</div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 max-[860px]:grid-cols-1">
+          <div className="rounded-lg border bg-muted/30 p-3">
+            <div className="text-xs font-medium text-muted-foreground">HTTP/1.1 Header 顺序</div>
+            <div className="mt-1 text-sm">固定 {effective?.header_order?.length || 0} 个已验证字段位置</div>
+          </div>
+          <div className="rounded-lg border bg-muted/30 p-3">
+            <div className="text-xs font-medium text-muted-foreground">TLS 摘要</div>
+            <div className="mt-1 break-all font-mono text-xs">JA3 {effective?.tls_ja3 || "-"}</div>
+            <div className="mt-1 break-all font-mono text-xs">JA4 {effective?.tls_ja4 || "-"}</div>
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-3 max-[860px]:grid-cols-1">
@@ -1086,7 +1246,7 @@ function ClaudeCodeProfilePanel({
         </div>
 
         <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm leading-6 text-emerald-900">
-          完整 Claude Code 静态提示词、billing block、CCH 签名、账号级 metadata.user_id 和官方域名 TLS profile 都由后端内置维护，不跟随 API 使用者变化。
+          生产只使用经过 trace 校验的稳定工具无关 Prompt、sdk-cli billing、账号级 metadata.user_id 和官方域名 HTTP/1.1 TLS profile。Phistory 完整动态 Prompt 仅用于对比参考。
         </div>
       </CardContent>
     </Card>
@@ -1104,7 +1264,7 @@ function ClaudeCodeProfileSnapshotsPanel({
   onDone: () => Promise<void>;
   onToast: (message: string, tone?: ToastState["tone"]) => void;
 }) {
-  const [version, setVersion] = useState(profile?.effective?.version || "2.1.178");
+  const [version, setVersion] = useState(profile?.effective?.version || "2.1.207");
   const [activeDiff, setActiveDiff] = useState<{ snapshot: ClaudeCodeProfileSnapshot; report: string } | null>(null);
   const fetchMutation = useMutation({
     mutationFn: ({ version, latest }: { version?: string; latest: boolean }) => api.fetchProfileSnapshot(version, latest),
@@ -1142,7 +1302,7 @@ function ClaudeCodeProfileSnapshotsPanel({
         <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-end gap-3 max-[760px]:grid-cols-1">
           <Label className="grid gap-2">
             <span>指定版本</span>
-            <Input value={version} onChange={(event) => setVersion(event.target.value)} placeholder="2.1.178" />
+            <Input value={version} onChange={(event) => setVersion(event.target.value)} placeholder="2.1.207" />
           </Label>
           <Button
             variant="outline"
@@ -1158,19 +1318,21 @@ function ClaudeCodeProfileSnapshotsPanel({
           </Button>
         </div>
 
-        <div className="grid grid-cols-3 gap-3 max-[900px]:grid-cols-1">
+        <div className="grid grid-cols-4 gap-3 max-[1100px]:grid-cols-2 max-[620px]:grid-cols-1">
           <ReadOnlyTile label="当前运行版本" value={profile?.effective?.version || "-"} />
+          <ReadOnlyTile label="基线 Revision" value={profile?.effective?.revision || "-"} />
           <ReadOnlyTile label="当前来源" value={profile?.effective?.updated_from || "builtin"} />
           <ReadOnlyTile label="Profile 摘要" value={currentFingerprint} />
         </div>
 
         <div className="overflow-x-auto rounded-lg border">
-          <table className="min-w-[920px] text-sm">
+          <table className="min-w-[1080px] text-sm">
             <thead className="bg-muted/50 text-left text-xs text-muted-foreground">
               <tr>
                 <th className="px-3 py-2 font-medium">版本</th>
                 <th className="px-3 py-2 font-medium">状态</th>
-                <th className="px-3 py-2 font-medium">Prompt Hash</th>
+                <th className="px-3 py-2 font-medium">稳定提示词</th>
+                <th className="px-3 py-2 font-medium">完整动态 Prompt</th>
                 <th className="px-3 py-2 font-medium">Trace Hash</th>
                 <th className="px-3 py-2 font-medium">Diff</th>
                 <th className="px-3 py-2 font-medium">拉取时间</th>
@@ -1180,7 +1342,7 @@ function ClaudeCodeProfileSnapshotsPanel({
             <tbody>
               {snapshots.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
+                  <td colSpan={8} className="px-3 py-8 text-center text-muted-foreground">
                     还没有 Profile 基线，先拉取当前版本或最新版本。
                   </td>
                 </tr>
@@ -1192,11 +1354,23 @@ function ClaudeCodeProfileSnapshotsPanel({
                         <span className="font-medium">{item.version}</span>
                       </div>
                       <div className="text-xs text-muted-foreground">{item.source}</div>
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {Object.entries(item.request_kind_summary || {}).map(([kind, count]) => (
+                          <Badge key={kind} tone="neutral">{kind} {count}</Badge>
+                        ))}
+                      </div>
                     </td>
                     <td className="px-3 py-2">
                       <Badge tone={item.status === "promoted" ? "success" : item.status === "failed" ? "danger" : "info"}>{snapshotStatusText(item.status)}</Badge>
                     </td>
-                    <td className="px-3 py-2 font-mono text-xs">{shortText(item.prompt_hash, 12)}</td>
+                    <td className="px-3 py-2 font-mono text-xs">
+                      <div>{shortText(item.static_prompt_hash, 12)}</div>
+                      <div className="mt-1 font-sans text-muted-foreground">{item.static_prompt_length || 0} 字符</div>
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs">
+                      <div>{shortText(item.full_prompt_hash || item.prompt_hash, 12)}</div>
+                      <div className="mt-1 font-sans text-muted-foreground">{item.full_prompt_length || 0} 字符</div>
+                    </td>
                     <td className="px-3 py-2 font-mono text-xs">{shortText(item.trace_hash, 12)}</td>
                     <td className="px-3 py-2">
                       <div className="flex flex-wrap items-center gap-2">
@@ -1229,7 +1403,7 @@ function ClaudeCodeProfileSnapshotsPanel({
   );
 }
 
-type ProfileDiffTab = "prompt" | "headers" | "betas" | "report";
+type ProfileDiffTab = "prompt" | "full-prompt" | "headers" | "betas" | "report";
 type DiffStatus = "same" | "missing-current" | "missing-snapshot" | "changed";
 
 interface ProfileDiffKVRow {
@@ -1261,7 +1435,7 @@ function ProfileDiffPanel({
   const [tab, setTab] = useState<ProfileDiffTab>("prompt");
   const currentPrompt = current?.system_prompt || "";
   const snapshotProfile = snapshot.normalized_profile;
-  const snapshotPrompt = snapshot.prompt_md || snapshotProfile?.system_prompt || "";
+  const snapshotPrompt = snapshot.static_prompts_md || snapshotProfile?.system_prompt || "";
   const lineRows = useMemo(() => buildProfileLineDiff(currentPrompt, snapshotPrompt), [currentPrompt, snapshotPrompt]);
   const headerRows = useMemo(() => buildProfileMapDiff(current?.headers, snapshotProfile?.headers), [current?.headers, snapshotProfile?.headers]);
   const betaRows = useMemo(() => buildProfileListDiff(current?.betas, snapshotProfile?.betas), [current?.betas, snapshotProfile?.betas]);
@@ -1289,7 +1463,10 @@ function ProfileDiffPanel({
 
       <div className="flex flex-wrap gap-2">
         <ProfileDiffTabButton active={tab === "prompt"} onClick={() => setTab("prompt")}>
-          System Prompt
+          稳定提示词
+        </ProfileDiffTabButton>
+        <ProfileDiffTabButton active={tab === "full-prompt"} onClick={() => setTab("full-prompt")}>
+          完整动态 Prompt
         </ProfileDiffTabButton>
         <ProfileDiffTabButton active={tab === "headers"} onClick={() => setTab("headers")}>
           Headers
@@ -1304,6 +1481,11 @@ function ProfileDiffPanel({
 
       {tab === "prompt" ? (
         <ProfilePromptSideBySide rows={lineRows} currentTitle="当前运行" snapshotTitle={`Phistory ${snapshot.version || ""}`} />
+      ) : null}
+      {tab === "full-prompt" ? (
+        <pre className="max-h-[520px] overflow-auto whitespace-pre-wrap rounded-md bg-slate-950 p-3 text-xs leading-5 text-slate-50">
+          {snapshot.prompt_md || "快照未包含完整动态 Prompt。"}
+        </pre>
       ) : null}
       {tab === "headers" ? (
         <ProfileKVTable rows={headerRows} leftTitle="当前运行" rightTitle="Phistory 快照" emptyText="Headers 一致或均为空。" />
@@ -1682,7 +1864,17 @@ function ReadOnlyTile({ label, value }: { label: string; value: string }) {
   );
 }
 
-function AccountPoolMetrics({ stats, usage, config }: { stats?: ClaudeCodePoolStats; usage?: UsageSummary; config: ClaudeCodePoolEffectiveConfig }) {
+function AccountPoolMetrics({
+  stats,
+  usage,
+  config,
+  compactUsage = false
+}: {
+  stats?: ClaudeCodePoolStats;
+  usage?: UsageSummary;
+  config: ClaudeCodePoolEffectiveConfig;
+  compactUsage?: boolean;
+}) {
   const rpmLimit = stats?.rpm_limit || config.routing.per_account_rpm * Math.max(1, stats?.account_count || 0);
   return (
     <Card>
@@ -1715,18 +1907,44 @@ function AccountPoolMetrics({ stats, usage, config }: { stats?: ClaudeCodePoolSt
           />
         </div>
 
-        <div className="grid grid-cols-5 gap-3 max-[1180px]:grid-cols-3 max-[760px]:grid-cols-2 max-[480px]:grid-cols-1">
+        {!compactUsage ? (
+          <div className="grid grid-cols-5 gap-3 max-[1180px]:grid-cols-3 max-[760px]:grid-cols-2 max-[480px]:grid-cols-1">
+            <CompactStat label="真实输入" value={formatTokenLarge(stats?.raw_input_tokens || stats?.input_tokens || 0)} />
+            <CompactStat label="真实输出" value={formatTokenLarge(stats?.output_tokens || 0)} />
+            <CompactStat label="缓存创建" value={formatTokenLarge(stats?.cache_creation_tokens || 0)} />
+            <CompactStat label="缓存读取" value={formatTokenLarge(stats?.cache_read_tokens || 0)} />
+            <CompactStat label="真实总量" value={formatTokenLarge(stats?.raw_total_tokens || realTotalTokens(stats))} />
+          </div>
+        ) : null}
+
+        <div className={cn("grid gap-3", compactUsage ? "grid-cols-1" : "grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.2fr)] max-[1080px]:grid-cols-1")}>
+          {!compactUsage ? <UsageBucket title="近 1h 按模型" items={usage?.by_requested_model?.length ? usage.by_requested_model : usage?.by_model || []} /> : null}
+          {!compactUsage ? <UsageBucket title="近 1h 按账号" items={usage?.by_account || []} /> : null}
+          <RecentRoutingErrors errors={stats?.recent_errors || []} />
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function AccountUsagePanel({ stats, usage }: { stats?: ClaudeCodePoolStats; usage?: UsageSummary }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>真实 Token 用量</CardTitle>
+        <CardDescription>使用 Anthropic 返回的原始 usage，不受纯净模式下游计费口径影响。</CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid grid-cols-5 gap-3 max-[980px]:grid-cols-3 max-[640px]:grid-cols-2">
           <CompactStat label="真实输入" value={formatTokenLarge(stats?.raw_input_tokens || stats?.input_tokens || 0)} />
           <CompactStat label="真实输出" value={formatTokenLarge(stats?.output_tokens || 0)} />
           <CompactStat label="缓存创建" value={formatTokenLarge(stats?.cache_creation_tokens || 0)} />
           <CompactStat label="缓存读取" value={formatTokenLarge(stats?.cache_read_tokens || 0)} />
           <CompactStat label="真实总量" value={formatTokenLarge(stats?.raw_total_tokens || realTotalTokens(stats))} />
         </div>
-
-        <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.2fr)] gap-3 max-[1080px]:grid-cols-1">
-          <UsageBucket title="近 1h 按模型" items={usage?.by_requested_model?.length ? usage.by_requested_model : usage?.by_model || []} />
-          <UsageBucket title="近 1h 按账号" items={usage?.by_account || []} />
-          <RecentRoutingErrors errors={stats?.recent_errors || []} />
+        <div className="grid grid-cols-2 gap-3 max-[860px]:grid-cols-1">
+          <UsageBucket title="按模型" items={usage?.by_requested_model?.length ? usage.by_requested_model : usage?.by_model || []} />
+          <UsageBucket title="按账号" items={usage?.by_account || []} />
         </div>
       </CardContent>
     </Card>
@@ -1769,12 +1987,14 @@ function AccountPoolConfigPanel({
 }) {
   const [enabled, setEnabled] = useState(config.enabled);
   const [pureMode, setPureMode] = useState(config.pure_mode);
+  const [allowClientCacheTTL, setAllowClientCacheTTL] = useState(config.allow_client_cache_ttl);
   useEffect(() => {
     setEnabled(config.enabled);
     setPureMode(config.pure_mode);
-  }, [config.enabled, config.pure_mode]);
+    setAllowClientCacheTTL(config.allow_client_cache_ttl);
+  }, [config.allow_client_cache_ttl, config.enabled, config.pure_mode]);
   const mutation = useMutation({
-    mutationFn: () => api.savePoolConfig(toRawPoolConfig({ ...config, enabled, pure_mode: pureMode })),
+    mutationFn: () => api.savePoolConfig(toRawPoolConfig({ ...config, enabled, pure_mode: pureMode, allow_client_cache_ttl: allowClientCacheTTL })),
     onSuccess: async () => {
       await onDone();
       onToast("基础配置已保存");
@@ -1785,11 +2005,20 @@ function AccountPoolConfigPanel({
     <Card>
       <CardHeader>
         <CardTitle>基础配置</CardTitle>
-        <CardDescription>账号池开关和 Claude Code 请求净化策略。</CardDescription>
+        <CardDescription>账号池开关、请求缓存和下游 usage 净化策略。</CardDescription>
       </CardHeader>
       <CardContent className="grid gap-4">
         <ToggleRow label="启用账号池" checked={enabled} onChange={setEnabled} />
-        <ToggleRow label="纯净模式" checked={pureMode} onChange={setPureMode} />
+        <ToggleRow label="纯净计费模式" checked={pureMode} onChange={setPureMode} />
+        <ToggleBox
+          label="允许请求参数控制缓存 TTL"
+          help="默认关闭：账号池发往 Anthropic 的已有缓存断点统一使用 1 小时。开启后，客户端显式传入的 ttl: 5m 或 ttl: 1h 会被保留；未指定 ttl 的断点仍使用 1 小时。"
+          checked={allowClientCacheTTL}
+          onChange={setAllowClientCacheTTL}
+        />
+        <div className="rounded-lg border bg-muted/30 px-3 py-2 text-sm leading-6 text-muted-foreground">
+          只清理返回给下游的输入与缓存 usage，扣除账号池自动注入的 Claude Code 请求开销；上游请求、真实账本和 Anthropic 实际消耗保持不变。
+        </div>
         <div className="rounded-lg border bg-muted/30 px-3 py-2 text-sm leading-6 text-muted-foreground">
           <div className="flex items-center gap-2 font-medium text-foreground">
             <Database className="h-4 w-4" />
@@ -1808,166 +2037,35 @@ function AccountPoolConfigPanel({
   );
 }
 
-function VirtualCachePanel({
-  config,
-  stats,
-  onDone,
-  onToast
-}: {
-  config: ClaudeCodePoolEffectiveConfig;
-  stats?: ClaudeCodePoolStats;
-  onDone: () => Promise<void>;
-  onToast: (message: string, tone?: ToastState["tone"]) => void;
-}) {
-  const [virtualCache, setVirtualCache] = useState<VirtualCacheEffectiveConfig>(config.virtual_cache);
-  useEffect(() => {
-    setVirtualCache(config.virtual_cache);
-  }, [config.virtual_cache]);
-  const setField = <K extends keyof VirtualCacheEffectiveConfig>(key: K, value: VirtualCacheEffectiveConfig[K]) =>
-    setVirtualCache((prev) => ({ ...prev, [key]: value }));
-  const mutation = useMutation({
-    mutationFn: () => api.savePoolConfig(toRawPoolConfig({ ...config, virtual_cache: virtualCache })),
-    onSuccess: async () => {
-      await onDone();
-      onToast("虚拟账本配置已保存");
-    },
-    onError: (error) => onToast(`保存失败：${errorMessage(error)}`, "danger")
-  });
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>虚拟账本</CardTitle>
-        <CardDescription>对外缓存口径。默认关闭，真实缓存优先靠会话亲和和固定出口。</CardDescription>
-      </CardHeader>
-      <CardContent className="grid gap-4">
-        <div className="grid grid-cols-3 gap-3 max-[640px]:grid-cols-1">
-          <CompactStat label="目标" value={formatRatioPercent(virtualCache.target_cache_reuse_ratio)} />
-          <CompactStat label="实际" value={formatRatioPercent(stats?.real_cache_ratio)} />
-          <CompactStat label="样本" value={`${stats?.request_count || 0}`} />
-        </div>
-        <ToggleRow label="启用虚拟缓存账本" checked={virtualCache.enabled} onChange={(value) => setField("enabled", value)} />
-        <Field label="账本模式">
-          <Select value={virtualCache.mode} onChange={(event) => setField("mode", event.target.value)}>
-            <option value="natural">自然增长</option>
-            <option value="forced">强制目标</option>
-          </Select>
-        </Field>
-        <div className="grid grid-cols-3 gap-3 max-[760px]:grid-cols-1">
-          <PercentInput label="缓存命中率 %" value={virtualCache.hit_rate} onChange={(value) => setField("hit_rate", value)} />
-          <PercentInput
-            label="目标复用率 %"
-            value={virtualCache.target_cache_reuse_ratio}
-            onChange={(value) => setField("target_cache_reuse_ratio", value)}
-          />
-          <PercentInput
-            label="压缩重置比例 %"
-            value={virtualCache.context_shrink_reset_ratio}
-            onChange={(value) => setField("context_shrink_reset_ratio", value)}
-          />
-          <NumberField label="最小缓存 Tokens" value={virtualCache.min_cache_tokens} onChange={(value) => setField("min_cache_tokens", value)} />
-          <NumberField label="最大缓存 Tokens" value={virtualCache.max_cache_tokens} onChange={(value) => setField("max_cache_tokens", value)} />
-          <NumberField
-            label="未缓存输入 Tokens"
-            value={virtualCache.uncached_input_tokens}
-            onChange={(value) => setField("uncached_input_tokens", value)}
-          />
-          <NumberField
-            label="最小创建 Tokens"
-            value={virtualCache.min_creation_tokens}
-            onChange={(value) => setField("min_creation_tokens", value)}
-          />
-          <NumberField
-            label="最大创建 Tokens"
-            value={virtualCache.max_creation_tokens}
-            onChange={(value) => setField("max_creation_tokens", value)}
-          />
-        </div>
-        <div className="flex justify-end">
-          <Button onClick={() => mutation.mutate()} disabled={mutation.isPending}>
-            {mutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-            保存账本
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function CloakConfigPanel({
-  config,
-  onDone,
-  onToast
-}: {
-  config: ClaudeCodePoolEffectiveConfig;
-  onDone: () => Promise<void>;
-  onToast: (message: string, tone?: ToastState["tone"]) => void;
-}) {
-  const [cloak, setCloak] = useState<CloakEffectiveConfig>(config.cloak);
-  const [enabled, setEnabled] = useState(config.cloak.mode !== "never");
-  const [sensitiveWordsText, setSensitiveWordsText] = useState((config.cloak.sensitive_words || []).join("\n"));
-  useEffect(() => {
-    setCloak(config.cloak);
-    setEnabled(config.cloak.mode !== "never");
-    setSensitiveWordsText((config.cloak.sensitive_words || []).join("\n"));
-  }, [config.cloak]);
-  const setField = <K extends keyof CloakEffectiveConfig>(key: K, value: CloakEffectiveConfig[K]) =>
-    setCloak((prev) => ({ ...prev, [key]: value }));
-  const effectiveCloak: CloakEffectiveConfig = {
-    ...cloak,
-    mode: enabled ? (cloak.mode === "never" ? "auto" : cloak.mode || "auto") : "never",
-    sensitive_words: parseSensitiveWords(sensitiveWordsText)
-  };
-  const mutation = useMutation({
-    mutationFn: () => api.savePoolConfig(toRawPoolConfig({ ...config, cloak: effectiveCloak })),
-    onSuccess: async () => {
-      await onDone();
-      onToast("请求伪装已保存");
-    },
-    onError: (error) => onToast(`保存失败：${errorMessage(error)}`, "danger")
-  });
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>请求伪装</CardTitle>
-        <CardDescription>全局作用于 Claude Code Account Pool 的 OAuth 账号。</CardDescription>
-      </CardHeader>
-      <CardContent className="grid gap-4">
-        <div className="grid grid-cols-3 gap-3 max-[860px]:grid-cols-1">
-          <ToggleBox label="启用请求伪装" checked={enabled} onChange={setEnabled} />
-          <Field label="模式">
-            <Select
-              value={effectiveCloak.mode}
-              onChange={(event) => {
-                const mode = event.target.value;
-                setEnabled(mode !== "never");
-                setField("mode", mode);
-              }}
-            >
-              <option value="auto">自动</option>
-              <option value="always">始终</option>
-              <option value="never">关闭</option>
-            </Select>
-          </Field>
-          <ToggleBox label="严格模式" checked={cloak.strict_mode} onChange={(value) => setField("strict_mode", value)} />
-          <Field label="敏感词" className="col-span-2 max-[860px]:col-span-1">
-            <Textarea
-              value={sensitiveWordsText}
-              onChange={(event) => setSensitiveWordsText(event.target.value)}
-              placeholder="每行一个，或用英文逗号分隔"
-              className="min-h-24"
-            />
-          </Field>
-        </div>
-        <div className="flex justify-end">
-          <Button onClick={() => mutation.mutate()} disabled={mutation.isPending}>
-            {mutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-            保存伪装
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
+const ROUTING_HELP: Partial<Record<keyof RoutingEffectiveConfig, string>> = {
+  cache_affinity_enabled: "让同一显式会话优先使用同一账号，并让长上下文缓存前缀使用稳定的备用账号，提高 Anthropic 真实缓存命中率。没有 Session ID 的请求不会建立会话绑定。",
+  cache_affinity_auto: "根据账号池规模、可用账号和当前压力自动调整亲和 lanes。关闭后固定使用下方配置的亲和 lanes 与最大 lanes。",
+  account_capacity_profile: "预设每账号 RPM 和基础并发。选择“自定义”时使用右侧手动值；其他档位由系统套用预设容量。OAuth 账号建议使用保守档位或较低的自定义值。",
+  per_account_rpm: "单个账号每分钟最多发起的真实上游请求次数。首次请求和每次重试都会计数；Sticky 并发预留不会增加此上限。",
+  per_account_concurrency: "单个账号允许同时执行的基础请求数。数值越高吞吐越大，但更容易触发上游限流或账号风险。",
+  sticky_concurrency_reserve: "仅供已绑定到该账号的亲和会话使用的额外并发槽位。新会话和普通请求不能占用，也不会增加 RPM。",
+  max_sessions: "单个账号最多维持的活跃显式会话数。这是调度软上限：新会话会改选其他账号，已有会话仍可继续；空闲达到活跃 TTL 后释放名额。",
+  max_switches: "一次请求最多允许切换到其他账号的次数。数值过大会放大请求延迟和账号池压力；请求参数错误不会触发换号。",
+  sticky_wait_ms: "已绑定会话的主账号满载时，等待并发槽位释放的最长时间。超时后才尝试备用账号或返回 429。单位：毫秒。",
+  fallback_wait_ms: "普通请求或无绑定请求在账号满载时等待可用槽位的最长时间。超时后返回本地 429。单位：毫秒。",
+  max_waiters_per_account: "单个账号允许排队等待并发槽位的请求数。达到上限后新请求不会继续排队。",
+  max_waiters_global: "整个 Claude Code 账号池允许同时排队的请求总数，用于避免满载时积压过多请求。",
+  session_affinity_ttl_ms: "会话主账号绑定的空闲有效期，命中后会续期。过期后该会话重新参与账号选择。单位：毫秒。",
+  active_session_idle_ttl_ms: "活跃会话占用 MaxSessions 名额的空闲时间，默认 5 分钟。它独立于 1 小时会话亲和。单位：毫秒。",
+  switch_delay_ms: "换到另一个账号前的等待时间，用于避免错误发生后立即连续冲击多个账号。单位：毫秒。",
+  rate_limit_cooldown_ms: "遇到没有明确 Retry-After/reset 的 HTTP 429 时，第一次对该模型执行的本地冷却时间。单位：毫秒。",
+  rate_limit_max_cooldown_ms: "HTTP 429 本地指数退避允许增长到的最长冷却时间；上游返回明确 reset 时优先采用上游时间。单位：毫秒。",
+  overload_cooldown_ms: "遇到 HTTP 529 上游过载时，第一次对该模型执行的本地冷却时间。单位：毫秒。",
+  overload_max_cooldown_ms: "HTTP 529 连续发生时，本地指数退避允许增长到的最长冷却时间。单位：毫秒。",
+  same_account_retry_429: "收到 HTTP 429 后，在同一账号上再次尝试的次数。每次尝试都会消耗 RPM；通常建议设为 0。",
+  same_account_retry_529: "收到 HTTP 529 后，在同一账号上再次尝试的次数。适合短暂上游过载，默认 1 次。",
+  same_account_retry_delay_ms: "429/529 同账号重试之间的固定等待时间。单位：毫秒。",
+  cache_affinity_min_cache_tokens: "只有请求中的缓存相关 Token 达到此阈值，才启用长上下文前缀亲和；较短请求仍只使用会话主绑定。",
+  cache_affinity_lanes: "一个缓存前缀期望维持的稳定账号通道数。主账号不可用时会从这些 lanes 中选择备用；手动策略下直接生效。",
+  cache_affinity_max_lanes: "同一缓存前缀最多可扩展到的账号通道数。自动策略会在该上限内按账号池规模和压力调整。",
+  cache_affinity_wait_ms: "亲和账号暂时满载时，为保住真实缓存命中而等待该账号的时间；超时后才使用其他账号。单位：毫秒。",
+  cache_affinity_ttl_ms: "缓存前缀与稳定 lanes 的空闲有效期，命中后会续期。它独立于上面的会话主绑定 TTL。单位：毫秒。"
+};
 
 function RoutingProtectionPanel({
   config,
@@ -1988,93 +2086,72 @@ function RoutingProtectionPanel({
     mutationFn: () => api.savePoolConfig(toRawPoolConfig({ ...config, routing })),
     onSuccess: async () => {
       await onDone();
-      onToast("路由保护已保存");
+      onToast("全局默认策略已保存");
     },
     onError: (error) => onToast(`保存失败：${errorMessage(error)}`, "danger")
   });
   return (
     <Card>
       <CardHeader>
-        <CardTitle>路由保护</CardTitle>
-        <CardDescription>限速、换号与真实缓存亲和。Claude Code OAuth 账号建议保持保守。</CardDescription>
+        <CardTitle>全局默认策略</CardTitle>
+        <CardDescription>未设置独立策略的账号池继承这里的调度参数。</CardDescription>
       </CardHeader>
       <CardContent className="grid gap-4">
-        <div className="grid grid-cols-3 gap-3 max-[900px]:grid-cols-2 max-[560px]:grid-cols-1">
-          <ToggleBox label="启用缓存亲和" checked={routing.cache_affinity_enabled} onChange={(value) => setField("cache_affinity_enabled", value)} />
-          <ToggleBox label="自动策略" checked={routing.cache_affinity_auto} onChange={(value) => setField("cache_affinity_auto", value)} />
-          <Field label="容量档位">
+        <div className="grid grid-cols-4 gap-3 max-[1040px]:grid-cols-2 max-[560px]:grid-cols-1">
+          <ToggleBox label="启用缓存亲和" help={ROUTING_HELP.cache_affinity_enabled} checked={routing.cache_affinity_enabled} onChange={(value) => setField("cache_affinity_enabled", value)} />
+          <ToggleBox label="自动策略" help={ROUTING_HELP.cache_affinity_auto} checked={routing.cache_affinity_auto} onChange={(value) => setField("cache_affinity_auto", value)} />
+          <Field label="承载档位" help={ROUTING_HELP.account_capacity_profile}>
             <Select value={routing.account_capacity_profile} onChange={(event) => setField("account_capacity_profile", event.target.value)}>
               <option value="custom">自定义</option>
               <option value="conservative">保守</option>
-              <option value="balanced">均衡</option>
+              <option value="standard">标准</option>
               <option value="aggressive">激进</option>
             </Select>
           </Field>
-          <NumberField label="每账号 RPM" value={routing.per_account_rpm} onChange={(value) => setField("per_account_rpm", value)} />
+          <NumberField label="每账号 RPM" help={ROUTING_HELP.per_account_rpm} value={routing.per_account_rpm} onChange={(value) => setField("per_account_rpm", value)} />
           <NumberField
             label="每账号并发"
+            help={ROUTING_HELP.per_account_concurrency}
             value={routing.per_account_concurrency}
             onChange={(value) => setField("per_account_concurrency", value)}
           />
-          <NumberField label="最大换号次数" value={routing.max_switches} onChange={(value) => setField("max_switches", value)} />
-          <NumberField label="换号间隔 ms" value={routing.switch_delay_ms} onChange={(value) => setField("switch_delay_ms", value)} />
-          <NumberField
-            label="429 初始冷却 ms"
-            value={routing.rate_limit_cooldown_ms}
-            onChange={(value) => setField("rate_limit_cooldown_ms", value)}
-          />
-          <NumberField
-            label="429 最大冷却 ms"
-            value={routing.rate_limit_max_cooldown_ms}
-            onChange={(value) => setField("rate_limit_max_cooldown_ms", value)}
-          />
-          <NumberField
-            label="529 初始冷却 ms"
-            value={routing.overload_cooldown_ms}
-            onChange={(value) => setField("overload_cooldown_ms", value)}
-          />
-          <NumberField
-            label="529 最大冷却 ms"
-            value={routing.overload_max_cooldown_ms}
-            onChange={(value) => setField("overload_max_cooldown_ms", value)}
-          />
-          <NumberField
-            label="429 同号重试"
-            value={routing.same_account_retry_429}
-            onChange={(value) => setField("same_account_retry_429", value)}
-          />
-          <NumberField
-            label="529 同号重试"
-            value={routing.same_account_retry_529}
-            onChange={(value) => setField("same_account_retry_529", value)}
-          />
-          <NumberField
-            label="同号重试间隔 ms"
-            value={routing.same_account_retry_delay_ms}
-            onChange={(value) => setField("same_account_retry_delay_ms", value)}
-          />
-          <NumberField
-            label="最小缓存 Tokens"
-            value={routing.cache_affinity_min_cache_tokens}
-            onChange={(value) => setField("cache_affinity_min_cache_tokens", value)}
-          />
-          <NumberField label="亲和 lanes" value={routing.cache_affinity_lanes} onChange={(value) => setField("cache_affinity_lanes", value)} />
-          <NumberField
-            label="亲和最大 lanes"
-            value={routing.cache_affinity_max_lanes}
-            onChange={(value) => setField("cache_affinity_max_lanes", value)}
-          />
-          <NumberField
-            label="亲和等待 ms"
-            value={routing.cache_affinity_wait_ms}
-            onChange={(value) => setField("cache_affinity_wait_ms", value)}
-          />
-          <NumberField label="亲和 TTL ms" value={routing.cache_affinity_ttl_ms} onChange={(value) => setField("cache_affinity_ttl_ms", value)} />
+          <NumberField label="最大换号次数" help={ROUTING_HELP.max_switches} value={routing.max_switches} onChange={(value) => setField("max_switches", value)} />
         </div>
+        <details className="rounded-lg border bg-muted/20">
+          <summary className="cursor-pointer px-4 py-3 text-sm font-medium">高级路由设置</summary>
+          <div className="grid grid-cols-4 gap-3 border-t p-4 max-[1040px]:grid-cols-2 max-[560px]:grid-cols-1">
+            <NumberField label="亲和会话额外并发" help={ROUTING_HELP.sticky_concurrency_reserve} value={routing.sticky_concurrency_reserve} onChange={(value) => setField("sticky_concurrency_reserve", value)} />
+            <NumberField label="活跃会话软上限" help={ROUTING_HELP.max_sessions} value={routing.max_sessions} onChange={(value) => setField("max_sessions", value)} />
+            <NumberField label="Sticky 等待 ms" help={ROUTING_HELP.sticky_wait_ms} value={routing.sticky_wait_ms} onChange={(value) => setField("sticky_wait_ms", value)} />
+            <NumberField label="普通等待 ms" help={ROUTING_HELP.fallback_wait_ms} value={routing.fallback_wait_ms} onChange={(value) => setField("fallback_wait_ms", value)} />
+            <NumberField label="单账号等待上限" help={ROUTING_HELP.max_waiters_per_account} value={routing.max_waiters_per_account} onChange={(value) => setField("max_waiters_per_account", value)} />
+            <NumberField label="全局等待上限" help={ROUTING_HELP.max_waiters_global} value={routing.max_waiters_global} onChange={(value) => setField("max_waiters_global", value)} />
+	            <NumberField label="会话亲和 TTL ms" help={ROUTING_HELP.session_affinity_ttl_ms} value={routing.session_affinity_ttl_ms} onChange={(value) => setField("session_affinity_ttl_ms", value)} />
+	            <NumberField label="活跃会话 TTL ms" help={ROUTING_HELP.active_session_idle_ttl_ms} value={routing.active_session_idle_ttl_ms} onChange={(value) => setField("active_session_idle_ttl_ms", value)} />
+            <NumberField label="换号间隔 ms" help={ROUTING_HELP.switch_delay_ms} value={routing.switch_delay_ms} onChange={(value) => setField("switch_delay_ms", value)} />
+            <NumberField label="429 初始冷却 ms" help={ROUTING_HELP.rate_limit_cooldown_ms} value={routing.rate_limit_cooldown_ms} onChange={(value) => setField("rate_limit_cooldown_ms", value)} />
+            <NumberField label="429 最大冷却 ms" help={ROUTING_HELP.rate_limit_max_cooldown_ms} value={routing.rate_limit_max_cooldown_ms} onChange={(value) => setField("rate_limit_max_cooldown_ms", value)} />
+            <NumberField label="529 初始冷却 ms" help={ROUTING_HELP.overload_cooldown_ms} value={routing.overload_cooldown_ms} onChange={(value) => setField("overload_cooldown_ms", value)} />
+            <NumberField label="529 最大冷却 ms" help={ROUTING_HELP.overload_max_cooldown_ms} value={routing.overload_max_cooldown_ms} onChange={(value) => setField("overload_max_cooldown_ms", value)} />
+            <NumberField label="429 同号重试" help={ROUTING_HELP.same_account_retry_429} value={routing.same_account_retry_429} onChange={(value) => setField("same_account_retry_429", value)} />
+            <NumberField label="529 同号重试" help={ROUTING_HELP.same_account_retry_529} value={routing.same_account_retry_529} onChange={(value) => setField("same_account_retry_529", value)} />
+            <NumberField label="重试间隔 ms" help={ROUTING_HELP.same_account_retry_delay_ms} value={routing.same_account_retry_delay_ms} onChange={(value) => setField("same_account_retry_delay_ms", value)} />
+            <NumberField label="最小缓存 Tokens" help={ROUTING_HELP.cache_affinity_min_cache_tokens} value={routing.cache_affinity_min_cache_tokens} onChange={(value) => setField("cache_affinity_min_cache_tokens", value)} />
+            <NumberField label="亲和 lanes" help={ROUTING_HELP.cache_affinity_lanes} value={routing.cache_affinity_lanes} onChange={(value) => setField("cache_affinity_lanes", value)} />
+            <NumberField label="最大 lanes" help={ROUTING_HELP.cache_affinity_max_lanes} value={routing.cache_affinity_max_lanes} onChange={(value) => setField("cache_affinity_max_lanes", value)} />
+            <NumberField label="亲和等待 ms" help={ROUTING_HELP.cache_affinity_wait_ms} value={routing.cache_affinity_wait_ms} onChange={(value) => setField("cache_affinity_wait_ms", value)} />
+            <NumberField label="亲和 TTL ms" help={ROUTING_HELP.cache_affinity_ttl_ms} value={routing.cache_affinity_ttl_ms} onChange={(value) => setField("cache_affinity_ttl_ms", value)} />
+          </div>
+        </details>
+        {routing.per_account_rpm > 6 || routing.per_account_concurrency > 1 || routing.sticky_concurrency_reserve > 1 ? (
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+            当前请求强度高于保守档位（6 RPM / 1 并发 / 1 亲和额外并发），请结合账号额度和实际错误率评估。
+          </div>
+        ) : null}
         <div className="flex justify-end">
           <Button onClick={() => mutation.mutate()} disabled={mutation.isPending}>
             {mutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-            保存路由
+            保存全局策略
           </Button>
         </div>
       </CardContent>
@@ -2111,7 +2188,7 @@ function ModelManagementPanel({
     },
     onError: (error) => onToast(`拉取模型失败：${errorMessage(error)}`, "danger")
   });
-  const runnableAccounts = accounts.filter((row) => row.account.enabled && row.account.has_auth_data);
+  const runnableAccounts = accounts.filter((row) => row.account.effective_schedulable && row.account.has_auth_data);
 
   return (
     <Card>
@@ -2301,17 +2378,37 @@ function SegmentedTabs<T extends string>({
   onChange: (value: T) => void;
   items: Array<{ value: T; label: string }>;
 }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const activeButtonRef = useRef<HTMLButtonElement>(null);
+
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    const activeButton = activeButtonRef.current;
+    if (!container || !activeButton) {
+      return;
+    }
+
+    const left = activeButton.offsetLeft;
+    const right = left + activeButton.offsetWidth;
+    if (left < container.scrollLeft) {
+      container.scrollLeft = left;
+    } else if (right > container.scrollLeft + container.clientWidth) {
+      container.scrollLeft = right - container.clientWidth;
+    }
+  }, [value]);
+
   return (
-    <div className="flex w-full flex-wrap gap-2 rounded-lg border bg-card p-1">
+    <div ref={containerRef} className="flex w-full flex-nowrap gap-1 overflow-x-auto rounded-lg border bg-card p-1">
       {items.map((item) => {
         const active = item.value === value;
         return (
           <button
             key={item.value}
+            ref={active ? activeButtonRef : undefined}
             type="button"
             className={cn(
-              "min-h-10 rounded-md px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-              active ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:bg-muted hover:text-foreground"
+              "min-h-9 shrink-0 rounded-md px-4 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              active ? "bg-foreground text-background shadow-sm" : "text-muted-foreground hover:bg-muted hover:text-foreground"
             )}
             onClick={() => onChange(item.value)}
           >
@@ -2319,6 +2416,60 @@ function SegmentedTabs<T extends string>({
           </button>
         );
       })}
+    </div>
+  );
+}
+
+function AccountWorkspaceToolbar({
+  query,
+  status,
+  viewMode,
+  total,
+  filtered,
+  onQueryChange,
+  onStatusChange,
+  onViewModeChange
+}: {
+  query: string;
+  status: "all" | "available" | "checking" | "cooling" | "error" | "disabled";
+  viewMode: "cards" | "table";
+  total: number;
+  filtered: number;
+  onQueryChange: (value: string) => void;
+  onStatusChange: (value: "all" | "available" | "checking" | "cooling" | "error" | "disabled") => void;
+  onViewModeChange: (value: "cards" | "table") => void;
+}) {
+  return (
+    <div className="workspace-toolbar flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card p-3">
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+        <label className="relative min-w-[220px] flex-1 max-w-md">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={query}
+            onChange={(event) => onQueryChange(event.target.value)}
+            placeholder="搜索邮箱、Auth ID、代理"
+            className="pl-9 pr-9"
+          />
+          {query ? (
+            <button type="button" className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground" onClick={() => onQueryChange("")} aria-label="清空搜索">
+              <X className="h-3.5 w-3.5" />
+            </button>
+          ) : null}
+        </label>
+        <Select value={status} onChange={(event) => onStatusChange(event.target.value as typeof status)} className="w-32">
+          <option value="all">全部状态</option>
+          <option value="available">可调度</option>
+          <option value="checking">检查中</option>
+          <option value="cooling">冷却中</option>
+          <option value="error">有错误</option>
+          <option value="disabled">暂停调度</option>
+        </Select>
+        <span className="whitespace-nowrap text-xs text-muted-foreground">{filtered} / {total}</span>
+      </div>
+      <div className="view-toggle flex rounded-lg border bg-muted/40 p-0.5" aria-label="账号显示方式">
+        <button type="button" className={cn("icon-segment", viewMode === "cards" && "active")} onClick={() => onViewModeChange("cards")} title="卡片视图" aria-label="卡片视图"><LayoutGrid className="h-4 w-4" /></button>
+        <button type="button" className={cn("icon-segment", viewMode === "table" && "active")} onClick={() => onViewModeChange("table")} title="表格视图" aria-label="表格视图"><List className="h-4 w-4" /></button>
+      </div>
     </div>
   );
 }
@@ -2334,6 +2485,7 @@ function AccountCardsPanel({
   selectedCount,
   pending,
   availableCount,
+  viewMode,
   onPageChange,
   onSelectPage,
   onSelectAccount,
@@ -2346,6 +2498,7 @@ function AccountCardsPanel({
   onReset,
   onRefreshQuota,
   quotaPending,
+  onMove,
   onToggle,
   onDelete
 }: {
@@ -2359,6 +2512,7 @@ function AccountCardsPanel({
   selectedCount: number;
   pending: boolean;
   availableCount: number;
+  viewMode: "cards" | "table";
   onPageChange: (page: number) => void;
   onSelectPage: (selected: boolean) => void;
   onSelectAccount: (id: string, selected: boolean) => void;
@@ -2371,6 +2525,7 @@ function AccountCardsPanel({
   onReset: (account: ClaudeCodeAccount) => void;
   onRefreshQuota: (account: ClaudeCodeAccount) => void;
   quotaPending: boolean;
+  onMove: (row: AccountRow) => void;
   onToggle: (account: ClaudeCodeAccount) => void;
   onDelete: (account: ClaudeCodeAccount) => void;
 }) {
@@ -2378,20 +2533,8 @@ function AccountCardsPanel({
   const end = total === 0 ? 0 : start + rows.length - 1;
 
   return (
-    <Card>
-      <CardHeader className="gap-4">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="grid gap-1">
-            <CardTitle>账号卡片</CardTitle>
-            <CardDescription>OAuth 登录账号、固定出口绑定、健康度和保守调度集中管理。</CardDescription>
-          </div>
-          <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-            <Badge tone="info">每页 10 个</Badge>
-            <span>空闲代理 {availableCount}</span>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-muted/25 px-3 py-2">
+    <section className="grid gap-3">
+        {selectedCount > 0 ? <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-primary/25 bg-primary/5 px-3 py-2">
           <label className="flex min-h-10 items-center gap-2 text-sm">
             <input
               type="checkbox"
@@ -2413,10 +2556,10 @@ function AccountCardsPanel({
               测试
             </Button>
             <Button variant="outline" size="sm" onClick={() => onRunBatch("enable")} disabled={selectedCount === 0 || pending}>
-              启用
+              参与调度
             </Button>
             <Button variant="outline" size="sm" onClick={() => onRunBatch("disable")} disabled={selectedCount === 0 || pending}>
-              禁用
+              暂停调度
             </Button>
             <Button variant="outline" size="sm" onClick={() => onRunBatch("unbind")} disabled={selectedCount === 0 || pending}>
               <Unlink className="h-3.5 w-3.5" />
@@ -2438,12 +2581,11 @@ function AccountCardsPanel({
               清空
             </Button>
           </div>
-        </div>
-      </CardHeader>
-      <CardContent className="grid gap-4">
+        </div> : null}
+
         {total > 0 ? (
-          <div className="max-h-[680px] overflow-y-auto pr-1">
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,280px),1fr))] gap-3">
+          viewMode === "cards" ? (
+          <div className="account-grid grid grid-cols-[repeat(auto-fill,minmax(min(100%,300px),1fr))] gap-3">
               {rows.map((row) => (
                 <AccountPoolCard
                   key={row.account.id}
@@ -2457,19 +2599,36 @@ function AccountCardsPanel({
                   onUnbind={() => onUnbind(row.account)}
                   onReset={() => onReset(row.account)}
                   onRefreshQuota={() => onRefreshQuota(row.account)}
+                  onMove={() => onMove(row)}
                   onToggle={() => onToggle(row.account)}
                   onDelete={() => onDelete(row.account)}
                 />
               ))}
-            </div>
           </div>
+          ) : (
+            <AccountTable
+              rows={rows}
+              selectedSet={selectedSet}
+              quotaPending={quotaPending}
+              onSelectAccount={onSelectAccount}
+              onDetails={onDetails}
+              onTest={onTest}
+              onBind={onBind}
+              onUnbind={onUnbind}
+              onReset={onReset}
+              onRefreshQuota={onRefreshQuota}
+              onMove={onMove}
+              onToggle={onToggle}
+              onDelete={onDelete}
+            />
+          )
         ) : (
-          <EmptyState title="暂无账号" description="点击顶部新增 OAuth 账号，授权完成后会出现在这里。" />
+          <EmptyState title="没有匹配的账号" description="调整搜索或筛选条件，或点击顶部新增账号。" />
         )}
 
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4 text-sm text-muted-foreground">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card px-3 py-2 text-sm text-muted-foreground">
           <div>
-            第 {start}-{end} 个 / 共 {total} 个
+            第 {start}-{end} 个 / 共 {total} 个 · 空闲代理 {availableCount}
           </div>
           <div className="flex items-center gap-2">
             <Button variant="outline" size="sm" onClick={() => onPageChange(Math.max(1, page - 1))} disabled={page <= 1}>
@@ -2483,8 +2642,232 @@ function AccountCardsPanel({
             </Button>
           </div>
         </div>
-      </CardContent>
-    </Card>
+    </section>
+  );
+}
+
+function AccountTable({
+  rows,
+  selectedSet,
+  quotaPending,
+  onSelectAccount,
+  onDetails,
+  onTest,
+  onBind,
+  onUnbind,
+  onReset,
+  onRefreshQuota,
+  onMove,
+  onToggle,
+  onDelete
+}: {
+  rows: AccountRow[];
+  selectedSet: Set<string>;
+  quotaPending: boolean;
+  onSelectAccount: (id: string, selected: boolean) => void;
+  onDetails: (row: AccountRow) => void;
+  onTest: (account: ClaudeCodeAccount) => void;
+  onBind: (account: ClaudeCodeAccount) => void;
+  onUnbind: (account: ClaudeCodeAccount) => void;
+  onReset: (account: ClaudeCodeAccount) => void;
+  onRefreshQuota: (account: ClaudeCodeAccount) => void;
+  onMove: (row: AccountRow) => void;
+  onToggle: (account: ClaudeCodeAccount) => void;
+  onDelete: (account: ClaudeCodeAccount) => void;
+}) {
+  return (
+    <div className="table-scroll">
+      <table className="data-table account-table min-w-[1080px]">
+        <thead>
+          <tr>
+            <th className="w-10"></th>
+            <th>账号</th>
+            <th>状态</th>
+            <th>额度</th>
+            <th>1h 可用性</th>
+            <th>负载</th>
+            <th>30 天用量</th>
+            <th>固定出口</th>
+            <th className="w-28">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => {
+            const account = row.account;
+            const bound = Boolean(account.proxy_resource_id || account.proxy);
+            return (
+              <tr key={account.id} className="cursor-pointer" onClick={() => onDetails(row)}>
+                <td onClick={(event) => event.stopPropagation()}>
+                  <input type="checkbox" className="h-4 w-4 rounded border-border" checked={selectedSet.has(account.id)} onChange={(event) => onSelectAccount(account.id, event.target.checked)} aria-label={`选择账号 ${account.email || account.auth_id}`} />
+                </td>
+                <td>
+                    <div className="max-w-56">
+                      <div className="truncate font-medium" title={account.email || account.auth_id}>{account.email || account.auth_id}</div>
+                    </div>
+                  </td>
+                <td><AccountStatusBadge account={account} runtime={row.runtime} /></td>
+                <td>
+                  <CompactQuotaInline account={account} />
+                </td>
+                <td><AvailabilityTableCell availability={account.availability} /></td>
+                <td><CapacityInline account={account} /></td>
+                <td>
+                  <div className="min-w-32 text-xs tabular-nums">
+                    <div>{account.usage?.request_count || 0} 请求 · {formatTokenLarge(account.usage?.raw_total_tokens || 0)}</div>
+                    <div className="mt-1 font-medium text-foreground">{formatUSD(account.usage?.estimated_cost || 0)}</div>
+                  </div>
+                </td>
+                <td className="max-w-44 truncate font-mono text-xs" title={account.proxy ? proxyDisplay(account.proxy) : ""}>{account.proxy?.exit_ip || (account.proxy ? account.proxy.name : "未绑定")}</td>
+                <td onClick={(event) => event.stopPropagation()}>
+                  <div className="flex items-center gap-1">
+                    <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => onTest(account)} title="测试账号" aria-label="测试账号"><Play className="h-3.5 w-3.5" /></Button>
+                    <OverflowMenu label="账号操作">
+                      <button type="button" onClick={() => onDetails(row)}>查看详情</button>
+                      <button type="button" onClick={() => (bound ? onUnbind(account) : onBind(account))}>{bound ? "解绑代理" : "绑定代理"}</button>
+                      <button type="button" onClick={() => onRefreshQuota(account)} disabled={quotaPending}>刷新额度</button>
+                      <button type="button" onClick={() => onReset(account)}>清除冷却</button>
+                      <button type="button" onClick={() => onMove(row)}>移动账号池</button>
+                      <button type="button" onClick={() => onToggle(account)}>{account.schedulable ? "暂停调度" : "参与调度"}</button>
+                      <button type="button" className="danger" onClick={() => onDelete(account)}>删除账号</button>
+                    </OverflowMenu>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function CompactQuotaInline({ account }: { account: ClaudeCodeAccount }) {
+  const quota5h = findQuotaWindowState(account, "five_hour");
+  const quota7d = findQuotaWindowState(account, "seven_day");
+  return (
+    <div className="grid min-w-44 gap-1 whitespace-nowrap text-xs tabular-nums">
+      <div className="flex items-center gap-2">
+        <span title={quotaWindowStateTitle(quota5h)}><span className="text-muted-foreground">5h</span> {quotaWindowStateCompactValue(quota5h)}</span>
+        <span className="text-border">/</span>
+        <span title={quotaWindowStateTitle(quota7d)}><span className="text-muted-foreground">7天</span> {quotaWindowStateCompactValue(quota7d)}</span>
+      </div>
+      <CompactModelQuotaSummary account={account} />
+    </div>
+  );
+}
+
+function AvailabilityTableCell({ availability }: { availability?: AccountAvailabilitySummary }) {
+  const summary = availabilityWindowSummary(availability);
+  const hasData = summary.request_count > 0;
+  const tone = availabilityTone(summary.status);
+  return (
+    <div className="grid w-44 gap-1.5">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className={cn("font-semibold tabular-nums", tone.textClass)}>{hasData ? formatPercent(summary.success_rate) : "暂无请求"}</span>
+        {hasData ? <span className="text-muted-foreground">{summary.request_count} 次</span> : null}
+      </div>
+      <AvailabilityStrip availability={availability} compact />
+    </div>
+  );
+}
+
+function CapacityInline({ account }: { account: ClaudeCodeAccount }) {
+  const runtime = account.runtime_capacity;
+  const configured = account.capacity;
+  return (
+    <div className="whitespace-nowrap text-xs tabular-nums">
+      <span>并发 {runtime?.in_flight ?? 0}/{runtime?.concurrency_limit || configured?.concurrency_limit || 0}</span>
+      <span className="mx-1.5 text-border">·</span>
+      <span>RPM {runtime?.rpm_used ?? 0}/{runtime?.rpm_limit || configured?.base_rpm || 0}</span>
+    </div>
+  );
+}
+
+function OverflowMenu({ label, children }: { label: string; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState({ left: 0, top: 0 });
+
+  useLayoutEffect(() => {
+    if (!open) {
+      return;
+    }
+    const updatePosition = () => {
+      const trigger = triggerRef.current;
+      const menu = menuRef.current;
+      if (!trigger || !menu) {
+        return;
+      }
+      const triggerRect = trigger.getBoundingClientRect();
+      const menuRect = menu.getBoundingClientRect();
+      const viewportPadding = 8;
+      const left = Math.min(
+        window.innerWidth - menuRect.width - viewportPadding,
+        Math.max(viewportPadding, triggerRect.right - menuRect.width)
+      );
+      const spaceBelow = window.innerHeight - triggerRect.bottom - viewportPadding;
+      const top = spaceBelow >= menuRect.height + 4
+        ? triggerRect.bottom + 4
+        : Math.max(viewportPadding, triggerRect.top - menuRect.height - 4);
+      setPosition({ left, top });
+    };
+    const closeOnPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (!triggerRef.current?.contains(target) && !menuRef.current?.contains(target)) {
+        setOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
+    };
+    updatePosition();
+    window.addEventListener("resize", updatePosition);
+    document.addEventListener("scroll", updatePosition, true);
+    document.addEventListener("pointerdown", closeOnPointerDown);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      document.removeEventListener("scroll", updatePosition, true);
+      document.removeEventListener("pointerdown", closeOnPointerDown);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  return (
+    <div className="overflow-menu">
+      <button
+        ref={triggerRef}
+        type="button"
+        title={label}
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={(event) => {
+          event.stopPropagation();
+          setOpen((current) => !current);
+        }}
+      >
+        <MoreHorizontal className="h-4 w-4" />
+      </button>
+      {open
+        ? createPortal(
+            <div
+              ref={menuRef}
+              role="menu"
+              className="overflow-menu-content"
+              style={{ left: position.left, top: position.top }}
+              onClick={() => setOpen(false)}
+            >
+              {children}
+            </div>,
+            document.body
+          )
+        : null}
+    </div>
   );
 }
 
@@ -2499,6 +2882,7 @@ function AccountPoolCard({
   onUnbind,
   onReset,
   onRefreshQuota,
+  onMove,
   onToggle,
   onDelete
 }: {
@@ -2512,6 +2896,7 @@ function AccountPoolCard({
   onUnbind: () => void;
   onReset: () => void;
   onRefreshQuota: () => void;
+  onMove: () => void;
   onToggle: () => void;
   onDelete: () => void;
 }) {
@@ -2524,7 +2909,7 @@ function AccountPoolCard({
       role="button"
       tabIndex={0}
       className={cn(
-        "grid min-h-[360px] min-w-0 cursor-pointer gap-3 overflow-hidden rounded-lg border bg-card p-4 transition-colors hover:border-primary/45 hover:bg-muted/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        "grid min-w-0 cursor-pointer gap-2 overflow-visible rounded-lg border bg-card p-3 transition-colors hover:border-primary/45 hover:bg-muted/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
         selected && "border-primary bg-primary/5"
       )}
       onClick={onDetails}
@@ -2535,141 +2920,128 @@ function AccountPoolCard({
         }
       }}
     >
-      <div className="flex items-start justify-between gap-3">
-        <label className="flex min-w-0 items-start gap-2" onClick={(event) => event.stopPropagation()}>
+      <div className="flex min-w-0 items-center justify-between gap-2.5">
+        <label className="flex min-w-0 flex-1 items-center gap-2" onClick={(event) => event.stopPropagation()}>
           <input
             type="checkbox"
-            className="mt-1 h-4 w-4 shrink-0 rounded border-border"
+            className="h-4 w-4 shrink-0 rounded border-border"
             checked={selected}
             aria-label={`选择账号 ${displayName}`}
             onChange={(event) => onSelectedChange(event.target.checked)}
           />
-          <span className="min-w-0">
-            <span className="block break-all text-sm font-semibold leading-5">{displayName}</span>
-            <span className="mt-0.5 block break-all text-xs text-muted-foreground">{account.auth_id}</span>
-          </span>
+          <span className="min-w-0 truncate text-sm font-semibold leading-5" title={displayName}>{displayName}</span>
         </label>
-        <div className="flex shrink-0 flex-col items-end gap-1">
-          <AccountStatusBadge account={account} runtime={runtime} />
-          <AccountTestBadge account={account} />
-        </div>
+        <AccountStatusBadge account={account} runtime={runtime} />
       </div>
 
       <AvailabilityPanel availability={account.availability} compact />
 
-      <CompactQuotaGrid quota={account.quota} />
-      <CompactCapacity account={account} />
+      <CompactQuotaGrid account={account} />
+      <AccountMetricGrid account={account} />
       <BoundProxyIndicator account={account} />
 
-      <div className="mt-auto flex flex-wrap gap-2 border-t pt-3" onClick={(event) => event.stopPropagation()}>
-        <Button variant="outline" size="sm" onClick={onDetails}>
-          详情
-        </Button>
+      <div className="flex items-center justify-between gap-2 border-t pt-2.5" onClick={(event) => event.stopPropagation()}>
         <Button variant="outline" size="sm" onClick={onTest}>
           <Play className="h-3.5 w-3.5" />
           测试
         </Button>
-        <Button variant="outline" size="sm" onClick={bound ? onUnbind : onBind}>
-          {bound ? <Unlink className="h-3.5 w-3.5" /> : <Network className="h-3.5 w-3.5" />}
-          {bound ? "解绑" : "绑定"}
-        </Button>
-        <Button variant="outline" size="sm" onClick={onRefreshQuota} disabled={quotaPending}>
-          <RefreshCw className={cn("h-3.5 w-3.5", quotaPending && "animate-spin")} />
-          额度
-        </Button>
-        <Button variant="outline" size="sm" onClick={onReset}>
-          <Clock3 className="h-3.5 w-3.5" />
-          清冷却
-        </Button>
-        <Button variant="outline" size="sm" onClick={onToggle}>
-          {account.enabled ? "禁用" : "启用"}
-        </Button>
-        <Button variant="destructive" size="sm" onClick={onDelete}>
-          <Trash2 className="h-3.5 w-3.5" />
-          删除
-        </Button>
+        <OverflowMenu label="账号操作">
+          <button type="button" onClick={onDetails}>查看详情</button>
+          <button type="button" onClick={bound ? onUnbind : onBind}>{bound ? "解绑代理" : "绑定代理"}</button>
+          <button type="button" onClick={onRefreshQuota} disabled={quotaPending}>刷新额度</button>
+          <button type="button" onClick={onReset}>清除冷却</button>
+          <button type="button" onClick={onMove}>移动账号池</button>
+          <button type="button" onClick={onToggle}>{account.schedulable ? "暂停调度" : "参与调度"}</button>
+          <button type="button" className="danger" onClick={onDelete}>删除账号</button>
+        </OverflowMenu>
       </div>
     </article>
   );
 }
 
-function CompactQuotaGrid({ quota }: { quota?: AccountQuota }) {
+function CompactQuotaGrid({ account }: { account: ClaudeCodeAccount }) {
   return (
-    <div className="grid min-w-0 grid-cols-2 gap-2">
-      <CompactQuotaWindow label="5h" window={findQuotaWindow(quota, ["five_hour", "5 小时", "5小时"])} />
-      <CompactQuotaWindow label="7天" window={findQuotaWindow(quota, ["seven_day", "7 天", "7天"])} />
+    <div className="grid min-w-0 grid-cols-2 gap-x-4 gap-y-1.5 border-y py-2">
+      <CompactQuotaWindow label="5h" state={findQuotaWindowState(account, "five_hour")} />
+      <CompactQuotaWindow label="7天" state={findQuotaWindowState(account, "seven_day")} />
+      <div className="col-span-2"><CompactModelQuotaSummary account={account} /></div>
     </div>
   );
 }
 
-function CompactQuotaWindow({ label, window }: { label: string; window?: AccountQuota["windows"][number] }) {
-  if (!window) {
+function CompactModelQuotaSummary({ account }: { account: ClaudeCodeAccount }) {
+  const windows = [
+    { label: "S", state: findQuotaWindowState(account, "seven_day_sonnet") },
+    { label: "O", state: findQuotaWindowState(account, "seven_day_opus") },
+    { label: "F", state: findQuotaWindowState(account, "seven_day_fable") }
+  ];
+  return (
+    <div className="flex min-w-0 items-center justify-between gap-2 text-[11px] tabular-nums">
+      {windows.map(({ label, state }) => (
+        <span key={label} className="flex min-w-0 items-center gap-1 whitespace-nowrap" title={quotaWindowStateTitle(state)}>
+          <span className="text-muted-foreground">{label}</span>
+          <span className={cn("font-semibold", quotaWindowStateTextTone(state))}>{quotaWindowStateCompactValue(state)}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function CompactQuotaWindow({ label, state }: { label: string; state?: QuotaWindowState }) {
+  if (!state || state.confidence === "unknown") {
     return (
-      <div className="grid min-w-0 gap-1 rounded-lg border bg-muted/20 p-3">
-        <div className="text-xs text-muted-foreground">{label}</div>
-        <div className="text-sm font-semibold">未检测</div>
-        <Progress value={0} />
+      <div className="grid min-w-0 gap-1 text-xs">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-muted-foreground">{label}</span>
+          <span className="font-medium text-muted-foreground">未知</span>
+        </div>
+        <div className="h-2 rounded-full bg-muted" />
       </div>
     );
   }
+  const progressValue = quotaWindowStateProgress(state);
   return (
-    <div className="grid min-w-0 gap-1 rounded-lg border bg-muted/20 p-3">
-      <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-        <span>{label}</span>
-        <span className="tabular-nums">{formatPercent(window.remain_percent)}</span>
+    <div className="grid min-w-0 gap-1 text-xs">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-muted-foreground">{label}</span>
+        <span className={cn("font-semibold tabular-nums", quotaWindowStateTextTone(state))} title={quotaWindowStateTitle(state)}>{quotaWindowStateCompactValue(state)}</span>
       </div>
-      <Progress value={window.remain_percent} />
-      <div className="truncate text-xs text-muted-foreground" title={window.resets_at ? `重置 ${formatTime(window.resets_at)}` : "无重置时间"}>
-        {window.resets_at ? formatTime(window.resets_at) : "无重置时间"}
-      </div>
+      {typeof progressValue === "number" ? <Progress value={progressValue} /> : <div className="h-2 rounded-full bg-muted" />}
     </div>
   );
 }
 
-function CompactCapacity({ account }: { account: ClaudeCodeAccount }) {
+function AccountMetricGrid({ account }: { account: ClaudeCodeAccount }) {
   const runtime = account.runtime_capacity;
   const configured = account.capacity;
   const concurrencyLimit = runtime?.concurrency_limit ?? configured?.concurrency_limit ?? 0;
   const inFlight = runtime?.in_flight ?? 0;
-  const percent = concurrencyLimit > 0 ? Math.min(100, Math.round((inFlight / concurrencyLimit) * 100)) : 0;
-
+  const metrics = [
+    { label: "并发", value: concurrencyLimit > 0 ? `${inFlight}/${concurrencyLimit}` : "-" },
+    { label: "RPM", value: `${runtime?.rpm_used ?? 0}/${runtime?.rpm_limit || configured?.base_rpm || 0}` },
+    { label: "请求", value: formatNumber(account.usage?.request_count || 0) },
+    { label: "Tokens", value: formatTokenLarge(account.usage?.raw_total_tokens || 0) },
+    { label: "金额", value: formatUSD(account.usage?.estimated_cost || 0) }
+  ];
   return (
-    <div className="grid min-w-0 gap-2 rounded-lg border bg-muted/20 p-3">
-      <div className="flex items-center justify-between gap-2 text-xs">
-        <span className="text-muted-foreground">并发</span>
-        <span className="font-semibold tabular-nums">{concurrencyLimit > 0 ? `${inFlight} / ${concurrencyLimit}` : "-"}</span>
-      </div>
-      <Progress value={percent} />
-      <div className="grid gap-1 text-xs text-muted-foreground">
-        <span>
-          RPM {runtime?.rpm_used ?? 0}/{runtime?.rpm_limit || configured?.base_rpm || 0}
-        </span>
-        <span>
-          Sticky buffer {runtime?.buffer_used ?? 0}/{runtime?.sticky_buffer ?? configured?.sticky_buffer ?? 0}
-        </span>
-      </div>
+    <div className="grid grid-cols-5 divide-x overflow-hidden rounded-md border bg-muted/25" title="请求、Tokens 和金额为最近 30 天原始上游用量">
+      {metrics.map((metric) => (
+        <div key={metric.label} className="min-w-0 px-1.5 py-1.5 text-center">
+          <div className="truncate text-[10px] leading-4 text-muted-foreground">{metric.label}</div>
+          <div className="truncate text-xs font-semibold leading-4 tabular-nums" title={metric.value}>{metric.value}</div>
+        </div>
+      ))}
     </div>
   );
 }
 
 function BoundProxyIndicator({ account }: { account: ClaudeCodeAccount }) {
   const bound = Boolean(account.proxy_resource_id || account.proxy);
+  const proxyText = account.proxy?.exit_ip || account.proxy?.name || (account.proxy_resource_id ? "已绑定" : "未绑定 IP");
   return (
-    <div className="flex min-h-11 min-w-0 items-center justify-between gap-3 overflow-hidden rounded-lg border bg-muted/20 px-3 py-2 text-sm">
-      <span className="text-muted-foreground">固定出口</span>
-      {bound ? (
-        <span className="inline-flex min-w-0 items-center gap-1.5 text-emerald-700">
-          <Check className="h-4 w-4 shrink-0" />
-          <span className="truncate font-medium" title={account.proxy ? proxyDisplay(account.proxy) : account.proxy_resource_id}>
-            {account.proxy ? proxyDisplay(account.proxy) : "已绑定"}
-          </span>
-        </span>
-      ) : (
-        <span className="inline-flex items-center gap-1.5 text-amber-700">
-          <Link2Off className="h-4 w-4" />
-          未绑定
-        </span>
-      )}
+    <div className={cn("flex min-w-0 items-center gap-1.5 text-xs", bound ? "text-emerald-700" : "text-muted-foreground")}>
+      {bound ? <Network className="h-3.5 w-3.5 shrink-0" /> : <Link2Off className="h-3.5 w-3.5 shrink-0" />}
+      <span className="truncate font-medium" title={account.proxy ? proxyDisplay(account.proxy) : proxyText}>{proxyText}</span>
     </div>
   );
 }
@@ -2681,31 +3053,32 @@ function AvailabilityPanel({
   availability?: AccountAvailabilitySummary;
   compact?: boolean;
 }) {
-  const tone = availabilityTone(availability?.status || "none");
-  const hasData = Boolean(availability && availability.request_count > 0);
-  const value = hasData ? formatPercent(availability?.success_rate) : "暂无数据";
-  const failureCount = availability ? Math.max(0, availability.failure_count || 0) : 0;
+  const summary = availabilityWindowSummary(availability);
+  const tone = availabilityTone(summary.status);
+  const hasData = summary.request_count > 0;
+  const value = hasData ? formatPercent(summary.success_rate) : "暂无请求";
+  if (compact) {
+    return (
+      <div className="grid min-w-0 grid-cols-[2rem_minmax(0,1fr)_auto] items-center gap-2">
+        <span className="text-xs font-medium text-muted-foreground">1h</span>
+        <AvailabilityStrip availability={availability} compact />
+        <span className={cn("min-w-14 text-right text-xs font-semibold tabular-nums", tone.textClass)}>{value}</span>
+      </div>
+    );
+  }
   return (
-    <div className={cn("grid min-w-0 overflow-hidden rounded-lg border bg-muted/20", compact ? "gap-2 p-2.5" : "gap-3 p-3 bg-background/70")}>
+    <div className="grid min-w-0 gap-3 overflow-hidden rounded-lg border bg-muted/20 p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="grid gap-0.5">
-          <div className="text-xs font-medium text-muted-foreground">2小时可用性</div>
-          <div className={cn(compact ? "text-base" : "text-lg", "font-semibold tabular-nums", tone.textClass)}>{value}</div>
+        <div className="flex items-baseline gap-2">
+          <span className="text-xs font-medium text-muted-foreground">1h 可用性</span>
+          <span className={cn("text-lg font-semibold tabular-nums", tone.textClass)}>{value}</span>
         </div>
         <Badge tone={tone.badgeTone}>{tone.label}</Badge>
       </div>
-      <AvailabilityStrip availability={availability} compact={compact} />
-      <div className={cn("flex items-center justify-between gap-2 text-xs text-muted-foreground", !compact && "flex-wrap")}>
-        <span className="shrink-0">{compact ? "2 小时" : "过去 2 小时 · 每格 2 分钟"}</span>
-        <span className="min-w-0 truncate tabular-nums">
-          {hasData
-            ? compact
-              ? `${availability?.success_count || 0}/${availability?.request_count || 0} 成功`
-              : `${availability?.success_count || 0}/${availability?.request_count || 0} 成功 · 失败 ${failureCount}`
-            : compact
-              ? "无请求"
-              : "灰色表示无请求"}
-        </span>
+      <AvailabilityStrip availability={availability} />
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+        <span>最近 1 小时 · 每格 2 分钟</span>
+        <span className="tabular-nums">{hasData ? `${summary.success_count}/${summary.request_count} 成功 · 失败 ${summary.failure_count}` : "灰色表示无请求"}</span>
       </div>
     </div>
   );
@@ -2715,9 +3088,9 @@ function AvailabilityStrip({ availability, compact = false }: { availability?: A
   const buckets = aggregateAvailabilityBuckets(normalizeAvailabilityBuckets(availability), 2);
   return (
     <div
-      className={cn("grid min-w-0 max-w-full grid-flow-col gap-px overflow-hidden", compact ? "h-4" : "h-8")}
+      className={cn("availability-strip grid min-w-0 max-w-full grid-flow-col overflow-hidden rounded-sm", compact ? "h-2.5 gap-px" : "h-5 gap-0.5")}
       style={{ gridTemplateColumns: `repeat(${buckets.length}, minmax(0, 1fr))` }}
-      aria-label="最近 2 小时每分钟请求可用性"
+      aria-label="最近 1 小时每两分钟请求可用性"
     >
       {buckets.map((bucket, index) => {
         const tone = availabilityTone(bucket.status);
@@ -2725,7 +3098,7 @@ function AvailabilityStrip({ availability, compact = false }: { availability?: A
         return (
           <span
             key={`${bucket.started_at || "empty"}-${index}`}
-            className={cn("block min-w-0 rounded-[1px]", tone.barClass)}
+            className={cn("block min-w-0 rounded-[2px]", tone.barClass)}
             title={title}
             aria-label={title}
           />
@@ -2737,10 +3110,10 @@ function AvailabilityStrip({ availability, compact = false }: { availability?: A
 
 function normalizeAvailabilityBuckets(availability?: AccountAvailabilitySummary) {
   const buckets = availability?.buckets || [];
-  if (buckets.length >= 120) {
-    return buckets.slice(-120);
+  if (buckets.length >= 60) {
+    return buckets.slice(-60);
   }
-  const padding = Array.from({ length: 120 - buckets.length }, () => ({
+  const padding = Array.from({ length: 60 - buckets.length }, () => ({
     started_at: "",
     request_count: 0,
     success_count: 0,
@@ -2748,6 +3121,21 @@ function normalizeAvailabilityBuckets(availability?: AccountAvailabilitySummary)
     status: "none"
   }));
   return [...padding, ...buckets];
+}
+
+function availabilityWindowSummary(availability?: AccountAvailabilitySummary): AccountAvailabilitySummary {
+  const buckets = normalizeAvailabilityBuckets(availability);
+  const requestCount = buckets.reduce((sum, bucket) => sum + (bucket.request_count || 0), 0);
+  const successCount = buckets.reduce((sum, bucket) => sum + (bucket.success_count || 0), 0);
+  return {
+    window_minutes: 60,
+    request_count: requestCount,
+    success_count: successCount,
+    failure_count: Math.max(0, requestCount - successCount),
+    success_rate: requestCount > 0 ? (successCount * 100) / requestCount : 0,
+    status: availabilityStatusForCount(requestCount, successCount),
+    buckets
+  };
 }
 
 function aggregateAvailabilityBuckets(buckets: ReturnType<typeof normalizeAvailabilityBuckets>, size: number) {
@@ -2778,18 +3166,6 @@ function availabilityBucketTitle(bucket: ReturnType<typeof normalizeAvailability
   return `${time} · ${bucket.success_count}/${bucket.request_count} 成功 · ${formatPercent(bucket.success_rate)}`;
 }
 
-function AvailabilityStats({ availability }: { availability?: AccountAvailabilitySummary }) {
-  const hasData = Boolean(availability && availability.request_count > 0);
-  return (
-    <div className="grid grid-cols-4 gap-3 max-[720px]:grid-cols-2">
-      <CompactStat label="请求数" value={hasData ? formatNumber(availability?.request_count) : "暂无"} />
-      <CompactStat label="成功" value={hasData ? formatNumber(availability?.success_count) : "暂无"} />
-      <CompactStat label="失败" value={hasData ? formatNumber(availability?.failure_count) : "暂无"} />
-      <CompactStat label="成功率" value={hasData ? formatPercent(availability?.success_rate) : "暂无数据"} />
-    </div>
-  );
-}
-
 function AccountDetailDialog({
   row,
   open,
@@ -2800,9 +3176,13 @@ function AccountDetailDialog({
   onReset,
   onRefreshQuota,
   quotaPending,
-  onRefreshToken,
-  tokenPending,
-  onToggle,
+	pools,
+	onMove,
+	  onRefreshToken,
+	  tokenPending,
+	  onRecheck,
+	  recheckPending,
+	  onToggle,
   onDelete
 }: {
   row: AccountRow | null;
@@ -2814,8 +3194,12 @@ function AccountDetailDialog({
   onReset: (account: ClaudeCodeAccount) => void;
   onRefreshQuota: (account: ClaudeCodeAccount) => void;
   quotaPending: boolean;
+  pools: ClaudeCodeAccountPool[];
+  onMove: (account: ClaudeCodeAccount) => void;
   onRefreshToken: (account: ClaudeCodeAccount) => void;
-  tokenPending: boolean;
+	  tokenPending: boolean;
+	  onRecheck: (account: ClaudeCodeAccount) => void;
+	  recheckPending: boolean;
   onToggle: (account: ClaudeCodeAccount) => void;
   onDelete: (account: ClaudeCodeAccount) => void;
 }) {
@@ -2823,107 +3207,259 @@ function AccountDetailDialog({
   const runtime = row?.runtime;
   const bound = Boolean(account?.proxy_resource_id || account?.proxy);
   const identity = parseClaudeCodeIdentity(account?.cloak_user_id);
+  const availabilitySummary = availabilityWindowSummary(account?.availability);
+  const quota5h = account ? findQuotaWindowState(account, "five_hour") : undefined;
+  const quota7d = account ? findQuotaWindowState(account, "seven_day") : undefined;
+	const pool = pools.find((item) => item.id === account?.pool_id);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-5xl">
+      <DialogContent className="drawer-panel grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden rounded-none border-y-0 border-r-0 p-0">
         {account ? (
           <>
-            <DialogHeader>
-              <DialogTitle>账号详情</DialogTitle>
-              <DialogDescription>{account.email || account.auth_id}</DialogDescription>
+            <DialogHeader className="border-b px-5 py-4 pr-12">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="grid min-w-0 gap-1.5">
+                  <DialogTitle>账号详情</DialogTitle>
+                  <DialogDescription className="break-all">{account.email || account.auth_id}</DialogDescription>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <AccountStatusBadge account={account} runtime={runtime} />
+					<Badge tone="neutral">{pool?.name || account.pool_id}</Badge>
+                    <QuotaBandBadge account={account} />
+                    <AccountTestBadge account={account} />
+                    {account.runtime_capacity?.account_cooling ? <Badge tone="danger">账号冷却</Badge> : null}
+                    {(account.runtime_capacity?.model_cooling_count || 0) > 0 ? <Badge tone="warning">{account.runtime_capacity?.model_cooling_count} 个模型冷却</Badge> : null}
+                    {bound ? <Badge tone="success">已绑定代理</Badge> : <Badge tone="warning">未绑定代理</Badge>}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button variant="outline" size="sm" onClick={() => onTest(account)}>
+                    <Play className="h-3.5 w-3.5" />
+                    测试
+                  </Button>
+                  <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => onRefreshToken(account)} disabled={tokenPending} title="刷新 Token" aria-label="刷新 Token">
+                    <RefreshCw className={cn("h-3.5 w-3.5", tokenPending && "animate-spin")} />
+                  </Button>
+                  <OverflowMenu label="更多账号操作">
+                    <button type="button" onClick={() => (bound ? onUnbind(account) : onBind(account))}>{bound ? "解绑代理" : "绑定代理"}</button>
+                    <button type="button" onClick={() => onReset(account)}>清除冷却</button>
+	                    <button type="button" onClick={() => onRecheck(account)} disabled={recheckPending}>重新检查并恢复</button>
+	                    <button type="button" onClick={() => onMove(account)}>移动账号池</button>
+	                    <button type="button" onClick={() => onToggle(account)}>{account.schedulable ? "暂停调度" : "参与调度"}</button>
+                    <button type="button" className="danger" onClick={() => onDelete(account)}>删除账号</button>
+                  </OverflowMenu>
+                </div>
+              </div>
             </DialogHeader>
-            <div className="grid gap-5">
-              <div className="flex flex-wrap items-center gap-2">
-                <AccountStatusBadge account={account} runtime={runtime} />
-                <AccountTestBadge account={account} />
-                {runtime?.cooling_until || account.runtime_capacity?.cooling_until ? <Badge tone="warning">冷却中</Badge> : null}
-                {bound ? <Badge tone="success">已绑定代理</Badge> : <Badge tone="warning">未绑定代理</Badge>}
+            <div className="grid content-start gap-4 overflow-y-auto px-5 py-4 pb-6">
+	              {account.blocked_reason ? (
+	                <section className={cn("grid gap-1 rounded-lg border px-3 py-2.5", account.health_status === "manual_recovery" ? "border-red-200 bg-red-50 text-red-800" : "border-amber-200 bg-amber-50 text-amber-800")}>
+	                  <div className="text-xs font-semibold">{account.health_status === "manual_recovery" ? "账号需要处理" : "账号暂不可调度"}</div>
+	                  <div className="text-xs leading-5">{account.blocked_reason}{account.blocked_until ? ` · 预计 ${formatTime(account.blocked_until)} 恢复` : ""}</div>
+	                </section>
+	              ) : null}
+	              <section className="grid grid-cols-6 divide-x rounded-lg border bg-card max-[900px]:grid-cols-3 max-[620px]:grid-cols-2 max-[900px]:divide-x-0">
+                <DetailMetric label="1h 可用性" value={availabilitySummary.request_count > 0 ? formatPercent(availabilitySummary.success_rate) : "暂无请求"} />
+                <DetailMetric label="5h 额度" value={quotaWindowStateCompactValue(quota5h)} />
+                <DetailMetric label="7天额度" value={quotaWindowStateCompactValue(quota7d)} />
+                <DetailMetric label="并发 / RPM" value={`${account.runtime_capacity?.in_flight || 0}/${account.runtime_capacity?.concurrency_limit || account.capacity?.concurrency_limit || 0} · ${account.runtime_capacity?.rpm_used || 0}/${account.runtime_capacity?.rpm_limit || account.capacity?.base_rpm || 0}`} />
+	                <DetailMetric label="活跃会话" value={`${account.runtime_capacity?.active_sessions || 0}/${account.runtime_capacity?.max_sessions || account.capacity?.max_sessions || 0}`} />
+	                <DetailMetric label="亲和额外并发" value={`${account.runtime_capacity?.reserve_used || 0}/${account.runtime_capacity?.sticky_concurrency_reserve || account.capacity?.sticky_concurrency_reserve || 0}`} />
+              </section>
+
+              <div className="grid grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] items-start gap-3 max-[700px]:grid-cols-1">
+                <AvailabilityPanel availability={account.availability} />
+	                <DenseQuotaPanel account={account} onRefresh={() => onRefreshQuota(account)} refreshing={quotaPending} />
               </div>
 
-              <div className="grid grid-cols-3 gap-3 max-[900px]:grid-cols-1">
-                <ReadOnlyTile label="Auth ID" value={account.auth_id} />
-                <ReadOnlyTile label="Device ID" value={identity.deviceId || "-"} />
-                <ReadOnlyTile label="Account UUID" value={identity.accountUUID || "-"} />
-                <ReadOnlyTile label="Session ID" value="请求时按会话生成" />
-                <ReadOnlyTile label="运行成功率" value={successRate(runtime)} />
-                <ReadOnlyTile label="连续失败" value={`${account.consecutive_failures || 0}`} />
-                <ReadOnlyTile label="最近测试" value={formatTime(account.last_test_at)} />
-                <ReadOnlyTile label="Token 过期" value={formatTime(account.token_expires_at)} />
-                <ReadOnlyTile label="更新时间" value={formatTime(account.updated_at)} />
-              </div>
+              {account.model_statuses ? <ModelStatusStrip statuses={account.model_statuses} /> : null}
 
-              <div className="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] gap-4 max-[900px]:grid-cols-1">
-                <div className="grid gap-4">
-                  <div className="grid gap-3 rounded-lg border bg-muted/20 p-3">
-                    <AvailabilityPanel availability={account.availability} />
-                    <AvailabilityStats availability={account.availability} />
-                    <div className="text-xs text-muted-foreground">
-                      当前请求 {account.runtime_capacity?.in_flight || 0} · RPM {account.runtime_capacity?.rpm_used || 0}
-                    </div>
-                  </div>
-                  <div className="rounded-lg border bg-muted/20 p-3">
-                    <div className="mb-2 text-sm font-medium">容量</div>
-                    <CapacitySummary account={account} />
-                  </div>
-                  {account.model_statuses ? <ModelStatusStrip statuses={account.model_statuses} /> : null}
-                </div>
-                <QuotaPanel quota={account.quota} onRefresh={() => onRefreshQuota(account)} refreshing={quotaPending} />
-              </div>
+			  <AccountUsageBreakdown usage={account.usage} />
 
-              <div className="grid grid-cols-2 gap-4 max-[900px]:grid-cols-1">
-                <div className="grid gap-2 rounded-lg border bg-muted/20 p-3">
-                  <div className="text-sm font-medium">绑定代理</div>
-                  {account.proxy ? (
-                    <div className="grid gap-1 text-sm">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium">{account.proxy.name}</span>
-                        <HealthBadge status={account.proxy.health_status} enabled={account.proxy.enabled} />
-                        <span className="text-xs text-muted-foreground">{account.proxy.latency_ms || 0} ms</span>
-                      </div>
-                      <div className="break-all text-xs text-muted-foreground">{proxyDisplay(account.proxy)}</div>
-                      <div className="text-xs text-muted-foreground">最近测试 {formatTime(account.proxy.last_checked_at)}</div>
-                    </div>
-                  ) : (
-                    <div className="text-sm text-muted-foreground">未绑定代理</div>
-                  )}
-                </div>
-                <div className="grid gap-2 rounded-lg border bg-muted/20 p-3">
-                  <div className="text-sm font-medium">最近错误</div>
-                  <div className="break-words text-sm leading-6 text-muted-foreground">{account.last_error || runtime?.last_error || "暂无"}</div>
-                </div>
-              </div>
+              <ProxyDetailRow account={account} />
 
-              <div className="flex flex-wrap justify-end gap-2 border-t pt-4">
-                <Button variant="outline" onClick={() => onTest(account)}>
-                  <Play className="h-4 w-4" />
-                  测试
-                </Button>
-                <Button variant="outline" onClick={() => (bound ? onUnbind(account) : onBind(account))}>
-                  {bound ? <Unlink className="h-4 w-4" /> : <Network className="h-4 w-4" />}
-                  {bound ? "解绑代理" : "绑定代理"}
-                </Button>
-                <Button variant="outline" onClick={() => onReset(account)}>
-                  <Clock3 className="h-4 w-4" />
-                  清冷却
-                </Button>
-                <Button variant="outline" onClick={() => onRefreshToken(account)} disabled={tokenPending}>
-                  <RefreshCw className={cn("h-4 w-4", tokenPending && "animate-spin")} />
-                  刷新 Token
-                </Button>
-                <Button variant="outline" onClick={() => onToggle(account)}>
-                  {account.enabled ? "禁用账号" : "启用账号"}
-                </Button>
-                <Button variant="destructive" onClick={() => onDelete(account)}>
-                  <Trash2 className="h-4 w-4" />
-                  删除账号
-                </Button>
-              </div>
+              {account.last_error || runtime?.last_error ? (
+                <section className="grid gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5">
+                  <div className="text-xs font-semibold text-red-800">最近错误</div>
+                  <div className="break-words text-xs leading-5 text-red-700">{account.last_error || runtime?.last_error}</div>
+                </section>
+              ) : null}
+
+              <details className="identity-details rounded-lg border bg-card">
+                <summary className="cursor-pointer px-3 py-2.5 text-sm font-medium">身份与时间信息</summary>
+                <dl className="grid grid-cols-2 gap-x-5 gap-y-3 border-t px-3 py-3 text-xs max-[560px]:grid-cols-1">
+                  <DetailField label="Auth ID" value={account.auth_id} />
+                  <DetailField label="Device ID" value={identity.deviceId || "-"} />
+                  <DetailField label="Account UUID" value={identity.accountUUID || "-"} />
+                  <DetailField label="Session ID" value="请求时按会话生成" />
+                  <DetailField label="亲和绑定" value={`${account.affinity_bindings || 0}`} />
+                  <DetailField label="运行成功率" value={successRate(runtime)} />
+                  <DetailField label="连续失败" value={`${account.consecutive_failures || 0}`} />
+                  <DetailField label="最近测试" value={formatTime(account.last_test_at)} />
+	                  <DetailField label="Token 过期" value={formatTime(account.token_expires_at)} />
+	                  <DetailField label="最近健康检查" value={formatTime(account.last_health_check_at)} />
+	                  <DetailField label="下次健康检查" value={formatTime(account.next_health_check_at)} />
+                  <DetailField label="更新时间" value={formatTime(account.updated_at)} />
+                </dl>
+              </details>
             </div>
           </>
         ) : null}
       </DialogContent>
     </Dialog>
+  );
+}
+
+function DetailMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 px-3 py-3 max-[620px]:border-b max-[620px]:odd:border-r">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="mt-1 truncate text-base font-semibold tabular-nums" title={value}>{value}</div>
+    </div>
+  );
+}
+
+function DetailField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="mt-1 break-all font-medium leading-5">{value}</dd>
+    </div>
+  );
+}
+
+function AccountUsageBreakdown({ usage }: { usage?: UsageSummary["by_account"][number] }) {
+	return (
+		<section className="grid gap-3 rounded-lg border bg-card p-3">
+			<div className="flex flex-wrap items-center justify-between gap-2">
+				<div>
+					<div className="text-sm font-medium">最近 30 天用量</div>
+					<div className="mt-0.5 text-[11px] text-muted-foreground">成本使用原始上游 usage，包含重试和换号产生的真实 attempts</div>
+				</div>
+				<Badge tone={(usage?.unpriced_request_count || 0) > 0 ? "warning" : "success"}>
+					计价覆盖 {formatPercent(usage?.pricing_coverage ?? 100)}
+				</Badge>
+			</div>
+			<div className="grid grid-cols-4 gap-px overflow-hidden rounded-md border bg-border max-[620px]:grid-cols-2">
+				<UsageDetailMetric label="请求 / Attempts" value={`${usage?.request_count || 0} / ${usage?.attempt_count || 0}`} />
+				<UsageDetailMetric label="输入" value={formatTokenLarge(usage?.input_tokens || 0)} />
+				<UsageDetailMetric label="输出" value={formatTokenLarge(usage?.output_tokens || 0)} />
+				<UsageDetailMetric label="缓存读取" value={formatTokenLarge(usage?.cache_read_tokens || 0)} />
+				<UsageDetailMetric label="缓存写入 5m" value={formatTokenLarge(usage?.cache_creation_5m_tokens || 0)} />
+				<UsageDetailMetric label="缓存写入 1h" value={formatTokenLarge(usage?.cache_creation_1h_tokens || 0)} />
+				<UsageDetailMetric label="原始 Tokens" value={formatTokenLarge(usage?.raw_total_tokens || 0)} />
+				<UsageDetailMetric label="估算成本" value={formatUSD(usage?.estimated_cost || 0)} />
+			</div>
+			{(usage?.unpriced_request_count || 0) > 0 ? <div className="text-xs text-amber-700">{usage?.unpriced_request_count} 个请求尚无匹配价格，Tokens 已统计但未计入成本。</div> : null}
+		</section>
+	);
+}
+
+function UsageDetailMetric({ label, value }: { label: string; value: string }) {
+	return <div className="min-w-0 bg-card px-3 py-2.5"><div className="text-[11px] text-muted-foreground">{label}</div><div className="mt-1 truncate text-sm font-semibold tabular-nums" title={value}>{value}</div></div>;
+}
+
+function MoveAccountDialog({ row, pools, open, pending, onClose, onMove }: {
+	row: AccountRow | null;
+	pools: ClaudeCodeAccountPool[];
+	open: boolean;
+	pending: boolean;
+	onClose: () => void;
+	onMove: (poolID: string) => void;
+}) {
+	const targets = pools.filter((pool) => !pool.archived_at && pool.id !== row?.account.pool_id);
+	const [poolID, setPoolID] = useState("");
+	useEffect(() => {
+		if (open) {
+			setPoolID(targets[0]?.id || "");
+		}
+	}, [open, row?.account.id, targets[0]?.id]);
+	return (
+		<Dialog open={open} onOpenChange={(next) => !next && onClose()}>
+			<DialogContent>
+				<DialogHeader>
+					<DialogTitle>移动账号</DialogTitle>
+					<DialogDescription>移动会清除旧池中的亲和绑定和活跃会话；历史用量仍归原账号池。</DialogDescription>
+				</DialogHeader>
+				{targets.length > 0 ? (
+					<form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); if (poolID) onMove(poolID); }}>
+						<div className="grid gap-2">
+							<Label htmlFor="move-account-pool">目标账号池</Label>
+							<Select id="move-account-pool" value={poolID} onChange={(event) => setPoolID(event.target.value)}>
+								{targets.map((pool) => <option key={pool.id} value={pool.id}>{pool.name}</option>)}
+							</Select>
+						</div>
+						<div className="flex justify-end gap-2"><Button type="button" variant="outline" onClick={onClose}>取消</Button><Button type="submit" disabled={!poolID || pending}>{pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRightLeft className="h-4 w-4" />}移动</Button></div>
+					</form>
+				) : <div className="rounded-md border bg-muted px-3 py-8 text-center text-sm text-muted-foreground">没有可移动到的其他账号池</div>}
+			</DialogContent>
+		</Dialog>
+	);
+}
+
+function DenseQuotaPanel({ account, onRefresh, refreshing }: { account: ClaudeCodeAccount; onRefresh: () => void; refreshing: boolean }) {
+  const quota = account.quota;
+  const windows = accountQuotaWindowStates(account);
+  return (
+    <section className="grid gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <span className="text-sm font-medium">额度</span>
+          <div className="mt-0.5 text-[11px] text-muted-foreground">
+            {typeof account.headroom === "number" ? `Headroom ${formatPercent(account.headroom * 100)}` : "尚无可用 Headroom"}
+            {account.quota_band && account.quota_band !== "unknown" ? ` · ${quotaBandText(account.quota_band)}` : ""}
+          </div>
+        </div>
+        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={onRefresh} disabled={refreshing} title="刷新额度" aria-label="刷新额度">
+          <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
+        </Button>
+      </div>
+      {quota?.status === "error" ? (
+        <div className="text-xs leading-5 text-red-700">额度刷新失败，以下保留最后一次采集结果</div>
+      ) : null}
+      <div className="divide-y overflow-hidden rounded-md border bg-card">
+        {windows.map((window) => {
+          const progressValue = quotaWindowStateProgress(window);
+          return (
+            <div key={window.key} className="grid gap-1.5 px-3 py-2.5">
+              <div className="flex min-w-0 items-center justify-between gap-3">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <span className="truncate text-xs font-medium" title={window.name}>{window.name}</span>
+                  <Badge className="px-1.5 py-0 text-[10px]" tone={quotaWindowConfidenceTone(window)}>{quotaWindowConfidenceText(window)}</Badge>
+                  {window.freshness === "stale" ? <Badge className="px-1.5 py-0 text-[10px]" tone="warning">数据过期</Badge> : window.freshness === "fresh" ? <Badge className="px-1.5 py-0 text-[10px]" tone="success">新鲜</Badge> : null}
+                </div>
+                <span className={cn("shrink-0 text-xs font-semibold tabular-nums", quotaWindowStateTextTone(window))}>{quotaWindowStateDetailValue(window)}</span>
+              </div>
+              {typeof progressValue === "number" ? <Progress value={progressValue} /> : <div className="h-2 rounded-full bg-muted" />}
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] leading-4 text-muted-foreground">
+                <span>{quotaSourceText(window.source)}</span>
+                <span>{window.observed_at ? `采集 ${formatTime(window.observed_at)}` : "尚未采集"}</span>
+                {window.status ? <span>{quotaWindowStatusText(window.status)}</span> : null}
+                {window.resets_at ? <span>重置 {formatTime(window.resets_at)}</span> : null}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function ProxyDetailRow({ account }: { account: ClaudeCodeAccount }) {
+  return (
+    <section className="flex min-w-0 flex-wrap items-center justify-between gap-3 rounded-lg border bg-card px-3 py-2.5">
+      <div className="min-w-0">
+        <div className="text-xs text-muted-foreground">绑定代理</div>
+        <div className="mt-1 truncate text-sm font-medium" title={account.proxy ? proxyDisplay(account.proxy) : "未绑定代理"}>{account.proxy ? account.proxy.name : "未绑定代理"}</div>
+      </div>
+      {account.proxy ? (
+        <div className="flex min-w-0 items-center gap-2 text-xs">
+          <HealthBadge status={account.proxy.health_status} enabled={account.proxy.enabled} />
+          <span className="truncate font-mono text-muted-foreground">{account.proxy.exit_ip || proxyDisplay(account.proxy)}</span>
+          <span className="text-muted-foreground">{account.proxy.latency_ms || 0} ms</span>
+        </div>
+      ) : <Badge tone="warning">未绑定</Badge>}
+    </section>
   );
 }
 
@@ -2933,72 +3469,125 @@ function findQuotaWindow(quota: AccountQuota | undefined, candidates: string[]) 
   return windows.find((item) => normalized.includes(String(item.key || "").toLowerCase()) || normalized.includes(String(item.name || "").toLowerCase()));
 }
 
-function AccountBatchToolbar({
-  selectedCount,
-  pending,
-  onRun,
-  onClear
-}: {
-  selectedCount: number;
-  pending: boolean;
-  onRun: (action: AccountBatchAction) => void;
-  onClear: () => void;
-}) {
-  return (
-    <Card>
-      <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4">
-        <div className="grid gap-1">
-          <div className="text-sm font-medium">账号批量操作</div>
-          <div className="text-xs text-muted-foreground">已选择 {selectedCount} 个账号</div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" onClick={() => onRun("test")} disabled={selectedCount === 0 || pending}>
-            {pending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
-            批量测试
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => onRun("enable")} disabled={selectedCount === 0 || pending}>
-            启用
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => onRun("disable")} disabled={selectedCount === 0 || pending}>
-            禁用
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => onRun("unbind")} disabled={selectedCount === 0 || pending}>
-            <Unlink className="h-3.5 w-3.5" />
-            解绑代理
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => onRun("reset-cooling")} disabled={selectedCount === 0 || pending}>
-            <Clock3 className="h-3.5 w-3.5" />
-            清冷却
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => onRun("refresh-quota")} disabled={selectedCount === 0 || pending}>
-            <RefreshCw className={cn("h-3.5 w-3.5", pending && "animate-spin")} />
-            刷新额度
-          </Button>
-          <Button variant="destructive" size="sm" onClick={() => onRun("delete")} disabled={selectedCount === 0 || pending}>
-            <Trash2 className="h-3.5 w-3.5" />
-            删除
-          </Button>
-          <Button variant="ghost" size="sm" onClick={onClear} disabled={selectedCount === 0 || pending}>
-            清空选择
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
-  );
+const quotaWindowStateSpecs = [
+  { key: "five_hour", name: "5 小时", candidates: ["five_hour", "5 小时", "5小时"], shared: false },
+  { key: "seven_day", name: "7 天", candidates: ["seven_day", "7 天", "7天"], shared: false },
+  { key: "seven_day_sonnet", name: "Sonnet 周额度", candidates: ["seven_day_sonnet"], shared: true },
+  { key: "seven_day_opus", name: "Opus 周额度", candidates: ["seven_day_opus"], shared: true },
+  { key: "seven_day_fable", name: "Fable 周额度", candidates: ["seven_day_fable", "seven_day_overage_included", "model_7d_oi"], shared: true }
+] as const;
+
+function unknownQuotaWindowState(key: string, name: string): QuotaWindowState {
+  return { key, name, confidence: "unknown", freshness: "unknown", utilization_known: false, exhausted: false };
 }
 
-function CapacitySummary({ account }: { account: ClaudeCodeAccount }) {
-  const runtime = account.runtime_capacity;
-  if (!runtime) {
-    return <span className="text-muted-foreground">-</span>;
+function accountQuotaWindowStates(account: ClaudeCodeAccount): QuotaWindowState[] {
+  const provided = account.quota_window_states || [];
+  if (provided.length > 0) {
+    return quotaWindowStateSpecs.map((spec) => provided.find((item) => item.key === spec.key) || unknownQuotaWindowState(spec.key, spec.name));
   }
-  return (
-    <div className="grid gap-1 text-sm tabular-nums">
-      <span>并发 {runtime.in_flight}/{runtime.concurrency_limit}</span>
-      <span>RPM {runtime.rpm_used}/{runtime.rpm_limit || runtime.base_rpm}</span>
-      <span>Sticky buffer {runtime.buffer_used}/{runtime.sticky_buffer}</span>
-    </div>
-  );
+
+  const shared = findQuotaWindow(account.quota, ["seven_day", "7 天", "7天"]);
+  return quotaWindowStateSpecs.map((spec) => {
+    const direct = findQuotaWindow(account.quota, [...spec.candidates]);
+    const window = direct || (spec.shared ? shared : undefined);
+    if (!window) {
+      return unknownQuotaWindowState(spec.key, spec.name);
+    }
+    const observedAt = window.updated_at || account.quota?.checked_at;
+    const observedTime = observedAt ? Date.parse(observedAt) : Number.NaN;
+    const resetTime = window.resets_at ? Date.parse(window.resets_at) : Number.NaN;
+    const stale = (Number.isFinite(observedTime) && Date.now() - observedTime > 15 * 60 * 1000) || (Number.isFinite(resetTime) && resetTime <= Date.now());
+    const known = quotaWindowUtilizationKnown(window);
+    return {
+      key: spec.key,
+      name: spec.name,
+      confidence: direct ? (known ? "exact" : "observed") : "shared",
+      freshness: observedAt ? (stale ? "stale" : "fresh") : "unknown",
+      source: window.source || account.quota_source,
+      observed_at: observedAt,
+      shared_from: direct ? undefined : "seven_day",
+      utilization_known: known,
+      used_percent: known ? window.used_percent : undefined,
+      remain_percent: known ? window.remain_percent : undefined,
+      resets_at: window.resets_at,
+      status: window.status,
+      remaining: window.remaining,
+      exhausted: quotaWindowExplicitlyExhausted(window) || (known && window.used_percent >= 100)
+    };
+  });
+}
+
+function findQuotaWindowState(account: ClaudeCodeAccount, key: string) {
+  return accountQuotaWindowStates(account).find((item) => item.key === key);
+}
+
+function quotaWindowStateProgress(state?: QuotaWindowState) {
+  if (!state || state.freshness !== "fresh" || !state.utilization_known || typeof state.remain_percent !== "number") {
+    return undefined;
+  }
+  return state.remain_percent;
+}
+
+function quotaWindowStateCompactValue(state?: QuotaWindowState) {
+  if (!state || state.confidence === "unknown") return "未知";
+  if (state.freshness === "stale") return "过期";
+  if (state.freshness !== "fresh") return "未知";
+  if (state.exhausted) return "已耗尽";
+  if (state.confidence === "shared") return "共享";
+  if (state.utilization_known && typeof state.remain_percent === "number") return formatPercent(state.remain_percent);
+  return "已观察";
+}
+
+function quotaWindowStateDetailValue(state: QuotaWindowState) {
+  if (state.confidence === "unknown") return "未知";
+  if (state.freshness === "stale") {
+    return state.utilization_known && typeof state.remain_percent === "number" ? `上次 ${formatPercent(state.remain_percent)}` : "历史状态";
+  }
+  if (state.freshness !== "fresh") return "采集时间未知";
+  if (state.exhausted) return "已耗尽";
+  if (state.utilization_known && typeof state.remain_percent === "number") return `${formatPercent(state.remain_percent)} 可用`;
+  return "已观察";
+}
+
+function quotaWindowConfidenceText(state: QuotaWindowState) {
+  switch (state.confidence) {
+    case "exact": return "精确百分比";
+    case "shared": return "共享 7 天";
+    case "observed": return "仅观察";
+    default: return "未知";
+  }
+}
+
+function quotaWindowConfidenceTone(state: QuotaWindowState): "success" | "info" | "neutral" {
+  if (state.confidence === "exact") return "success";
+  if (state.confidence === "shared") return "info";
+  return "neutral";
+}
+
+function quotaWindowStateTitle(state?: QuotaWindowState) {
+  if (!state) return "暂无额度数据";
+  const details = [state.name, quotaWindowConfidenceText(state)];
+  details.push(state.freshness === "fresh" ? "数据新鲜" : state.freshness === "stale" ? "数据过期" : "采集时间未知");
+  if (state.source) details.push(quotaSourceText(state.source));
+  if (state.observed_at) details.push(`采集 ${formatTime(state.observed_at)}`);
+  if (state.resets_at) details.push(`重置 ${formatTime(state.resets_at)}`);
+  return details.join(" · ");
+}
+
+function quotaWindowStateTextTone(state?: QuotaWindowState) {
+  if (!state || state.confidence === "unknown" || state.freshness === "unknown") return "text-muted-foreground";
+  if (state.freshness === "stale") return "text-amber-700";
+  if (state.exhausted || (state.utilization_known && (state.remain_percent ?? 100) <= 0)) return "text-red-700";
+  if (state.utilization_known && (state.remain_percent ?? 100) <= 15) return "text-amber-700";
+  return "text-foreground";
+}
+
+function quotaSourceText(source?: string) {
+  if (source === "response_headers") return "推理响应 Header";
+  if (source === "oauth_usage") return "OAuth usage";
+  if (source === "mixed") return "OAuth usage + 响应 Header";
+  return "未知来源";
 }
 
 function ModelStatusStrip({ statuses }: { statuses: NonNullable<ClaudeCodeAccount["model_statuses"]> }) {
@@ -3039,34 +3628,13 @@ function CleanInputUsagePanel({
   onDone: () => Promise<void>;
   onToast: (message: string, tone?: ToastState["tone"]) => void;
 }) {
-  const [enabled, setEnabled] = useState(config.usage.clean_input_tokens);
   const [accountID, setAccountID] = useState("");
-  useEffect(() => {
-    setEnabled(config.usage.clean_input_tokens);
-  }, [config.usage.clean_input_tokens]);
-  const runnableAccounts = accounts.filter((row) => row.account.enabled && row.account.has_auth_data);
+  const runnableAccounts = accounts.filter((row) => row.account.effective_schedulable && row.account.has_auth_data);
   useEffect(() => {
     if (accountID && !runnableAccounts.some((row) => row.account.id === accountID)) {
       setAccountID("");
     }
   }, [accountID, runnableAccounts]);
-  const saveMutation = useMutation({
-    mutationFn: () =>
-      api.savePoolConfig(
-        toRawPoolConfig({
-          ...config,
-          usage: {
-            ...config.usage,
-            clean_input_tokens: enabled
-          }
-        })
-      ),
-    onSuccess: async () => {
-      await onDone();
-      onToast("纯净输入用量已保存");
-    },
-    onError: (error) => onToast(`保存失败：${errorMessage(error)}`, "danger")
-  });
   const calibrateMutation = useMutation({
     mutationFn: (model: string) => api.calibrateUsage(model, accountID),
     onSuccess: async (data) => {
@@ -3093,31 +3661,22 @@ function CleanInputUsagePanel({
             estimated: true
           }));
   const fingerprint = calibrations?.profile_fingerprint || config.usage.profile_fingerprint;
-  const hasUnsavedUsageChange = enabled !== config.usage.clean_input_tokens;
   return (
     <Card>
       <CardHeader>
-        <CardTitle>纯净输入用量</CardTitle>
-        <CardDescription>只改写对外返回和控制台展示的 input tokens；Anthropic 实际消耗不变。</CardDescription>
+        <CardTitle>纯净模式计费校准</CardTitle>
+        <CardDescription>校准账号池自动注入的 Claude Code 开销，用于清理下游 input、缓存创建和缓存读取；真实 usage 始终保留。</CardDescription>
       </CardHeader>
       <CardContent className="grid gap-5">
-        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-4 max-[860px]:grid-cols-1">
-          <div className="grid gap-3">
-            <ToggleRow label="开启纯净 input_tokens" checked={enabled} onChange={setEnabled} />
-            <div className="grid grid-cols-2 gap-3 max-[640px]:grid-cols-1">
-              <CompactStat label="默认估算扣减" value={`${calibrations?.default_overhead || config.usage.system_prompt_overhead_tokens} tokens`} />
-              <CompactStat label="已保存状态" value={config.usage.clean_input_tokens ? "已开启" : "未开启"} />
-              <CompactStat label="未保存变更" value={hasUnsavedUsageChange ? (enabled ? "开启" : "关闭") : "无"} />
-            </div>
-            <div className="rounded-lg border bg-muted/30 p-3">
-              <div className="text-xs font-medium text-muted-foreground">Profile Fingerprint</div>
-              <div className="mt-1 break-all font-mono text-xs">{fingerprint || "unknown"}</div>
-            </div>
+        <div className="grid gap-3">
+          <div className="grid grid-cols-2 gap-3 max-[640px]:grid-cols-1">
+            <CompactStat label="默认估算扣减" value={`${calibrations?.default_overhead || config.usage.system_prompt_overhead_tokens} tokens`} />
+            <CompactStat label="纯净模式状态" value={config.pure_mode ? "已开启" : "未开启"} />
           </div>
-          <Button onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending}>
-            {saveMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-            保存开关
-          </Button>
+          <div className="rounded-lg border bg-muted/30 p-3">
+            <div className="text-xs font-medium text-muted-foreground">Profile Fingerprint</div>
+            <div className="mt-1 break-all font-mono text-xs">{fingerprint || "unknown"}</div>
+          </div>
         </div>
 
         <div className="grid gap-3 rounded-lg border bg-muted/20 p-3">
@@ -3411,7 +3970,8 @@ function RoutingEventsPanel({ events }: { events: RoutingEvent[] }) {
                 <th>决策</th>
                 <th>模型</th>
                 <th>状态</th>
-                <th>容量</th>
+                <th>容量 / RPM</th>
+                <th>亲和</th>
                 <th>原因</th>
               </tr>
             </thead>
@@ -3430,14 +3990,15 @@ function RoutingEventsPanel({ events }: { events: RoutingEvent[] }) {
                     </td>
                     <td>{event.status_code || "-"}</td>
                     <td>
-                      {event.capacity_used ?? 0}/{event.capacity_limit ?? 0}
+                      {event.in_flight ?? event.capacity_used ?? 0}/{event.concurrency_limit ?? event.capacity_limit ?? 0} · {event.rpm_used ?? 0}/{event.rpm_limit ?? 0}
                     </td>
+                    <td>{event.affinity_mode ? `${event.affinity_mode}${event.backup_lane ? " · 备用" : event.primary_hit ? " · 主账号" : ""}` : "-"}</td>
                     <td className="max-w-80 break-words">{event.reason || event.error || "-"}</td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td colSpan={6} className="text-center text-muted-foreground">
+                  <td colSpan={7} className="text-center text-muted-foreground">
                     暂无调度事件
                   </td>
                 </tr>
@@ -3469,18 +4030,22 @@ function ToggleRow({
 
 function ToggleBox({
   label,
+  help,
   checked,
   onChange
 }: {
   label: string;
+  help?: string;
   checked: boolean;
   onChange: (checked: boolean) => void;
 }) {
+  const inputID = useId();
   return (
-    <label className="flex min-h-11 items-center gap-2 rounded-lg border bg-card px-3 py-2 text-sm">
-      <input type="checkbox" className="h-4 w-4" checked={checked} onChange={(event) => onChange(event.target.checked)} />
-      <span>{label}</span>
-    </label>
+    <div className="flex min-h-11 items-center gap-2 rounded-lg border bg-card px-3 py-2 text-sm">
+      <input id={inputID} type="checkbox" className="h-4 w-4" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+      <label htmlFor={inputID} className="cursor-pointer">{label}</label>
+      {help ? <HelpTip label={label} content={help} /> : null}
+    </div>
   );
 }
 
@@ -3493,30 +4058,15 @@ function CompactStat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function NumberField({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {
+function NumberField({ label, help, value, onChange }: { label: string; help?: string; value: number; onChange: (value: number) => void }) {
   return (
-    <Field label={label}>
+    <Field label={label} help={help}>
       <Input
         type="number"
         inputMode="numeric"
         min={0}
         value={Number.isFinite(value) ? value : 0}
         onChange={(event) => onChange(nonNegativeNumber(event.target.value))}
-      />
-    </Field>
-  );
-}
-
-function PercentInput({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {
-  return (
-    <Field label={label}>
-      <Input
-        type="number"
-        inputMode="decimal"
-        min={0}
-        max={100}
-        value={Math.round((Number.isFinite(value) ? value : 0) * 100)}
-        onChange={(event) => onChange(Math.max(0, Math.min(100, nonNegativeNumber(event.target.value))) / 100)}
       />
     </Field>
   );
@@ -3648,25 +4198,18 @@ function textToHeaders(text: string) {
   return out;
 }
 
-function parseLineList(text: string) {
-  return text
-    .split(/[\n,]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .filter((item, index, items) => items.findIndex((candidate) => candidate.toLowerCase() === item.toLowerCase()) === index);
-}
-
 function defaultPoolEffectiveConfig(): ClaudeCodePoolEffectiveConfig {
   return {
     enabled: true,
     pure_mode: true,
+    allow_client_cache_ttl: false,
     cloak: {
       mode: "auto",
       strict_mode: false,
       sensitive_words: []
     },
     usage: {
-      clean_input_tokens: false,
+      clean_input_tokens: true,
       system_prompt_overhead_tokens: 1909,
       profile_fingerprint: ""
     },
@@ -3678,21 +4221,17 @@ function defaultPoolEffectiveConfig(): ClaudeCodePoolEffectiveConfig {
       max_backups: 3,
       redact: true
     },
-    virtual_cache: {
-      enabled: false,
-      mode: "natural",
-      hit_rate: 0.95,
-      target_cache_reuse_ratio: 0.9,
-      min_cache_tokens: 0,
-      max_cache_tokens: 0,
-      uncached_input_tokens: 0,
-      context_shrink_reset_ratio: 0.7,
-      min_creation_tokens: 0,
-      max_creation_tokens: 0
-    },
     routing: {
       per_account_rpm: 6,
       per_account_concurrency: 1,
+      sticky_concurrency_reserve: 1,
+      max_sessions: 30,
+      sticky_wait_ms: 2000,
+      fallback_wait_ms: 500,
+	      max_waiters_per_account: 5,
+      max_waiters_global: 200,
+	      session_affinity_ttl_ms: 3600000,
+	      active_session_idle_ttl_ms: 300000,
       max_switches: 2,
       switch_delay_ms: 1000,
       rate_limit_cooldown_ms: 300000,
@@ -3719,13 +4258,14 @@ function toRawPoolConfig(config: ClaudeCodePoolEffectiveConfig): ClaudeCodePoolR
   return {
     enabled: config.enabled,
     pure_mode: config.pure_mode,
+    allow_client_cache_ttl: config.allow_client_cache_ttl,
     cloak: {
       mode: config.cloak.mode,
       "strict-mode": config.cloak.strict_mode,
       "sensitive-words": config.cloak.sensitive_words
     },
     usage: {
-      clean_input_tokens: config.usage.clean_input_tokens,
+      clean_input_tokens: config.pure_mode,
       system_prompt_overhead_tokens: config.usage.system_prompt_overhead_tokens
     },
     log: {
@@ -3736,21 +4276,17 @@ function toRawPoolConfig(config: ClaudeCodePoolEffectiveConfig): ClaudeCodePoolR
       max_backups: config.log.max_backups,
       redact: config.log.redact
     },
-    virtual_cache: {
-      enabled: config.virtual_cache.enabled,
-      mode: config.virtual_cache.mode,
-      "hit-rate": config.virtual_cache.hit_rate,
-      "target-cache-reuse-ratio": config.virtual_cache.target_cache_reuse_ratio,
-      "min-cache-tokens": config.virtual_cache.min_cache_tokens,
-      "max-cache-tokens": config.virtual_cache.max_cache_tokens,
-      "uncached-input-tokens": config.virtual_cache.uncached_input_tokens,
-      "context-shrink-reset-ratio": config.virtual_cache.context_shrink_reset_ratio,
-      "min-creation-tokens": config.virtual_cache.min_creation_tokens,
-      "max-creation-tokens": config.virtual_cache.max_creation_tokens
-    },
     routing: {
       "per-account-rpm": config.routing.per_account_rpm,
       "per-account-concurrency": config.routing.per_account_concurrency,
+      "sticky-concurrency-reserve": config.routing.sticky_concurrency_reserve,
+      "max-sessions": config.routing.max_sessions,
+      "sticky-wait-ms": config.routing.sticky_wait_ms,
+      "fallback-wait-ms": config.routing.fallback_wait_ms,
+      "max-waiters-per-account": config.routing.max_waiters_per_account,
+      "max-waiters-global": config.routing.max_waiters_global,
+	      "session-affinity-ttl-ms": config.routing.session_affinity_ttl_ms,
+	      "active-session-idle-ttl-ms": config.routing.active_session_idle_ttl_ms,
       "max-switches": config.routing.max_switches,
       "switch-delay-ms": config.routing.switch_delay_ms,
       "rate-limit-cooldown-ms": config.routing.rate_limit_cooldown_ms,
@@ -3773,14 +4309,6 @@ function toRawPoolConfig(config: ClaudeCodePoolEffectiveConfig): ClaudeCodePoolR
   };
 }
 
-function parseSensitiveWords(value: string) {
-  return value
-    .split(/[\n,]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .filter((item, index, items) => items.findIndex((candidate) => candidate.toLowerCase() === item.toLowerCase()) === index);
-}
-
 function ProxyView({
   proxies,
   loading,
@@ -3795,8 +4323,28 @@ function ProxyView({
   onDone: () => Promise<void>;
 }) {
   const [selectedIDs, setSelectedIDs] = useState<string[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filter, setFilter] = useState<"all" | "healthy" | "unhealthy" | "available" | "bound" | "reserved" | "disabled">("all");
+  const [testResults, setTestResults] = useState<Record<string, { tone: "success" | "danger"; message: string }>>({});
   const selectedSet = useMemo(() => new Set(selectedIDs), [selectedIDs]);
   const selectedCount = selectedIDs.length;
+  const filteredProxies = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    return proxies.filter((proxy) => {
+      const matchesQuery = !query || [proxy.name, proxy.exit_ip, proxy.bound_account_email, proxy.proxy_url_preview]
+        .some((value) => (value || "").toLowerCase().includes(query));
+      if (!matchesQuery) {
+        return false;
+      }
+      if (filter === "healthy") return proxy.enabled && proxy.health_status === "healthy";
+      if (filter === "unhealthy") return proxy.enabled && proxy.health_status === "unhealthy";
+      if (filter === "available") return proxy.enabled && proxy.health_status === "healthy" && !proxy.bound_account_id && !proxy.reserved;
+      if (filter === "bound") return Boolean(proxy.bound_account_id);
+      if (filter === "reserved") return proxy.reserved;
+      if (filter === "disabled") return !proxy.enabled;
+      return true;
+    });
+  }, [filter, proxies, searchQuery]);
   useEffect(() => {
     setSelectedIDs((current) => current.filter((id) => proxies.some((proxy) => proxy.id === id)));
   }, [proxies]);
@@ -3832,11 +4380,14 @@ function ProxyView({
   });
   const testMutation = useMutation({
     mutationFn: api.testProxy,
-    onSuccess: async (data) => {
+    onSuccess: async (data, id) => {
+      setTestResults((current) => ({
+        ...current,
+        [id]: { tone: data.warning ? "danger" : "success", message: data.warning || "测试通过" }
+      }));
       await onDone();
-      onToast(data.warning ? `测试完成但异常：${data.warning}` : "测试完成");
     },
-    onError: (error) => onToast(`测试失败：${errorMessage(error)}`, "danger")
+    onError: (error, id) => setTestResults((current) => ({ ...current, [id]: { tone: "danger", message: errorMessage(error) } }))
   });
   const unbindMutation = useMutation({
     mutationFn: api.unbindProxy,
@@ -3924,20 +4475,22 @@ function ProxyView({
         )
       },
       {
-        header: "代理 URL",
-        cell: ({ row }) => <span className="block max-w-72 break-all">{row.original.proxy_url_preview || row.original.proxy_url}</span>
-      },
-      {
         header: "出口 IP",
-        accessorFn: (row) => row.exit_ip || "-"
+        cell: ({ row }) => (
+          <div className="max-w-52">
+            <div className="font-mono text-xs">{row.original.exit_ip || "-"}</div>
+            <div className="mt-1 truncate text-xs text-muted-foreground" title={row.original.proxy_url_preview || row.original.proxy_url}>{row.original.proxy_url_preview || row.original.proxy_url}</div>
+          </div>
+        )
       },
       {
         header: "状态",
-        cell: ({ row }) => <HealthBadge status={row.original.health_status} enabled={row.original.enabled} />
-      },
-      {
-        header: "延迟",
-        cell: ({ row }) => `${row.original.latency_ms || 0} ms`
+        cell: ({ row }) => (
+          <div className="flex flex-wrap gap-1.5">
+            <HealthBadge status={row.original.health_status} enabled={row.original.enabled} />
+            {row.original.reserved ? <Badge tone="warning">登录预留</Badge> : null}
+          </div>
+        )
       },
       {
         header: "失败",
@@ -3945,112 +4498,81 @@ function ProxyView({
       },
       {
         header: "绑定账号",
-        cell: ({ row }) => row.original.bound_account_email || <span className="text-muted-foreground">空闲</span>
+        cell: ({ row }) =>
+          row.original.bound_account_email ||
+          (row.original.reserved ? (
+            <span className="text-amber-700" title={row.original.reserved_until ? `预留至 ${formatTime(row.original.reserved_until)}` : undefined}>登录预留</span>
+          ) : (
+            <span className="text-muted-foreground">空闲</span>
+          ))
       },
       {
         header: "最后测试",
         cell: ({ row }) => formatTime(row.original.last_checked_at)
       },
       {
-        header: "错误",
-        cell: ({ row }) => <span className="block max-w-72 break-words text-muted-foreground">{row.original.last_error || "-"}</span>
+        header: "最近结果",
+        cell: ({ row }) => {
+          const result = testResults[row.original.id];
+          return (
+            <span className={cn("block max-w-72 truncate text-xs", result?.tone === "success" ? "text-emerald-700" : result?.tone === "danger" ? "text-red-700" : "text-muted-foreground")} title={result?.message || row.original.last_error || ""}>
+              {result?.message || row.original.last_error || "-"}
+            </span>
+          );
+        }
       },
       {
         header: "操作",
         cell: ({ row }) => {
           const proxy = row.original;
           return (
-            <div className="flex flex-wrap gap-2">
-              <Button variant="outline" size="sm" onClick={() => testMutation.mutate(proxy.id)}>
-                <Play className="h-3.5 w-3.5" />
-                测试
+            <div className="flex items-center gap-1">
+              <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => testMutation.mutate(proxy.id)} disabled={testMutation.isPending && testMutation.variables === proxy.id} title="测试代理" aria-label="测试代理">
+                {testMutation.isPending && testMutation.variables === proxy.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
               </Button>
-              <Button variant="outline" size="sm" onClick={() => onEdit(proxy)}>
-                <SlidersHorizontal className="h-3.5 w-3.5" />
-                编辑
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => proxyMutation.mutate({ id: proxy.id, enabled: !proxy.enabled })}>
-                {proxy.enabled ? "禁用" : "启用"}
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => unbindMutation.mutate(proxy.id)}>
-                <Unlink className="h-3.5 w-3.5" />
-                解绑
-              </Button>
-              <Button
-                variant="destructive"
-                size="sm"
-                onClick={() => {
-                  if (window.confirm("确认删除这个代理资源？已绑定账号会自动解绑。")) {
-                    deleteMutation.mutate(proxy.id);
-                  }
-                }}
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                删除
-              </Button>
+              <OverflowMenu label="代理操作">
+                <button type="button" onClick={() => onEdit(proxy)}>编辑代理</button>
+                <button type="button" onClick={() => proxyMutation.mutate({ id: proxy.id, enabled: !proxy.enabled })}>{proxy.enabled ? "禁用代理" : "启用代理"}</button>
+                <button type="button" onClick={() => unbindMutation.mutate(proxy.id)} disabled={!proxy.bound_account_id}>解绑账号</button>
+                <button type="button" className="danger" onClick={() => { if (window.confirm("确认删除这个代理资源？已绑定账号会自动解绑。")) deleteMutation.mutate(proxy.id); }}>删除代理</button>
+              </OverflowMenu>
             </div>
           );
         }
       }
     ],
-    [deleteMutation, onEdit, proxyMutation, selectedSet, testMutation, unbindMutation]
+    [deleteMutation, onEdit, proxyMutation, selectedSet, testMutation, testResults, unbindMutation]
   );
-
-  const grouped = useMemo(() => groupProxies(proxies), [proxies]);
+  const table = useReactTable({ data: filteredProxies, columns, getCoreRowModel: getCoreRowModel() });
 
   if (loading) {
     return <LoadingPanel />;
   }
 
   return (
-    <div className="grid gap-5">
-      <ProxyBatchToolbar
-        selectedCount={selectedCount}
-        pending={batchMutation.isPending}
-        onRun={runBatch}
-        onClear={clearSelection}
-      />
-      {grouped.map((group) => (
-        <ProxyGroupCard
-          key={group.key}
-          title={group.title}
-          description={group.description}
-          items={group.items}
-          columns={columns}
-        />
-      ))}
-      {proxies.length === 0 ? <EmptyState title="暂无代理" description="新增代理后，健康检查 worker 会按配置周期自动测试。" /> : null}
-    </div>
-  );
-}
+    <div className="grid gap-3">
+      <div className="workspace-toolbar grid gap-3 rounded-lg border bg-card p-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <label className="relative min-w-[240px] flex-1 max-w-lg">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索名称、出口 IP、绑定账号" className="pl-9 pr-9" />
+            {searchQuery ? <button type="button" className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:bg-muted" onClick={() => setSearchQuery("")} aria-label="清空搜索"><X className="h-3.5 w-3.5" /></button> : null}
+          </label>
+          <span className="text-xs text-muted-foreground">{filteredProxies.length} / {proxies.length} 个代理</span>
+        </div>
+        <div className="filter-tabs flex gap-1 overflow-x-auto pb-0.5">
+          {([
+            ["all", "全部"], ["healthy", "健康"], ["unhealthy", "异常"], ["available", "可用"], ["bound", "已绑定"], ["reserved", "登录预留"], ["disabled", "已禁用"]
+          ] as const).map(([value, label]) => (
+            <button key={value} type="button" className={cn(filter === value && "active")} onClick={() => setFilter(value)}>{label}</button>
+          ))}
+        </div>
+      </div>
 
-function ProxyGroupCard({
-  title,
-  description,
-  items,
-  columns
-}: {
-  title: string;
-  description: string;
-  items: ProxyResource[];
-  columns: ColumnDef<ProxyResource>[];
-}) {
-  const table = useReactTable({ data: items, columns, getCoreRowModel: getCoreRowModel() });
-  if (items.length === 0) {
-    return null;
-  }
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>
-          {title} <span className="text-sm font-normal text-muted-foreground">({items.length})</span>
-        </CardTitle>
-        <CardDescription>{description}</CardDescription>
-      </CardHeader>
-      <CardContent>
-        <DataTable table={table} empty="暂无代理" />
-      </CardContent>
-    </Card>
+      {selectedCount > 0 ? <ProxyBatchToolbar selectedCount={selectedCount} pending={batchMutation.isPending} onRun={runBatch} onClear={clearSelection} /> : null}
+
+      {proxies.length > 0 ? <DataTable table={table} empty="没有匹配的代理" /> : <EmptyState title="暂无代理" description="新增代理后，健康检查会按配置周期自动测试。" />}
+    </div>
   );
 }
 
@@ -4066,12 +4588,8 @@ function ProxyBatchToolbar({
   onClear: () => void;
 }) {
   return (
-    <Card>
-      <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4">
-        <div className="grid gap-1">
-          <div className="text-sm font-medium">批量操作</div>
-          <div className="text-xs text-muted-foreground">已选择 {selectedCount} 个代理</div>
-        </div>
+    <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-primary/25 bg-primary/5 px-3 py-2">
+        <div className="text-sm font-medium">已选择 {selectedCount} 个代理</div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" size="sm" onClick={() => onRun("test")} disabled={selectedCount === 0 || pending}>
             {pending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
@@ -4095,8 +4613,7 @@ function ProxyBatchToolbar({
             清空选择
           </Button>
         </div>
-      </CardContent>
-    </Card>
+    </div>
   );
 }
 
@@ -4139,6 +4656,7 @@ function DataTable<T>({ table, empty }: { table: Table<T>; empty: string }) {
 
 function ResourceModal({
   modal,
+  pools,
   available,
   onClose,
   onRefresh,
@@ -4146,6 +4664,7 @@ function ResourceModal({
   onToast
 }: {
   modal: ModalState;
+  pools: ClaudeCodeAccountPool[];
   available: ProxyResource[];
   onClose: () => void;
   onRefresh: () => Promise<void>;
@@ -4154,9 +4673,9 @@ function ResourceModal({
 }) {
   return (
     <Dialog open={modal !== null} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className={modal?.type === "oauth" ? "max-w-5xl" : modal?.type === "test-account" ? "max-w-4xl p-0" : undefined}>
+      <DialogContent className={modal?.type === "oauth" ? "max-w-5xl" : modal?.type === "test-account" ? "max-w-4xl p-0" : modal?.type === "proxy" ? "drawer-panel max-w-[560px] rounded-none border-y-0 border-r-0" : undefined}>
         {modal?.type === "oauth" ? (
-          <OAuthForm available={available} onDone={onDone} onToast={onToast} />
+          <AddAccountForm poolID={modal.poolID} poolName={pools.find((pool) => pool.id === modal.poolID)?.name || modal.poolID} available={available} onDone={onDone} onToast={onToast} />
         ) : modal?.type === "proxy" ? (
           <ProxyForm proxy={modal.proxy} onDone={onDone} onToast={onToast} />
         ) : modal?.type === "import" ? (
@@ -4169,6 +4688,261 @@ function ResourceModal({
       </DialogContent>
     </Dialog>
   );
+}
+
+function AddAccountForm({
+  poolID,
+  poolName,
+  available,
+  onDone,
+  onToast
+}: {
+  poolID: string;
+  poolName: string;
+  available: ProxyResource[];
+  onDone: (message: string) => Promise<void>;
+  onToast: (message: string, tone?: ToastState["tone"]) => void;
+}) {
+  const [tab, setTab] = useState<"oauth" | "session-key">("oauth");
+  return (
+    <div className="grid min-w-0 gap-5">
+      <DialogHeader>
+        <DialogTitle className="flex items-center gap-2">
+          <UserRoundCog className="h-5 w-5 text-primary" />
+          新增 Claude Code 账号
+        </DialogTitle>
+        <DialogDescription>选择浏览器 OAuth，或使用现有网页会话批量完成 OAuth 授权。</DialogDescription>
+      </DialogHeader>
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/40 px-3 py-2 text-sm">
+        <span className="text-muted-foreground">目标账号池</span>
+        <span className="min-w-0 text-right"><strong>{poolName}</strong><code className="ml-2 break-all text-xs text-muted-foreground">{poolID}</code></span>
+      </div>
+      <div className="grid grid-cols-2 rounded-lg bg-muted p-1" role="tablist" aria-label="账号登录方式">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "oauth"}
+          className={cn("min-h-10 rounded-md px-3 text-sm font-medium", tab === "oauth" ? "bg-card shadow-sm" : "text-muted-foreground hover:text-foreground")}
+          onClick={() => setTab("oauth")}
+        >
+          OAuth 登录
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "session-key"}
+          className={cn("min-h-10 rounded-md px-3 text-sm font-medium", tab === "session-key" ? "bg-card shadow-sm" : "text-muted-foreground hover:text-foreground")}
+          onClick={() => setTab("session-key")}
+        >
+          SessionKey 批量
+        </button>
+      </div>
+      {tab === "oauth" ? (
+        <OAuthForm poolID={poolID} available={available} onDone={onDone} onToast={onToast} />
+      ) : (
+        <SessionKeyBatchForm poolID={poolID} available={available} onToast={onToast} />
+      )}
+    </div>
+  );
+}
+
+function SessionKeyBatchForm({
+  poolID,
+  available,
+  onToast
+}: {
+  poolID: string;
+  available: ProxyResource[];
+  onToast: (message: string, tone?: ToastState["tone"]) => void;
+}) {
+  const queryClient = useQueryClient();
+  const previousJobStatus = useRef<string | undefined>(undefined);
+  const [input, setInput] = useState("");
+  const [concurrency, setConcurrency] = useState(2);
+  const jobQuery = useQuery({
+    queryKey: ["session-key-job"],
+    queryFn: api.currentSessionKeyJob,
+    refetchInterval: (query) => {
+      const status = query.state.data?.job?.status;
+      return status === "queued" || status === "running" || status === "cancelling" ? 2_000 : false;
+    }
+  });
+  const job = jobQuery.data?.job || null;
+  const active = job?.status === "queued" || job?.status === "running" || job?.status === "cancelling";
+  const healthyAvailable = available.filter((proxy) => proxy.enabled && proxy.health_status === "healthy" && !proxy.reserved).length;
+  const parsedKeys = input.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+
+  const startMutation = useMutation({
+    mutationFn: () => api.createSessionKeyJob(parsedKeys, concurrency, poolID),
+    onSuccess: async (data) => {
+      setInput("");
+      queryClient.setQueryData(["session-key-job"], data);
+      await queryClient.invalidateQueries({ queryKey: ["available-proxies"] });
+      onToast("SessionKey 批量登录任务已开始");
+    },
+    onError: (error) => onToast(`启动批量登录失败：${errorMessage(error)}`, "danger")
+  });
+  const cancelMutation = useMutation({
+    mutationFn: () => (job ? api.cancelSessionKeyJob(job.id) : Promise.reject(new Error("没有运行中的任务"))),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["session-key-job"], data);
+      onToast("已停止领取待登录条目");
+    },
+    onError: (error) => onToast(`取消任务失败：${errorMessage(error)}`, "danger")
+  });
+
+  useEffect(() => {
+    const previous = previousJobStatus.current;
+    previousJobStatus.current = job?.status;
+    if (!job || (job.status !== "completed" && job.status !== "cancelled") || (previous !== "queued" && previous !== "running" && previous !== "cancelling")) {
+      return;
+    }
+    onToast(`批量登录完成：新增 ${job.succeeded}，更新 ${job.updated}，失败 ${job.failed + job.no_proxy}。`);
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["accounts"] }),
+      queryClient.invalidateQueries({ queryKey: ["proxies"] }),
+      queryClient.invalidateQueries({ queryKey: ["available-proxies"] }),
+      queryClient.invalidateQueries({ queryKey: ["account-pool-stats"] })
+    ]);
+  }, [job?.id, job?.status]);
+
+  const completed = job ? Math.max(0, job.total - job.queued - job.running) : 0;
+  const progress = job && job.total > 0 ? (completed / job.total) * 100 : 0;
+  const inputError = parsedKeys.length > 100 ? "每批最多 100 条" : parsedKeys.some((key) => key.length > 4096) ? "单条最长 4096 字符" : "";
+
+  return (
+    <div className="grid min-w-0 gap-5">
+      <div className="grid grid-cols-[minmax(0,1fr)_10rem] gap-4 max-[640px]:grid-cols-1">
+        <Field label="SessionKey（一行一个）">
+          <Textarea
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            rows={7}
+            maxLength={409700}
+            spellCheck={false}
+            autoComplete="off"
+            placeholder={"sk-ant-sid...\nsk-ant-sid..."}
+            disabled={active || startMutation.isPending}
+            className="min-h-44 resize-y font-mono text-xs"
+          />
+        </Field>
+        <div className="grid content-start gap-4">
+          <Field label="登录并发">
+            <Input
+              type="number"
+              min={1}
+              max={5}
+              value={concurrency}
+              onChange={(event) => setConcurrency(Math.max(1, Math.min(5, Number(event.target.value) || 1)))}
+              disabled={active}
+            />
+          </Field>
+          <div className="rounded-lg border bg-muted/30 px-3 py-3">
+            <div className="text-xs text-muted-foreground">健康空闲代理</div>
+            <div className="mt-1 text-2xl font-semibold">{healthyAvailable}</div>
+          </div>
+        </div>
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="text-sm text-muted-foreground">
+          {inputError ? <span className="text-destructive">{inputError}</span> : `已输入 ${parsedKeys.length} 条`}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {active ? (
+            <Button type="button" variant="destructive" onClick={() => cancelMutation.mutate()} disabled={cancelMutation.isPending || job?.status === "cancelling"}>
+              {cancelMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldAlert className="h-4 w-4" />}
+              停止任务
+            </Button>
+          ) : null}
+          <Button
+            type="button"
+            onClick={() => startMutation.mutate()}
+            disabled={active || startMutation.isPending || parsedKeys.length === 0 || Boolean(inputError)}
+          >
+            {startMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            开始批量登录
+          </Button>
+        </div>
+      </div>
+
+      {job ? (
+        <section className="grid min-w-0 gap-4 border-t pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2 font-semibold">
+                {active ? <Loader2 className="h-4 w-4 animate-spin text-primary" /> : <CheckCircle2 className="h-4 w-4 text-emerald-600" />}
+                批量任务
+                <SessionKeyJobBadge status={job.status} />
+              </div>
+              <div className="mt-1 font-mono text-xs text-muted-foreground">{job.id}</div>
+            </div>
+            <div className="text-sm text-muted-foreground">{completed} / {job.total}</div>
+          </div>
+          <Progress value={progress} />
+          <div className="grid grid-cols-5 gap-2 max-[768px]:grid-cols-3 max-[480px]:grid-cols-2">
+            <JobMetric label="新增" value={job.succeeded} tone="text-emerald-700" />
+            <JobMetric label="更新" value={job.updated} tone="text-blue-700" />
+            <JobMetric label="失败" value={job.failed} tone="text-red-700" />
+            <JobMetric label="无代理" value={job.no_proxy} tone="text-amber-700" />
+            <JobMetric label="运行中" value={job.running + job.queued} tone="text-foreground" />
+          </div>
+          <div className="max-h-72 overflow-auto rounded-lg border">
+            <table className="w-full min-w-[720px] border-collapse text-sm">
+              <thead className="sticky top-0 bg-muted text-left text-xs text-muted-foreground">
+                <tr>
+                  <th className="px-3 py-2">序号</th>
+                  <th className="px-3 py-2">指纹</th>
+                  <th className="px-3 py-2">代理</th>
+                  <th className="px-3 py-2">账号</th>
+                  <th className="px-3 py-2">状态</th>
+                  <th className="px-3 py-2">结果</th>
+                </tr>
+              </thead>
+              <tbody>
+                {job.items.map((item) => (
+                  <tr key={`${job.id}-${item.index}`} className="border-t align-top">
+                    <td className="px-3 py-2 tabular-nums">{item.index}</td>
+                    <td className="px-3 py-2 font-mono text-xs">{item.fingerprint}</td>
+                    <td className="max-w-44 break-words px-3 py-2">{item.proxy_name || item.proxy_exit_ip || "-"}</td>
+                    <td className="max-w-52 break-all px-3 py-2">{item.account_email || "-"}</td>
+                    <td className="px-3 py-2"><SessionKeyJobBadge status={item.status} /></td>
+                    <td className="max-w-64 break-words px-3 py-2 text-xs text-muted-foreground">{item.error_message || "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : jobQuery.isLoading ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />读取任务状态</div>
+      ) : null}
+    </div>
+  );
+}
+
+function JobMetric({ label, value, tone }: { label: string; value: number; tone: string }) {
+  return (
+    <div className="rounded-lg border bg-card px-3 py-2">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className={cn("mt-1 text-lg font-semibold tabular-nums", tone)}>{value}</div>
+    </div>
+  );
+}
+
+function SessionKeyJobBadge({ status }: { status: string }) {
+  const labels: Record<string, string> = {
+    queued: "排队", running: "运行中", cancelling: "正在停止", completed: "已完成", cancelled: "已取消",
+    success: "新增", updated: "更新", failed: "失败", no_proxy: "无代理", duplicate_input: "重复输入",
+    duplicate_account: "重复账号", invalid_format: "格式无效"
+  };
+  const tone = status === "success" || status === "updated" || status === "completed"
+    ? "success"
+    : status === "failed" || status === "invalid_format"
+      ? "danger"
+      : status === "running" || status === "queued" || status === "cancelling"
+        ? "warning"
+        : "neutral";
+  return <Badge tone={tone}>{labels[status] || status}</Badge>;
 }
 
 function AccountTestForm({
@@ -4404,10 +5178,12 @@ function consoleLineTone(label: string): "default" | "cyan" | "green" | "amber" 
 }
 
 function OAuthForm({
+  poolID,
   available,
   onDone,
   onToast
 }: {
+  poolID: string;
   available: ProxyResource[];
   onDone: (message: string) => Promise<void>;
   onToast: (message: string, tone?: ToastState["tone"]) => void;
@@ -4434,6 +5210,7 @@ function OAuthForm({
   const generateMutation = useMutation({
     mutationFn: async () => {
       const params = new URLSearchParams({ pool: "claude-code", is_webui: "true" });
+      params.set("pool_id", poolID || "default");
       if (effectiveMode) {
         params.set("login_proxy", effectiveMode);
       }
@@ -4525,15 +5302,6 @@ function OAuthForm({
 
   return (
     <>
-      <DialogHeader>
-        <DialogTitle className="flex items-center gap-2">
-          <KeyRound className="h-5 w-5 text-primary" />
-          Anthropic OAuth
-        </DialogTitle>
-        <DialogDescription>
-          通过 OAuth 流程登录 Anthropic Claude，认证成功后自动保存并加入 Claude Code 账号池。
-        </DialogDescription>
-      </DialogHeader>
       <form
         className="grid gap-5"
         onSubmit={(event) => {
@@ -5034,27 +5802,249 @@ function BindProxyForm({
   );
 }
 
-function Field({ label, className, htmlFor, children }: { label: string; className?: string; htmlFor?: string; children: ReactNode }) {
+function Field({
+  label,
+  help,
+  className,
+  htmlFor,
+  children
+}: {
+  label: string;
+  help?: string;
+  className?: string;
+  htmlFor?: string;
+  children: ReactNode;
+}) {
   return (
     <div className={cn("grid gap-2", className)}>
-      <Label htmlFor={htmlFor}>{label}</Label>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <Label htmlFor={htmlFor}>{label}</Label>
+        {help ? <HelpTip label={label} content={help} /> : null}
+      </div>
       {children}
     </div>
   );
 }
 
+function HelpTip({ label, content }: { label: string; content: string }) {
+  const tooltipID = useId();
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const [mode, setMode] = useState<"closed" | "hover" | "pinned">("closed");
+  const [position, setPosition] = useState({ left: 12, top: 12 });
+  const open = mode !== "closed";
+
+  useLayoutEffect(() => {
+    if (!open) {
+      return;
+    }
+    const updatePosition = () => {
+      const button = buttonRef.current;
+      const tooltip = tooltipRef.current;
+      if (!button || !tooltip) {
+        return;
+      }
+      const buttonRect = button.getBoundingClientRect();
+      const width = tooltip.offsetWidth;
+      const height = tooltip.offsetHeight;
+      const left = Math.min(Math.max(12, buttonRect.left + buttonRect.width / 2 - width / 2), window.innerWidth - width - 12);
+      const below = buttonRect.bottom + 8;
+      const top = below + height <= window.innerHeight - 12 ? below : Math.max(12, buttonRect.top - height - 8);
+      setPosition({ left, top });
+    };
+    updatePosition();
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (mode !== "pinned") {
+      return;
+    }
+    const closeOnOutsidePress = (event: Event) => {
+      const target = event.target as Node;
+      if (!buttonRef.current?.contains(target) && !tooltipRef.current?.contains(target)) {
+        setMode("closed");
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setMode("closed");
+        buttonRef.current?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePress);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePress);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [mode]);
+
+  return (
+    <>
+      <button
+        ref={buttonRef}
+        type="button"
+        className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        aria-label={`查看“${label}”说明`}
+        aria-describedby={open ? tooltipID : undefined}
+        aria-expanded={open}
+        onMouseEnter={() => setMode((current) => current === "closed" ? "hover" : current)}
+        onMouseLeave={() => setMode((current) => current === "hover" ? "closed" : current)}
+        onFocus={() => setMode((current) => current === "closed" ? "hover" : current)}
+        onBlur={() => setMode((current) => current === "hover" ? "closed" : current)}
+        onClick={() => setMode((current) => current === "pinned" ? "closed" : "pinned")}
+      >
+        <CircleHelp className="h-4 w-4" aria-hidden="true" />
+      </button>
+      {open ? createPortal(
+        <div
+          ref={tooltipRef}
+          id={tooltipID}
+          role="tooltip"
+          className="fixed z-[100] w-[min(19rem,calc(100vw-1.5rem))] rounded-md border border-slate-700 bg-slate-900 px-3 py-2.5 text-left text-xs font-normal leading-5 text-white shadow-lg"
+          style={position}
+        >
+          <div className="mb-0.5 font-medium text-white">{label}</div>
+          <div className="text-slate-200">{content}</div>
+        </div>,
+        document.body
+      ) : null}
+    </>
+  );
+}
+
 function AccountStatusBadge({ account, runtime }: Pick<AccountRow, "account" | "runtime">) {
-  if (!account.enabled) {
-    return <Badge tone="danger">已禁用</Badge>;
+  if (!account.schedulable) {
+    return <Badge tone="neutral">暂停调度</Badge>;
+  }
+  if (account.health_status === "checking") {
+    return <Badge tone="warning">检查中</Badge>;
+  }
+  if (account.health_status === "manual_recovery") {
+    return <Badge tone="danger">需要处理</Badge>;
+  }
+  if (account.health_status === "temporarily_blocked") {
+    return <Badge tone="warning">临时冷却</Badge>;
   }
   const status = runtime?.status || "active";
   if (status === "active") {
-    return <Badge tone="success">可用</Badge>;
+    return <Badge tone={account.effective_schedulable ? "success" : "warning"}>{account.effective_schedulable ? "可调度" : "暂不可用"}</Badge>;
   }
   if (status === "disabled") {
-    return <Badge tone="danger">已禁用</Badge>;
+    return <Badge tone="neutral">暂停调度</Badge>;
   }
   return <Badge tone="warning">{status}</Badge>;
+}
+
+function QuotaBandBadge({ account }: { account: ClaudeCodeAccount }) {
+  if (account.quota_freshness !== "fresh") {
+    return null;
+  }
+  if (account.shared_quota_band === "exhausted") {
+    return <Badge tone="danger">共享额度耗尽</Badge>;
+  }
+  if (account.shared_quota_band === "drain_only") {
+    return <Badge tone="neutral">共享额度偏低</Badge>;
+  }
+  if (account.quota_band === "exhausted") {
+    return <Badge tone="warning">模型额度受限</Badge>;
+  }
+  if (account.quota_band === "drain_only") {
+    return <Badge tone="neutral">额度偏低</Badge>;
+  }
+  if (account.quota_band === "degraded") {
+    return <Badge tone="neutral">额度偏低</Badge>;
+  }
+  return null;
+}
+
+function quotaBandText(band?: string) {
+  switch (band) {
+    case "normal": return "额度正常";
+    case "degraded": return "额度偏低";
+    case "drain_only": return "额度偏低";
+    case "exhausted": return "额度耗尽";
+    default: return "额度未知";
+  }
+}
+
+function quotaWindowStatusText(status?: string) {
+  switch (String(status || "").toLowerCase()) {
+    case "allowed": return "可用";
+    case "rejected": return "已拒绝";
+    case "exhausted": return "已耗尽";
+    default: return status || "";
+  }
+}
+
+function quotaWindowUtilizationKnown(window?: AccountQuota["windows"][number]) {
+  if (!window) {
+    return false;
+  }
+  if (typeof window.utilization_known === "boolean") {
+    return window.utilization_known;
+  }
+  if (window.source === "oauth_usage") {
+    return true;
+  }
+  return window.used_percent > 0 || (window.remain_percent > 0 && window.remain_percent < 100);
+}
+
+function quotaWindowExplicitlyExhausted(window?: AccountQuota["windows"][number]) {
+  if (!window) {
+    return false;
+  }
+  const status = String(window.status || "").toLowerCase();
+  return status === "rejected" || status === "exhausted" || (typeof window.remaining === "number" && window.remaining <= 0);
+}
+
+function quotaWindowValueText(window?: AccountQuota["windows"][number], missing = "未知") {
+  if (!window) {
+    return missing;
+  }
+  if (quotaWindowExplicitlyExhausted(window)) {
+    return "已耗尽";
+  }
+  if (quotaWindowUtilizationKnown(window)) {
+    return formatPercent(window.remain_percent);
+  }
+  return "已观察";
+}
+
+function quotaWindowTitle(label: string, window?: AccountQuota["windows"][number], shared?: AccountQuota["windows"][number]) {
+  if (!window) {
+    return shared ? `${label} 未返回独立额度，使用共享 7 天窗口` : `${label} 暂无额度数据`;
+  }
+  const details = [`${label} ${quotaWindowValueText(window)}`];
+  if (!quotaWindowUtilizationKnown(window)) {
+    details.push("上游未返回可计算的百分比");
+  }
+  if (window.status) {
+    details.push(quotaWindowStatusText(window.status));
+  }
+  if (window.resets_at) {
+    details.push(`重置 ${formatTime(window.resets_at)}`);
+  }
+  return details.filter(Boolean).join(" · ");
+}
+
+function quotaWindowTextTone(window?: AccountQuota["windows"][number]) {
+  if (quotaWindowExplicitlyExhausted(window) || (quotaWindowUtilizationKnown(window) && (window?.remain_percent ?? 100) <= 0)) {
+    return "text-red-700";
+  }
+  if (!quotaWindowUtilizationKnown(window)) {
+    return "text-muted-foreground";
+  }
+  if ((window?.remain_percent ?? 100) <= 15) {
+    return "text-amber-700";
+  }
+  return "text-foreground";
 }
 
 function HealthBadge({ status, enabled }: { status: string; enabled: boolean }) {
@@ -5091,53 +6081,6 @@ function QuotaSummary({ quota }: { quota?: AccountQuota }) {
   );
 }
 
-function QuotaPanel({ quota, onRefresh, refreshing }: { quota?: AccountQuota; onRefresh: () => void; refreshing: boolean }) {
-  const windows = quota?.windows || [];
-  return (
-    <div className="grid gap-3 rounded-lg border bg-muted/20 p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-sm font-medium">
-          <Database className="h-4 w-4 text-muted-foreground" />
-          额度
-          {quota?.status === "error" ? <Badge tone="danger">异常</Badge> : quota?.checked_at ? <Badge tone="info">已检测</Badge> : <Badge tone="warning">未检测</Badge>}
-        </div>
-        <Button variant="outline" size="sm" onClick={onRefresh} disabled={refreshing}>
-          <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
-          刷新额度
-        </Button>
-      </div>
-      {quota?.status === "error" ? (
-        <div className="break-words rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-800">
-          {quota.last_error || "额度检测失败"}
-        </div>
-      ) : windows.length ? (
-        <div className="grid gap-2">
-          {windows.map((window) => (
-            <div key={window.key || window.name} className="grid gap-1.5">
-              <div className="flex items-center justify-between gap-3 text-xs">
-                <span className="font-medium">{window.name || window.key}</span>
-                <span className="tabular-nums text-muted-foreground">
-                  剩余 {formatPercent(window.remain_percent)}
-                  {window.resets_at ? ` · 重置 ${formatTime(window.resets_at)}` : ""}
-                </span>
-              </div>
-              <Progress value={window.remain_percent} />
-              {window.monthly_limit !== undefined || window.used_credits !== undefined ? (
-                <div className="text-xs text-muted-foreground">
-                  已用 {formatNumber(window.used_credits)} / {formatNumber(window.monthly_limit)}
-                </div>
-              ) : null}
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="text-xs leading-5 text-muted-foreground">还没有额度快照。</div>
-      )}
-      {quota?.checked_at ? <div className="text-xs text-muted-foreground">最近刷新 {formatTime(quota.checked_at)}</div> : null}
-    </div>
-  );
-}
-
 function LoadingPanel() {
   return (
     <Card>
@@ -5158,28 +6101,6 @@ function EmptyState({ title, description }: { title: string; description: string
       </div>
     </div>
   );
-}
-
-function groupProxies(proxies: ProxyResource[]) {
-  const groups = [
-    { key: "healthy", title: "健康代理", description: "可优先绑定到账号池。", items: [] as ProxyResource[] },
-    { key: "unknown", title: "未知代理", description: "未完成检测或连续失败未达阈值。", items: [] as ProxyResource[] },
-    { key: "unhealthy", title: "异常代理", description: "不进入账号绑定选择器，已绑定账号会提示风险。", items: [] as ProxyResource[] },
-    { key: "disabled", title: "已禁用代理", description: "不会参与健康检查和账号选择。", items: [] as ProxyResource[] }
-  ];
-  for (const proxy of proxies) {
-    const text = healthText(proxy.health_status, proxy.enabled);
-    if (text === "健康") {
-      groups[0].items.push(proxy);
-    } else if (text === "异常") {
-      groups[2].items.push(proxy);
-    } else if (text === "已禁用") {
-      groups[3].items.push(proxy);
-    } else {
-      groups[1].items.push(proxy);
-    }
-  }
-  return groups;
 }
 
 function errorMessage(error: unknown) {

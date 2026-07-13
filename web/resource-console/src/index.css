@@ -4,18 +4,18 @@
 
 @layer base {
   :root {
-    --background: 216 25% 96%;
-    --foreground: 220 28% 10%;
+    --background: 210 20% 98%;
+    --foreground: 220 22% 12%;
     --card: 0 0% 100%;
-    --card-foreground: 220 28% 10%;
-    --primary: 222 78% 52%;
+    --card-foreground: 220 22% 12%;
+    --primary: 218 72% 45%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 180 30% 94%;
-    --secondary-foreground: 213 24% 18%;
-    --muted: 220 18% 93%;
-    --muted-foreground: 220 10% 42%;
-    --accent: 160 45% 92%;
-    --accent-foreground: 165 70% 22%;
+    --secondary: 210 18% 94%;
+    --secondary-foreground: 220 18% 18%;
+    --muted: 214 16% 94%;
+    --muted-foreground: 218 9% 43%;
+    --accent: 154 26% 93%;
+    --accent-foreground: 158 55% 22%;
     --destructive: 4 72% 42%;
     --destructive-foreground: 0 0% 100%;
     --border: 220 16% 85%;
@@ -40,9 +40,46 @@
   textarea {
     font: inherit;
   }
+
+  ::selection {
+    @apply bg-primary/20;
+  }
 }
 
 @layer components {
+  .console-sidebar {
+    @apply flex min-h-dvh flex-col;
+  }
+
+  .sidebar-link {
+    @apply flex min-h-9 items-center gap-2 rounded-lg px-3 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground;
+  }
+
+  .resource-overview,
+  .issue-row {
+    @apply transition-colors hover:bg-muted/40;
+  }
+
+  .issue-row:nth-last-child(-n + 2) {
+    @apply border-b-0;
+  }
+
+  .icon-segment {
+    @apply flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground;
+  }
+
+  .icon-segment.active {
+    @apply bg-card text-foreground shadow-sm;
+  }
+
+  .filter-tabs button {
+    @apply min-h-8 shrink-0 rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground;
+  }
+
+  .filter-tabs button.active {
+    @apply bg-foreground text-background;
+  }
+
   .table-scroll {
     @apply w-full overflow-x-auto rounded-lg border bg-card;
   }
@@ -52,14 +89,86 @@
   }
 
   .data-table th {
-    @apply border-b bg-muted px-3 py-3 text-left font-semibold text-muted-foreground;
+    @apply border-b bg-muted px-3 py-2.5 text-left text-xs font-semibold text-muted-foreground;
   }
 
   .data-table td {
-    @apply border-b px-3 py-3 align-top;
+    @apply border-b px-3 py-2.5 align-middle;
+  }
+
+  .data-table tbody tr {
+    @apply transition-colors hover:bg-muted/30;
   }
 
   .data-table tr:last-child td {
     @apply border-b-0;
+  }
+
+  .overflow-menu {
+    @apply relative;
+  }
+
+  .overflow-menu > button {
+    @apply flex h-8 w-8 cursor-pointer list-none items-center justify-center rounded-md border bg-card text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring;
+  }
+
+  .overflow-menu-content {
+    @apply fixed z-50 grid min-w-36 overflow-hidden rounded-lg border bg-card p-1 shadow-panel;
+  }
+
+  .overflow-menu-content button {
+    @apply min-h-8 rounded-md px-2.5 text-left text-xs transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50;
+  }
+
+  .overflow-menu-content button.danger {
+    @apply text-red-700 hover:bg-red-50;
+  }
+
+  .drawer-panel {
+    left: auto !important;
+    right: 0 !important;
+    top: 0 !important;
+    height: 100dvh !important;
+    max-height: 100dvh !important;
+    width: min(100vw, 720px) !important;
+    transform: none !important;
+    animation: drawer-in 180ms ease-out;
+  }
+
+  @keyframes drawer-in {
+    from { transform: translateX(16px); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+  }
+
+  @media (max-width: 900px) {
+    .console-sidebar {
+      min-height: auto;
+    }
+
+    .console-brand {
+      display: none;
+    }
+  }
+
+  @media (max-width: 760px) {
+    .issue-row:nth-last-child(2) {
+      @apply border-b;
+    }
+  }
+
+  @media (max-width: 520px) {
+    .console-nav button span {
+      @apply text-xs;
+    }
+
+    .workspace-toolbar {
+      @apply p-2;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .drawer-panel {
+      animation: none;
+    }
   }
 }

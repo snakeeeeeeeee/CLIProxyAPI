@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
@@ -34,6 +35,14 @@ const (
 	PoolScopeMetadataKey = "pool_scope"
 	// PoolScopeClaudeAccountPool is the dedicated Claude Code OAuth account pool.
 	PoolScopeClaudeAccountPool = "claude-acc-pool"
+	// AccountPoolIDMetadataKey stores the authenticated account-pool ID.
+	AccountPoolIDMetadataKey = "account_pool_id"
+	// AccountPoolAPIKeyIDMetadataKey stores the generated pool-key ID without its secret.
+	AccountPoolAPIKeyIDMetadataKey = "account_pool_api_key_id"
+	// AccountPoolPriceVersionMetadataKey pins the request-start model price revision.
+	AccountPoolPriceVersionMetadataKey = "account_pool_price_version_id"
+	// AccountPoolIDAttributeKey stores account membership on runtime auth records.
+	AccountPoolIDAttributeKey = "claude_code_pool_id"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.
@@ -43,6 +52,15 @@ const (
 	// ClaudePoolAffinityMetadataKey carries Claude API pool cache affinity hints.
 	ClaudePoolAffinityMetadataKey = "claude_pool_cache_affinity"
 )
+
+// ClaudeAccountPoolRoutingScope returns the isolated scheduler namespace for a pool.
+func ClaudeAccountPoolRoutingScope(poolID string) string {
+	poolID = strings.TrimSpace(poolID)
+	if poolID == "" {
+		poolID = "default"
+	}
+	return PoolScopeClaudeAccountPool + "/" + poolID
+}
 
 // Request encapsulates the translated payload that will be sent to a provider executor.
 type Request struct {

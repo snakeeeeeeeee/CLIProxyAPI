@@ -22,13 +22,11 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
-	xxHash64 "github.com/pierrec/xxHash/xxHash64"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/resourcepool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -75,6 +73,342 @@ func (h *Handler) GetResourcePoolConfig(c *gin.Context) {
 	})
 }
 
+func (h *Handler) ListClaudeCodeAccountPools(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	items, err := store.ListAccountPools(c.Request.Context(), strings.EqualFold(strings.TrimSpace(c.Query("include_archived")), "true"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list_failed", "message": err.Error()})
+		return
+	}
+	insights, err := store.AccountPoolInsights(c.Request.Context(), time.Now())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "insights_failed", "message": err.Error()})
+		return
+	}
+	baseQuery := summaryUsageQuery(parseUsageQuery(c))
+	usage, err := store.UsageSummaryQuery(c.Request.Context(), baseQuery)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "summary_failed", "message": err.Error()})
+		return
+	}
+	usageByPool := make(map[string]resourcepool.UsageSummaryItem, len(usage.ByPool))
+	for _, item := range usage.ByPool {
+		usageByPool[item.Key] = item
+	}
+	for index := range items {
+		attachAccountPoolSummary(&items[index], insights.Pools[items[index].ID], usageByPool[items[index].ID])
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+func (h *Handler) GetClaudeCodeAccountPool(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	item, err := store.GetAccountPool(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": "get_failed", "message": err.Error()})
+		return
+	}
+	insights, err := store.AccountPoolInsights(c.Request.Context(), time.Now())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "insights_failed", "message": err.Error()})
+		return
+	}
+	query := summaryUsageQuery(parseUsageQuery(c))
+	query.PoolID = item.ID
+	usage, err := store.UsageSummaryQuery(c.Request.Context(), query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "summary_failed", "message": err.Error()})
+		return
+	}
+	attachAccountPoolSummary(item, insights.Pools[item.ID], usageSummaryItem(usage))
+	c.JSON(http.StatusOK, gin.H{"item": item})
+}
+
+func attachAccountPoolSummary(pool *resourcepool.ClaudeCodeAccountPool, insights resourcepool.AccountPoolOperationalInsights, usage resourcepool.UsageSummaryItem) {
+	if pool == nil {
+		return
+	}
+	summary := &resourcepool.AccountPoolSummary{
+		AccountCount:         insights.AccountCount,
+		HealthyAccountCount:  insights.HealthyAccountCount,
+		APIKeyCount:          insights.APIKeyCount,
+		RequestCount:         usage.RequestCount,
+		AttemptCount:         usage.AttemptCount,
+		SuccessRate:          usage.SuccessRate,
+		RawTotalTokens:       usage.RawTotalTokens,
+		EstimatedCost:        usage.EstimatedCost,
+		UnpricedRequestCount: usage.UnpricedRequestCount,
+		PricingCoverage:      usage.PricingCoverage,
+		Health:               insights.Health,
+		ModelCapacity:        insights.ModelCapacity,
+	}
+	if summary.RequestCount == 0 {
+		summary.PricingCoverage = 100
+	}
+	pool.Summary = summary
+}
+
+func summaryUsageQuery(query resourcepool.UsageQuery) resourcepool.UsageQuery {
+	query.PoolID = ""
+	query.AccountID = ""
+	query.APIKeyID = ""
+	query.Model = ""
+	query.Limit = 500
+	query.Offset = 0
+	return query
+}
+
+func usageSummaryItem(summary resourcepool.UsageSummary) resourcepool.UsageSummaryItem {
+	return resourcepool.UsageSummaryItem{
+		RequestCount:         summary.RequestCount,
+		AttemptCount:         summary.AttemptCount,
+		SuccessCount:         summary.SuccessCount,
+		FailureCount:         summary.FailureCount,
+		SuccessRate:          summary.SuccessRate,
+		InputTokens:          summary.InputTokens,
+		OutputTokens:         summary.OutputTokens,
+		CacheReadTokens:      summary.CacheReadTokens,
+		CacheCreationTokens:  summary.CacheCreationTokens,
+		CacheCreation5m:      summary.CacheCreation5m,
+		CacheCreation1h:      summary.CacheCreation1h,
+		RawInputTokens:       summary.RawInputTokens,
+		RawTotalTokens:       summary.RawTotalTokens,
+		EstimatedCost:        summary.EstimatedCost,
+		UnpricedRequestCount: summary.UnpricedRequestCount,
+		PricingCoverage:      summary.PricingCoverage,
+	}
+}
+
+func (h *Handler) CreateClaudeCodeAccountPool(c *gin.Context) {
+	var body struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "invalid request body"})
+		return
+	}
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	item, err := store.CreateAccountPool(c.Request.Context(), body.Name, body.Description)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "create_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishPoolChanged(item.ID, "create")
+	resourcepool.PublishStatsChanged("account_pool")
+	c.JSON(http.StatusCreated, gin.H{"item": item})
+}
+
+func (h *Handler) PatchClaudeCodeAccountPool(c *gin.Context) {
+	var body resourcepool.ClaudeCodeAccountPoolPatch
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "invalid request body"})
+		return
+	}
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	item, err := store.PatchAccountPool(c.Request.Context(), c.Param("id"), body)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": "update_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishPoolChanged(item.ID, "update")
+	resourcepool.PublishStatsChanged("account_pool")
+	c.JSON(http.StatusOK, gin.H{"item": item})
+}
+
+func (h *Handler) DeleteClaudeCodeAccountPool(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	id := strings.TrimSpace(c.Param("id"))
+	if err := store.ArchiveAccountPool(c.Request.Context(), id); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, resourcepool.ErrAccountPoolNotEmpty) {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{"error": "archive_failed", "message": err.Error()})
+		return
+	}
+	claudeapipool.RemoveScopedRoutingScope(resourcepool.AccountRoutingScope(id))
+	resourcepool.PublishPoolChanged(id, "archive")
+	resourcepool.PublishStatsChanged("account_pool")
+	c.JSON(http.StatusOK, gin.H{"status": "archived"})
+}
+
+func (h *Handler) ListClaudeCodePoolAPIKeys(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	items, err := store.ListPoolAPIKeys(c.Request.Context(), strings.TrimSpace(c.Query("pool_id")), strings.EqualFold(strings.TrimSpace(c.Query("include_revoked")), "true"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list_failed", "message": err.Error()})
+		return
+	}
+	usageQuery := parseUsageQuery(c)
+	usageQuery.PoolID = strings.TrimSpace(c.Query("pool_id"))
+	usageQuery.Limit = 1
+	usage, err := store.UsageSummaryQuery(c.Request.Context(), usageQuery)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "usage_failed", "message": err.Error()})
+		return
+	}
+	usageByKey := make(map[string]*resourcepool.UsageSummaryItem, len(usage.ByAPIKey))
+	for index := range usage.ByAPIKey {
+		item := usage.ByAPIKey[index]
+		usageByKey[item.Key] = &item
+	}
+	for index := range items {
+		items[index].Usage = usageByKey[items[index].ID]
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+func (h *Handler) CreateClaudeCodePoolAPIKey(c *gin.Context) {
+	var body struct {
+		PoolID string `json:"pool_id"`
+		Name   string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "invalid request body"})
+		return
+	}
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	credential, err := store.CreatePoolAPIKey(c.Request.Context(), body.PoolID, body.Name)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "create_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishAPIKeyChanged(credential.Item.ID, "create")
+	resourcepool.PublishStatsChanged("api_key")
+	c.JSON(http.StatusCreated, credential)
+}
+
+func (h *Handler) PatchClaudeCodePoolAPIKey(c *gin.Context) {
+	var body resourcepool.ClaudeCodePoolAPIKeyPatch
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "invalid request body"})
+		return
+	}
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	item, err := store.PatchPoolAPIKey(c.Request.Context(), c.Param("id"), body)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": "update_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishAPIKeyChanged(item.ID, "update")
+	c.JSON(http.StatusOK, gin.H{"item": item})
+}
+
+func (h *Handler) GetClaudeCodePoolAPIKeySecret(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	secret, err := store.GetPoolAPIKeySecret(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		code := "secret_failed"
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			status = http.StatusNotFound
+			code = "not_found"
+		case errors.Is(err, resourcepool.ErrPoolAPIKeyRevoked):
+			status = http.StatusConflict
+			code = "key_revoked"
+		case errors.Is(err, resourcepool.ErrPoolAPIKeySecretUnavailable):
+			status = http.StatusConflict
+			code = "secret_unavailable"
+		}
+		c.JSON(status, gin.H{"error": code, "message": err.Error()})
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
+	c.JSON(http.StatusOK, gin.H{"secret": secret})
+}
+
+func (h *Handler) DeleteClaudeCodePoolAPIKey(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	id := strings.TrimSpace(c.Param("id"))
+	if err := store.RevokePoolAPIKey(c.Request.Context(), id); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": "revoke_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishAPIKeyChanged(id, "revoke")
+	resourcepool.PublishStatsChanged("api_key")
+	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
+}
+
+func (h *Handler) RotateClaudeCodePoolAPIKey(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	credential, err := store.RotatePoolAPIKey(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": "rotate_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishAPIKeyChanged(credential.Item.ID, "rotate")
+	c.JSON(http.StatusOK, credential)
+}
+
 func (h *Handler) GetClaudeCodePoolConfig(c *gin.Context) {
 	store, ok := h.openResourcePoolStore(c)
 	if !ok {
@@ -87,7 +421,6 @@ func (h *Handler) GetClaudeCodePoolConfig(c *gin.Context) {
 		return
 	}
 	effective := resourcepool.EffectiveClaudeCodePool(doc.ClaudeCode)
-	claudeapipool.SetScopedRoutingConfig(coreexecutor.PoolScopeClaudeAccountPool, effective.Routing)
 	c.JSON(http.StatusOK, gin.H{
 		"raw":       doc.ClaudeCode,
 		"effective": effective,
@@ -113,11 +446,54 @@ func (h *Handler) PutClaudeCodePoolConfig(c *gin.Context) {
 		return
 	}
 	effective := resourcepool.EffectiveClaudeCodePool(doc.ClaudeCode)
-	claudeapipool.SetScopedRoutingConfig(coreexecutor.PoolScopeClaudeAccountPool, effective.Routing)
 	h.triggerConfigReload(c.Request.Context())
 	resourcepool.PublishConfigChanged("save")
 	resourcepool.PublishStatsChanged("config")
 	c.JSON(http.StatusOK, gin.H{"raw": doc.ClaudeCode, "effective": effective})
+}
+
+func (h *Handler) GetClaudeCodeAccountPoolConfig(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	view, err := store.GetAccountPoolConfig(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": "load_failed", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, view)
+}
+
+func (h *Handler) PatchClaudeCodeAccountPoolConfig(c *gin.Context) {
+	raw, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20))
+	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "account-pool config patch is required"})
+		return
+	}
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	view, err := store.PatchAccountPoolConfig(c.Request.Context(), c.Param("id"), json.RawMessage(raw))
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": "save_failed", "message": err.Error()})
+		return
+	}
+	h.triggerConfigReload(c.Request.Context())
+	resourcepool.PublishPoolChanged(c.Param("id"), "config")
+	resourcepool.PublishStatsChanged("pool_config")
+	c.JSON(http.StatusOK, view)
 }
 
 func (h *Handler) GetClaudeCodeProfile(c *gin.Context) {
@@ -480,14 +856,28 @@ func (h *Handler) ListClaudeCodeAccounts(c *gin.Context) {
 		return
 	}
 	defer closeResourcePoolStore(store)
-	accounts, err := store.ListAccounts(c.Request.Context())
+	accounts, err := store.ListAccountsByPool(c.Request.Context(), strings.TrimSpace(c.Query("pool_id")))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "list_failed", "message": err.Error()})
 		return
 	}
+	usageQuery := parseUsageQuery(c)
+	usageQuery.PoolID = strings.TrimSpace(c.Query("pool_id"))
+	usageQuery.Limit = 1
+	usage, err := store.UsageSummaryQuery(c.Request.Context(), usageQuery)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "usage_failed", "message": err.Error()})
+		return
+	}
+	usageByAccount := make(map[string]*resourcepool.UsageSummaryItem, len(usage.ByAccount))
+	for index := range usage.ByAccount {
+		item := usage.ByAccount[index]
+		usageByAccount[item.Key] = &item
+	}
 	authEntries := h.authEntryByID()
 	items := make([]gin.H, 0, len(accounts))
 	for _, account := range accounts {
+		account.Usage = usageByAccount[account.ID]
 		entry := gin.H{"account": account}
 		if authEntry, ok := authEntries[account.AuthID]; ok {
 			entry["runtime"] = authEntry
@@ -503,36 +893,57 @@ func (h *Handler) GetClaudeCodePoolStats(c *gin.Context) {
 		return
 	}
 	defer closeResourcePoolStore(store)
-	accounts, err := store.ListAccounts(c.Request.Context())
+	usageQuery := parseUsageQuery(c)
+	insights, err := store.AccountPoolInsights(c.Request.Context(), time.Now())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "list_failed", "message": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "insights_failed", "message": err.Error()})
 		return
 	}
-	stats := resourcepool.AccountPoolStats{WindowSeconds: int64(time.Hour.Seconds()), AccountCount: len(accounts)}
-	for _, account := range accounts {
-		if strings.TrimSpace(account.AuthID) == "" {
-			continue
+	operational := insights.Global
+	if usageQuery.PoolID != "" {
+		operational = insights.Pools[usageQuery.PoolID]
+	}
+	stats := resourcepool.AccountPoolStats{
+		AccountCount:      operational.AccountCount,
+		AvailableAccounts: operational.AvailableAccounts,
+		CoolingAccounts:   operational.CoolingAccounts,
+		InFlight:          operational.InFlight,
+		RPMUsed:           operational.RPMUsed,
+		RPMLimit:          operational.RPMLimit,
+		Health:            operational.Health,
+		ModelCapacity:     operational.ModelCapacity,
+	}
+	if usageQuery.PoolID == "" {
+		distribution := insights.Distribution
+		stats.PoolHealthDistribution = &distribution
+	}
+	if !usageQuery.AllTime {
+		stats.WindowSeconds = int64(usageQuery.Window.Seconds())
+	}
+	if usageQuery.PoolID != "" {
+		activeKeys, warmLanes := claudeapipool.ScopedAccountAffinityStats(resourcepool.AccountRoutingScope(usageQuery.PoolID))
+		stats.ActiveAffinityKeys = activeKeys
+		stats.WarmLanes = warmLanes
+	} else {
+		pools, errPools := store.ListAccountPools(c.Request.Context(), false)
+		if errPools != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "list_failed", "message": errPools.Error()})
+			return
 		}
-		if account.Enabled && account.HasAuthData {
-			stats.AvailableAccounts++
-		}
-		status := claudeapipool.AggregateScopedRouteStatus(coreexecutor.PoolScopeClaudeAccountPool, account.AuthID)
-		stats.InFlight += status.InFlight
-		stats.RPMUsed += status.RPMUsed
-		stats.RPMLimit += status.RPMLimit
-		if status.Cooling || status.Unavailable {
-			stats.CoolingAccounts++
+		for _, pool := range pools {
+			activeKeys, warmLanes := claudeapipool.ScopedAccountAffinityStats(resourcepool.AccountRoutingScope(pool.ID))
+			stats.ActiveAffinityKeys += activeKeys
+			stats.WarmLanes += warmLanes
 		}
 	}
-	activeKeys, warmLanes := claudeapipool.AffinityStats()
-	stats.ActiveAffinityKeys = activeKeys
-	stats.WarmLanes = warmLanes
-	usage, errUsage := store.UsageSummary(c.Request.Context(), time.Hour, 20)
+	usageQuery.Limit = 20
+	usage, errUsage := store.UsageSummaryQuery(c.Request.Context(), usageQuery)
 	if errUsage != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "usage_failed", "message": errUsage.Error()})
 		return
 	}
 	stats.RequestCount = usage.RequestCount
+	stats.AttemptCount = usage.AttemptCount
 	stats.SuccessCount = usage.SuccessCount
 	stats.FailureCount = usage.FailureCount
 	stats.SuccessRate = usage.SuccessRate
@@ -542,16 +953,19 @@ func (h *Handler) GetClaudeCodePoolStats(c *gin.Context) {
 	stats.CacheCreationTokens = usage.CacheCreationTokens
 	stats.RawInputTokens = usage.RawInputTokens
 	stats.RawTotalTokens = usage.RawTotalTokens
+	stats.EstimatedCost = usage.EstimatedCost
+	stats.UnpricedRequestCount = usage.UnpricedRequestCount
+	stats.PricingCoverage = usage.PricingCoverage
 	if totalCache := usage.CacheReadTokens + usage.CacheCreationTokens; totalCache > 0 {
 		stats.RealCacheRatio = float64(usage.CacheReadTokens) * 100 / float64(totalCache)
 	}
-	rejects, errRejects := store.CountLocalRoutingRejects(c.Request.Context(), time.Hour)
+	rejects, errRejects := store.CountLocalRoutingRejectsQuery(c.Request.Context(), usageQuery.Window, usageQuery.AllTime, usageQuery.PoolID)
 	if errRejects != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "routing_failed", "message": errRejects.Error()})
 		return
 	}
 	stats.LocalRejectCount = rejects
-	recentErrors, errErrors := store.ListRecentRoutingErrors(c.Request.Context(), 10)
+	recentErrors, errErrors := store.ListRecentRoutingErrorsByPool(c.Request.Context(), usageQuery.PoolID, 10)
 	if errErrors != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "routing_failed", "message": errErrors.Error()})
 		return
@@ -665,12 +1079,18 @@ func (h *Handler) ListClaudeCodeRoutingEvents(c *gin.Context) {
 		return
 	}
 	defer closeResourcePoolStore(store)
-	events, err := store.ListRoutingEvents(c.Request.Context(), parsePositiveQueryInt(c, "limit", 100))
+	query := parseUsageQuery(c)
+	events, err := store.ListRoutingEventsQuery(c.Request.Context(), query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "list_failed", "message": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": events})
+	total, err := store.CountRoutingEventsQuery(c.Request.Context(), query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "count_failed", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": events, "total": total, "limit": query.Limit, "offset": query.Offset})
 }
 
 func (h *Handler) GetClaudeCodeUsageSummary(c *gin.Context) {
@@ -679,13 +1099,7 @@ func (h *Handler) GetClaudeCodeUsageSummary(c *gin.Context) {
 		return
 	}
 	defer closeResourcePoolStore(store)
-	window := time.Hour
-	if raw := strings.TrimSpace(c.Query("window")); raw != "" {
-		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
-			window = parsed
-		}
-	}
-	summary, err := store.UsageSummary(c.Request.Context(), window, parsePositiveQueryInt(c, "limit", 100))
+	summary, err := store.UsageSummaryQuery(c.Request.Context(), parseUsageQuery(c))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "usage_failed", "message": err.Error()})
 		return
@@ -762,6 +1176,7 @@ func (h *Handler) ListClaudeCodeUsageCalibrations(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"profile_fingerprint": fingerprint,
 		"default_overhead":    effective.Usage.SystemPromptOverheadTokens,
+		"pure_mode":           effective.PureMode,
 		"clean_input_tokens":  effective.Usage.CleanInputTokens,
 		"items":               items,
 	})
@@ -932,6 +1347,49 @@ func parsePositiveQueryInt(c *gin.Context, key string, fallback int) int {
 	return fallback
 }
 
+func parseNonNegativeQueryInt(c *gin.Context, key string, fallback int) int {
+	if c == nil {
+		return fallback
+	}
+	raw := strings.TrimSpace(c.Query(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err == nil && value >= 0 {
+		return value
+	}
+	return fallback
+}
+
+func parseUsageQuery(c *gin.Context) resourcepool.UsageQuery {
+	query := resourcepool.UsageQuery{
+		Window:    30 * 24 * time.Hour,
+		PoolID:    strings.TrimSpace(c.Query("pool_id")),
+		AccountID: strings.TrimSpace(c.Query("account_id")),
+		APIKeyID:  strings.TrimSpace(c.Query("api_key_id")),
+		Model:     strings.TrimSpace(c.Query("model")),
+		Limit:     parsePositiveQueryInt(c, "limit", 100),
+		Offset:    parseNonNegativeQueryInt(c, "offset", 0),
+	}
+	raw := strings.ToLower(strings.TrimSpace(c.Query("window")))
+	switch raw {
+	case "", "30d":
+	case "24h", "1d":
+		query.Window = 24 * time.Hour
+	case "7d":
+		query.Window = 7 * 24 * time.Hour
+	case "all", "all-time":
+		query.AllTime = true
+		query.Window = 0
+	default:
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			query.Window = parsed
+		}
+	}
+	return query
+}
+
 func (h *Handler) ListClaudeCodePoolModels(c *gin.Context) {
 	store, ok := h.openResourcePoolStore(c)
 	if !ok {
@@ -943,7 +1401,55 @@ func (h *Handler) ListClaudeCodePoolModels(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "list_failed", "message": err.Error()})
 		return
 	}
+	if err := store.AttachCurrentModelPrices(c.Request.Context(), models); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "pricing_failed", "message": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"items": models})
+}
+
+// GetClaudeCodeModelPrices returns the current immutable revision and history metadata.
+func (h *Handler) GetClaudeCodeModelPrices(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	current, err := store.CurrentModelPriceVersion(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "pricing_failed", "message": err.Error()})
+		return
+	}
+	versions, err := store.ListModelPriceVersions(c.Request.Context(), parsePositiveQueryInt(c, "limit", 20))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "pricing_failed", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"current": current, "versions": versions})
+}
+
+// PutClaudeCodeModelPrices creates a new immutable global price revision.
+func (h *Handler) PutClaudeCodeModelPrices(c *gin.Context) {
+	var body struct {
+		Note    string                          `json:"note"`
+		Updates []resourcepool.ModelPriceUpdate `json:"updates"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body"})
+		return
+	}
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	version, err := store.CreateModelPriceVersion(c.Request.Context(), body.Updates, body.Note)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "pricing_failed", "message": err.Error()})
+		return
+	}
+	resourcepool.PublishPricingChanged(strconv.FormatInt(version.ID, 10), "update")
+	c.JSON(http.StatusOK, gin.H{"current": version})
 }
 
 func (h *Handler) CreateClaudeCodePoolModel(c *gin.Context) {
@@ -1160,18 +1666,23 @@ func (h *Handler) testClaudeCodeAccount(ctx context.Context, store *resourcepool
 		return account, "", err
 	}
 	applyClaudeCodeManagementHeaders(req, auth, false, userID, model)
+	attemptedAt := time.Now()
 	resp, err := h.authManager.HttpRequest(ctx, auth, req)
 	if err != nil {
 		message := err.Error()
+		recordClaudeCodeAccountTestUsage(ctx, store, account, model, http.StatusBadGateway, false, nil, attemptedAt)
 		account, _ = store.MarkAccountTestResult(ctx, account.ID, false, message)
 		return account, "", errors.New(message)
 	}
 	responseBody, readErr := readClaudeCodeManagementResponseBody(resp, 2<<20)
 	if readErr != nil {
 		message := readErr.Error()
+		recordClaudeCodeAccountTestUsage(ctx, store, account, model, resp.StatusCode, false, nil, attemptedAt)
 		account, _ = store.MarkAccountTestResult(ctx, account.ID, false, message)
 		return account, "", errors.New(message)
 	}
+	testSucceeded := resp.StatusCode >= 200 && resp.StatusCode < 300
+	recordClaudeCodeAccountTestUsage(ctx, store, account, model, resp.StatusCode, testSucceeded, responseBody, attemptedAt)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		message := strings.TrimSpace(string(responseBody))
 		if message == "" {
@@ -1182,12 +1693,63 @@ func (h *Handler) testClaudeCodeAccount(ctx context.Context, store *resourcepool
 		return account, "", errors.New(message)
 	}
 	reply := extractClaudeMessageText(responseBody)
+	_, _ = store.MergeAccountRateLimitHeaders(ctx, account.ID, resp.Header)
 	_ = store.MarkAccountModelResult(ctx, account.ID, model, http.StatusOK, "")
 	account, err = store.MarkAccountTestResult(ctx, account.ID, true, "")
 	if err != nil {
 		return nil, "", err
 	}
+	if reply == "" {
+		return account, "", fmt.Errorf("上游返回 HTTP 200，但没有可显示文本（%s）", summarizeClaudeMessageResponse(responseBody))
+	}
 	return account, reply, nil
+}
+
+func recordClaudeCodeAccountTestUsage(ctx context.Context, store *resourcepool.Store, account *resourcepool.ClaudeCodeAccount, model string, statusCode int, success bool, body []byte, attemptedAt time.Time) {
+	if store == nil || account == nil {
+		return
+	}
+	var payload struct {
+		Usage struct {
+			InputTokens              int64 `json:"input_tokens"`
+			OutputTokens             int64 `json:"output_tokens"`
+			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+			CacheCreation            struct {
+				Ephemeral5mInputTokens int64 `json:"ephemeral_5m_input_tokens"`
+				Ephemeral1hInputTokens int64 `json:"ephemeral_1h_input_tokens"`
+			} `json:"cache_creation"`
+		} `json:"usage"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	rawTotal := payload.Usage.InputTokens + payload.Usage.OutputTokens + payload.Usage.CacheReadInputTokens + payload.Usage.CacheCreationInputTokens
+	if attemptedAt.IsZero() {
+		attemptedAt = time.Now()
+	}
+	if statusCode == 0 {
+		statusCode = http.StatusBadGateway
+	}
+	if err := store.RecordUsageLedger(ctx, resourcepool.UsageLedgerEntry{
+		PoolID:              account.PoolID,
+		RequestID:           "management-test",
+		AccountID:           account.ID,
+		AuthID:              account.AuthID,
+		Model:               strings.TrimSpace(model),
+		RequestedModel:      strings.TrimSpace(model),
+		StatusCode:          statusCode,
+		InputTokens:         payload.Usage.InputTokens,
+		OutputTokens:        payload.Usage.OutputTokens,
+		CacheReadTokens:     payload.Usage.CacheReadInputTokens,
+		CacheCreationTokens: payload.Usage.CacheCreationInputTokens,
+		CacheCreation5m:     payload.Usage.CacheCreation.Ephemeral5mInputTokens,
+		CacheCreation1h:     payload.Usage.CacheCreation.Ephemeral1hInputTokens,
+		RawInputTokens:      payload.Usage.InputTokens,
+		RawTotalTokens:      rawTotal,
+		Success:             success,
+		CreatedAt:           attemptedAt,
+	}); err != nil {
+		log.WithError(err).WithField("account_id", account.ID).Warn("failed to record Claude Code account test usage")
+	}
 }
 
 func resolveClaudeCodeAccountTestModel(ctx context.Context, store *resourcepool.Store, requested string) (string, error) {
@@ -1215,60 +1777,65 @@ func resolveClaudeCodeAccountTestModel(ctx context.Context, store *resourcepool.
 const (
 	claudeCodeManagementVersion         = resourcepool.DefaultClaudeCodeProfileVersion
 	claudeCodeManagementUserAgent       = "claude-cli/" + claudeCodeManagementVersion + " (external, sdk-cli)"
-	claudeCodeManagementIdentityPrompt  = "You are Claude Code, Anthropic's official CLI for Claude."
+	claudeCodeManagementIdentityPrompt  = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 	claudeCodeManagementFingerprintSalt = "59cf53e54c78"
-	claudeCodeManagementCCHSeed         = 0x6E52736AC806831E
+	claudeCodeManagementOAuthBeta       = "oauth-2025-04-20"
 	claudeCodeAccountTestMaxTokens      = 1024
 )
 
 func buildClaudeCodeAccountTestBody(model, message, userID string) ([]byte, error) {
-	payload := buildClaudeCodeAccountTestPayload(model, message, userID)
+	payload := buildClaudeCodeAccountTestPayload(model, message, userID, false)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	return signClaudeCodeManagementBody(body), nil
+	return body, nil
 }
 
 func buildClaudeCodeUsageCalibrationBody(model, userID string) ([]byte, error) {
-	payload := buildClaudeCodeAccountTestPayload(model, "hi", userID)
+	payload := buildClaudeCodeAccountTestPayload(model, "hi", userID, true)
 	delete(payload, "max_tokens")
 	delete(payload, "metadata")
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	return signClaudeCodeManagementBody(body), nil
+	return body, nil
 }
 
-func buildClaudeCodeAccountTestPayload(model, message, userID string) map[string]any {
+func buildClaudeCodeAccountTestPayload(model, message, userID string, includeStaticPrompt bool) map[string]any {
 	if strings.TrimSpace(userID) == "" {
 		userID = helps.GenerateFakeUserID()
 	}
-	staticPrompt := strings.Join([]string{
-		helps.ClaudeCodeIntro,
-		helps.ClaudeCodeSystem,
-		helps.ClaudeCodeDoingTasks,
-		helps.ClaudeCodeToneAndStyle,
-		helps.ClaudeCodeOutputEfficiency,
-	}, "\n\n")
+	system := []map[string]any{
+		{
+			"type": "text",
+			"text": claudeCodeManagementBillingHeader(message),
+		},
+		{
+			"type":          "text",
+			"text":          claudeCodeManagementIdentityPrompt,
+			"cache_control": map[string]string{"type": "ephemeral", "ttl": "1h"},
+		},
+	}
+	if includeStaticPrompt {
+		staticPrompt := strings.Join([]string{
+			helps.ClaudeCodeIntro,
+			helps.ClaudeCodeSystem,
+			helps.ClaudeCodeDoingTasks,
+			helps.ClaudeCodeToneAndStyle,
+			helps.ClaudeCodeOutputEfficiency,
+		}, "\n\n")
+		system = append(system, map[string]any{
+			"type":          "text",
+			"text":          staticPrompt,
+			"cache_control": map[string]string{"type": "ephemeral", "ttl": "1h"},
+		})
+	}
 	return map[string]any{
 		"model":      model,
 		"max_tokens": claudeCodeAccountTestMaxTokens,
-		"system": []map[string]string{
-			{
-				"type": "text",
-				"text": claudeCodeManagementBillingHeader(message),
-			},
-			{
-				"type": "text",
-				"text": claudeCodeManagementIdentityPrompt,
-			},
-			{
-				"type": "text",
-				"text": staticPrompt,
-			},
-		},
+		"system":     system,
 		"metadata": map[string]string{
 			"user_id": userID,
 		},
@@ -1292,16 +1859,7 @@ func claudeCodeManagementBillingHeader(messageText string) string {
 	input := claudeCodeManagementFingerprintSalt + sb.String() + claudeCodeManagementVersion
 	h := sha256.Sum256([]byte(input))
 	buildHash := hex.EncodeToString(h[:])[:3]
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;", claudeCodeManagementVersion, buildHash)
-}
-
-func signClaudeCodeManagementBody(body []byte) []byte {
-	placeholder := []byte("cch=00000;")
-	if !bytes.Contains(body, placeholder) {
-		return body
-	}
-	cch := fmt.Sprintf("%05x", xxHash64.Checksum(body, claudeCodeManagementCCHSeed)&0xFFFFF)
-	return bytes.Replace(body, placeholder, []byte("cch="+cch+";"), 1)
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=sdk-cli;", claudeCodeManagementVersion, buildHash)
 }
 
 func applyClaudeCodeManagementHeaders(req *http.Request, auth *coreauth.Auth, stream bool, userID string, model string) {
@@ -1310,21 +1868,42 @@ func applyClaudeCodeManagementHeaders(req *http.Request, auth *coreauth.Auth, st
 	}
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("accept", "application/json")
-	if stream {
-		req.Header.Set("accept", "text/event-stream")
-		req.Header.Set("accept-encoding", "identity")
-	} else {
-		req.Header.Set("accept-encoding", "gzip, deflate, br, zstd")
-	}
+	req.Header.Set("accept-encoding", "gzip, deflate, br, zstd")
 	req.Header.Set("user-agent", claudeCodeManagementUserAgent)
 	req.Header.Set("x-app", "cli")
+	req.Header.Set("anthropic-dangerous-direct-browser-access", "true")
 	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("anthropic-beta", strings.Join(claudeCodeManagementBetasForModel(model), ","))
+	req.Header.Set("anthropic-beta", strings.Join(claudeCodeManagementBetasForAuth(auth, model), ","))
 	req.Header.Set("x-stainless-runtime", "node")
+	req.Header.Set("x-stainless-runtime-version", "v26.3.0")
+	req.Header.Set("x-stainless-package-version", "0.94.0")
 	req.Header.Set("x-stainless-lang", "js")
 	req.Header.Set("x-stainless-retry-count", "0")
 	req.Header.Set("x-stainless-timeout", "600")
 	req.Header.Set("x-claude-code-session-id", claudeCodeManagementSessionID(auth, userID))
+}
+
+func claudeCodeManagementBetasForAuth(auth *coreauth.Auth, model string) []string {
+	betas := claudeCodeManagementBetasForModel(model)
+	if auth == nil || auth.AuthKind() != coreauth.AuthKindOAuth {
+		return betas
+	}
+	for _, beta := range betas {
+		if strings.EqualFold(beta, claudeCodeManagementOAuthBeta) {
+			return betas
+		}
+	}
+	insertAt := 0
+	for index, beta := range betas {
+		if strings.EqualFold(beta, "claude-code-20250219") {
+			insertAt = index + 1
+			break
+		}
+	}
+	betas = append(betas, "")
+	copy(betas[insertAt+1:], betas[insertAt:])
+	betas[insertAt] = claudeCodeManagementOAuthBeta
+	return betas
 }
 
 func claudeCodeManagementBetasForModel(model string) []string {
@@ -1336,8 +1915,6 @@ func claudeCodeManagementBetasForModel(model string) []string {
 			"thinking-token-count-2026-05-13",
 			"context-management-2025-06-27",
 			"prompt-caching-scope-2026-01-05",
-			"claude-code-20250219",
-			"advisor-tool-2026-03-01",
 		}
 	case strings.Contains(modelLower, "opus"):
 		return []string{
@@ -1347,8 +1924,6 @@ func claudeCodeManagementBetasForModel(model string) []string {
 			"context-management-2025-06-27",
 			"prompt-caching-scope-2026-01-05",
 			"mid-conversation-system-2026-04-07",
-			"advisor-tool-2026-03-01",
-			"effort-2025-11-24",
 		}
 	default:
 		return []string{
@@ -1357,8 +1932,6 @@ func claudeCodeManagementBetasForModel(model string) []string {
 			"thinking-token-count-2026-05-13",
 			"context-management-2025-06-27",
 			"prompt-caching-scope-2026-01-05",
-			"advisor-tool-2026-03-01",
-			"effort-2025-11-24",
 		}
 	}
 }
@@ -1488,25 +2061,114 @@ func (h *Handler) refreshClaudeCodeManagementAccessToken(ctx context.Context, st
 }
 
 func extractClaudeMessageText(body []byte) string {
-	var payload struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
+	if text := extractClaudeJSONMessageText(body); text != "" {
+		return text
 	}
+	var reply strings.Builder
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		if text := extractClaudeJSONMessageText([]byte(data)); text != "" {
+			reply.WriteString(text)
+		}
+	}
+	return strings.TrimSpace(reply.String())
+}
+
+type claudeMessageContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type claudeMessageEnvelope struct {
+	Type         string                      `json:"type"`
+	StopReason   string                      `json:"stop_reason"`
+	Content      []claudeMessageContentBlock `json:"content"`
+	ContentBlock claudeMessageContentBlock   `json:"content_block"`
+	Delta        claudeMessageContentBlock   `json:"delta"`
+	Completion   string                      `json:"completion"`
+	OutputText   string                      `json:"output_text"`
+	Message      *struct {
+		Content []claudeMessageContentBlock `json:"content"`
+	} `json:"message"`
+}
+
+func extractClaudeJSONMessageText(body []byte) string {
+	var payload claudeMessageEnvelope
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return ""
 	}
-	parts := make([]string, 0, len(payload.Content))
-	for _, item := range payload.Content {
-		if item.Type != "" && item.Type != "text" {
-			continue
+	parts := make([]string, 0, len(payload.Content)+3)
+	appendBlocks := func(blocks []claudeMessageContentBlock) {
+		for _, block := range blocks {
+			if block.Type != "" && block.Type != "text" && block.Type != "text_delta" {
+				continue
+			}
+			if text := strings.TrimSpace(block.Text); text != "" {
+				parts = append(parts, text)
+			}
 		}
-		if trimmed := strings.TrimSpace(item.Text); trimmed != "" {
+	}
+	appendBlocks(payload.Content)
+	if payload.Message != nil {
+		appendBlocks(payload.Message.Content)
+	}
+	for _, text := range []string{payload.ContentBlock.Text, payload.Delta.Text, payload.Completion, payload.OutputText} {
+		if trimmed := strings.TrimSpace(text); trimmed != "" {
 			parts = append(parts, trimmed)
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+func summarizeClaudeMessageResponse(body []byte) string {
+	var payload claudeMessageEnvelope
+	if err := json.Unmarshal(body, &payload); err == nil {
+		contentTypes := make([]string, 0, len(payload.Content))
+		for _, block := range payload.Content {
+			if block.Type != "" {
+				contentTypes = append(contentTypes, block.Type)
+			}
+		}
+		parts := []string{}
+		if payload.Type != "" {
+			parts = append(parts, "type="+payload.Type)
+		}
+		if payload.StopReason != "" {
+			parts = append(parts, "stop_reason="+payload.StopReason)
+		}
+		if len(contentTypes) > 0 {
+			parts = append(parts, "content="+strings.Join(contentTypes, ","))
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, " · ")
+		}
+	}
+	events := make([]string, 0, 4)
+	seen := map[string]bool{}
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "event:") {
+			continue
+		}
+		event := strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		if event != "" && !seen[event] {
+			seen[event] = true
+			events = append(events, event)
+		}
+	}
+	if len(events) > 0 {
+		return "SSE=" + strings.Join(events, ",")
+	}
+	return "无法识别的响应结构"
 }
 
 type managementCompositeReadCloser struct {
@@ -1672,6 +2334,7 @@ func (h *Handler) ImportClaudeAuthToAccountPool(c *gin.Context) {
 		AuthID          string `json:"auth_id"`
 		Email           string `json:"email"`
 		ProxyResourceID string `json:"proxy_resource_id"`
+		PoolID          string `json:"pool_id"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -1699,7 +2362,7 @@ func (h *Handler) ImportClaudeAuthToAccountPool(c *gin.Context) {
 		return
 	}
 	defer closeResourcePoolStore(store)
-	account, err := store.RegisterClaudeCodeAccount(c.Request.Context(), authID, email, body.ProxyResourceID)
+	account, err := store.RegisterClaudeCodeAccountInPool(c.Request.Context(), body.PoolID, authID, email, body.ProxyResourceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "import_failed", "message": err.Error()})
 		return
@@ -1710,6 +2373,29 @@ func (h *Handler) ImportClaudeAuthToAccountPool(c *gin.Context) {
 		resourcepool.PublishProxyChanged(account.ProxyResourceID, "bind")
 	}
 	resourcepool.PublishStatsChanged("account")
+	h.startClaudeCodeAccountInitialProbe(account.ID)
+	c.JSON(http.StatusOK, gin.H{"account": account})
+}
+
+// RecheckClaudeCodeAccount runs an explicit usage probe that may clear manual recovery.
+func (h *Handler) RecheckClaudeCodeAccount(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	h.mu.Lock()
+	cfg := h.cfg
+	configPath := h.configFilePath
+	h.mu.Unlock()
+	account, err := resourcepool.RecheckStoredAccountQuota(c.Request.Context(), configPath, cfg, store, c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "recheck_failed", "message": err.Error(), "account": account})
+		return
+	}
+	h.triggerConfigReload(c.Request.Context())
+	resourcepool.PublishAccountChanged(account.ID, "recovered")
+	resourcepool.PublishStatsChanged("account_health")
 	c.JSON(http.StatusOK, gin.H{"account": account})
 }
 
@@ -1735,6 +2421,46 @@ func (h *Handler) PatchClaudeCodeAccount(c *gin.Context) {
 	}
 	h.triggerConfigReload(c.Request.Context())
 	resourcepool.PublishAccountChanged(account.ID, "update")
+	resourcepool.PublishStatsChanged("account")
+	c.JSON(http.StatusOK, gin.H{"account": account})
+}
+
+func (h *Handler) MoveClaudeCodeAccount(c *gin.Context) {
+	var body struct {
+		PoolID string `json:"pool_id"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.PoolID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "pool_id is required"})
+		return
+	}
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	account, err := store.MoveAccountToPool(c.Request.Context(), c.Param("id"), body.PoolID)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, resourcepool.ErrAccountMoveInFlight) {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{"error": "move_failed", "message": err.Error()})
+		return
+	}
+	if h.authManager != nil {
+		if runtimeAuth, okAuth := h.authManager.GetByID(account.AuthID); okAuth && runtimeAuth != nil {
+			if runtimeAuth.Attributes == nil {
+				runtimeAuth.Attributes = map[string]string{}
+			}
+			runtimeAuth.Attributes[resourcepool.AttrAccountPoolID] = account.PoolID
+			_, _ = h.authManager.Update(coreauth.WithSkipPersist(c.Request.Context()), runtimeAuth)
+		}
+	}
+	h.triggerConfigReload(c.Request.Context())
+	resourcepool.PublishAccountChanged(account.ID, "move")
+	resourcepool.PublishPoolChanged(account.PoolID, "account_move")
 	resourcepool.PublishStatsChanged("account")
 	c.JSON(http.StatusOK, gin.H{"account": account})
 }
@@ -1840,6 +2566,9 @@ func (h *Handler) ResetClaudeCodeAccountCooling(c *gin.Context) {
 			_, _ = h.authManager.Update(coreauth.WithSkipPersist(c.Request.Context()), auth)
 		}
 	}
+	routingScope := resourcepool.AccountRoutingScope(account.PoolID)
+	claudeapipool.ResetScopedRouteCooling(routingScope, account.AuthID)
+	claudeapipool.ClearScopedProxyBlock(routingScope, account.ProxyResourceID)
 	resourcepool.PublishAccountChanged(account.ID, "reset_cooling")
 	resourcepool.PublishStatsChanged("account")
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -1947,6 +2676,17 @@ func (h *Handler) RefreshClaudeCodeAccountToken(c *gin.Context) {
 	if refreshed, errGet := store.GetAccount(c.Request.Context(), account.ID); errGet == nil {
 		account = refreshed
 	}
+	now := time.Now()
+	if recovered, errHealth := store.UpdateAccountHealth(c.Request.Context(), account.ID, resourcepool.AccountHealthUpdate{
+		Source:              "manual_token_refresh",
+		Status:              resourcepool.AccountHealthHealthy,
+		CheckedAt:           &now,
+		AllowManualRecovery: true,
+	}); errHealth == nil {
+		account = recovered
+	}
+	claudeapipool.ClearScopedAccountBlock(resourcepool.AccountRoutingScope(account.PoolID), account.AuthID)
+	h.triggerConfigReload(c.Request.Context())
 	resourcepool.PublishAccountChanged(account.ID, "token")
 	resourcepool.PublishStatsChanged("account")
 	c.JSON(http.StatusOK, gin.H{"account": account})
@@ -2095,6 +2835,9 @@ func (h *Handler) applyClaudeCodeAccountBatchAction(ctx context.Context, store *
 func (h *Handler) RequestClaudeCodeAccountPoolAuthURL(c *gin.Context) {
 	q := c.Request.URL.Query()
 	q.Set("pool", "claude-code")
+	if strings.TrimSpace(q.Get("pool_id")) == "" {
+		q.Set("pool_id", resourcepool.DefaultAccountPoolID)
+	}
 	if q.Get("proxy_resource_id") == "" && q.Get("login_proxy_resource_id") != "" {
 		q.Set("proxy_resource_id", q.Get("login_proxy_resource_id"))
 	}
@@ -2114,7 +2857,16 @@ func (h *Handler) authEntryByID() map[string]gin.H {
 		}
 		entry := h.buildAuthFileEntry(auth)
 		if entry == nil {
-			continue
+			entry = gin.H{
+				"status":          auth.Status,
+				"status_message":  auth.StatusMessage,
+				"success":         auth.Success,
+				"failed":          auth.Failed,
+				"recent_requests": auth.RecentRequestsSnapshot(time.Now()),
+			}
+			if !auth.NextRetryAfter.IsZero() {
+				entry["next_retry_after"] = auth.NextRetryAfter
+			}
 		}
 		out[auth.ID] = accountRuntimeEntry(auth, entry)
 	}

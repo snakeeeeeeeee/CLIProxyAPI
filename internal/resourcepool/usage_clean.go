@@ -1,7 +1,6 @@
 package resourcepool
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/tiktoken-go/tokenizer"
 )
 
 const (
@@ -17,6 +17,40 @@ const (
 	UsageCalibrationStale      = "stale"
 	UsageCalibrationFailed     = "failed"
 )
+
+var DefaultCleanInputOverheadTokens = ClaudeCodeProfileInjectedOverheadTokens(EffectiveClaudeCodeProfileConfig{
+	Revision:     DefaultClaudeCodeProfileRevision,
+	Version:      DefaultClaudeCodeProfileVersion,
+	SystemPrompt: helps.ClaudeCodeStaticPrompt(),
+})
+
+// ClaudeCodeProfileInjectedOverheadTokens estimates only the blocks added by
+// account-pool mimic mode. Client-provided system text remains visible usage.
+func ClaudeCodeProfileInjectedOverheadTokens(profile EffectiveClaudeCodeProfileConfig) int64 {
+	version := strings.TrimSpace(profile.Version)
+	if version == "" {
+		version = DefaultClaudeCodeProfileVersion
+	}
+	staticPrompt := strings.TrimSpace(profile.SystemPrompt)
+	if staticPrompt == "" {
+		staticPrompt = helps.ClaudeCodeStaticPrompt()
+	}
+	text := strings.Join([]string{
+		"x-anthropic-billing-header: cc_version=" + version + ".000; cc_entrypoint=sdk-cli;",
+		"You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+		staticPrompt,
+	}, "\n")
+	if enc, err := tokenizer.Get(tokenizer.Cl100kBase); err == nil && enc != nil {
+		if count, errCount := enc.Count(text); errCount == nil && count > 0 {
+			return int64(count)
+		}
+	}
+	count := int64((len([]rune(text)) + 3) / 4)
+	if count < 1 {
+		return 1
+	}
+	return count
+}
 
 // ClaudeCodeProfileFingerprint returns the stable fingerprint for the built-in
 // request profile that affects Claude Code prompt overhead.
@@ -32,9 +66,11 @@ func ClaudeCodeProfileFingerprint(profile EffectiveClaudeCodeProfileConfig) stri
 	}
 	betas := normalizeFingerprintList(profile.Betas)
 	payload := struct {
+		Revision            string            `json:"revision"`
 		Version             string            `json:"version"`
 		UserAgent           string            `json:"user_agent"`
 		Headers             map[string]string `json:"headers"`
+		HeaderOrder         []string          `json:"header_order"`
 		Betas               []string          `json:"betas"`
 		SystemPrompt        string            `json:"system_prompt"`
 		StaticPrompt        string            `json:"static_prompt"`
@@ -43,18 +79,28 @@ func ClaudeCodeProfileFingerprint(profile EffectiveClaudeCodeProfileConfig) stri
 		MetadataUserIDMode  string            `json:"metadata_user_id_mode"`
 		SystemPromptMode    string            `json:"system_prompt_mode"`
 		SigningMode         string            `json:"signing_mode"`
+		TLSProfile          string            `json:"tls_profile"`
+		TLSJA3              string            `json:"tls_ja3"`
+		TLSJA4              string            `json:"tls_ja4"`
+		TLSALPN             string            `json:"tls_alpn"`
 	}{
+		Revision:            strings.TrimSpace(profile.Revision),
 		Version:             strings.TrimSpace(profile.Version),
 		UserAgent:           strings.TrimSpace(profile.UserAgent),
 		Headers:             headers,
+		HeaderOrder:         append([]string(nil), profile.HeaderOrder...),
 		Betas:               betas,
 		SystemPrompt:        strings.TrimSpace(profile.SystemPrompt),
 		StaticPrompt:        helps.ClaudeCodeStaticPrompt(),
 		BillingBlockEnabled: profile.BillingBlockEnabled,
-		BillingTemplate:     "x-anthropic-billing-header: cc_version=<version>.<fp>; cc_entrypoint=cli; cch=<cch>;",
+		BillingTemplate:     "x-anthropic-billing-header: cc_version=<version>.<fp>; cc_entrypoint=sdk-cli;",
 		MetadataUserIDMode:  strings.TrimSpace(profile.MetadataUserIDMode),
 		SystemPromptMode:    strings.TrimSpace(profile.SystemPromptMode),
-		SigningMode:         "experimental-cch-signing+oauth",
+		SigningMode:         "none",
+		TLSProfile:          strings.TrimSpace(profile.TLSProfile),
+		TLSJA3:              strings.TrimSpace(profile.TLSJA3),
+		TLSJA4:              strings.TrimSpace(profile.TLSJA4),
+		TLSALPN:             strings.TrimSpace(profile.TLSALPN),
 	}
 	raw, _ := json.Marshal(payload)
 	sum := sha256.Sum256(raw)
@@ -91,36 +137,6 @@ func CleanInputTokens(inputTokens, overheadTokens int64) int64 {
 		return 1
 	}
 	return cleaned
-}
-
-type cleanInputFloorContextKey struct{}
-
-// WithCleanInputFloor stores the downstream-visible user input token estimate
-// for clean-input usage rewriting and usage ledger rows.
-func WithCleanInputFloor(ctx context.Context, floor int64) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if floor <= 0 {
-		return ctx
-	}
-	return context.WithValue(ctx, cleanInputFloorContextKey{}, floor)
-}
-
-// CleanInputFloorFromContext returns the user-visible input token floor stored
-// on the request context.
-func CleanInputFloorFromContext(ctx context.Context) int64 {
-	if ctx == nil {
-		return 0
-	}
-	switch value := ctx.Value(cleanInputFloorContextKey{}).(type) {
-	case int64:
-		return value
-	case int:
-		return int64(value)
-	default:
-		return 0
-	}
 }
 
 func normalizeUsageCalibrationStatus(status string) string {

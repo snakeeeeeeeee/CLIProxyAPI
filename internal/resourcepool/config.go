@@ -1,7 +1,6 @@
 package resourcepool
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -12,7 +11,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"gopkg.in/yaml.v3"
 )
 
@@ -83,11 +81,8 @@ func defaultConfigFile() *ConfigFile {
 	traceRedactUserContent := true
 	claudeCodeEnabled := true
 	pureMode := true
-	cleanInputTokens := false
-	virtualCacheEnabled := false
-	hitRate := 0.95
-	targetReuse := 0.90
-	shrinkReset := 0.70
+	allowClientCacheTTL := false
+	cleanInputTokens := true
 	routing := defaultClaudeCodeRoutingConfig()
 	return &ConfigFile{
 		DatabasePath: DefaultDBFileName,
@@ -112,8 +107,9 @@ func defaultConfigFile() *ConfigFile {
 		},
 		Profile: defaultClaudeCodeProfile(),
 		ClaudeCode: ClaudeCodePoolConfig{
-			Enabled:  &claudeCodeEnabled,
-			PureMode: &pureMode,
+			Enabled:             &claudeCodeEnabled,
+			PureMode:            &pureMode,
+			AllowClientCacheTTL: &allowClientCacheTTL,
 			Cloak: &config.CloakConfig{
 				Mode:       "auto",
 				StrictMode: false,
@@ -130,27 +126,7 @@ func defaultConfigFile() *ConfigFile {
 				MaxBackups: 3,
 				Redact:     boolPtr(true),
 			},
-			VirtualCache: claudeapipool.VirtualCacheConfig{
-				Enabled:                 &virtualCacheEnabled,
-				Mode:                    claudeapipool.VirtualCacheModeNatural,
-				HitRate:                 &hitRate,
-				TargetCacheReuseRatio:   &targetReuse,
-				ContextShrinkResetRatio: &shrinkReset,
-			},
-			Routing:                 routing,
-			PerAccountRPM:           6,
-			PerAccountConcurrency:   1,
-			MaxSwitches:             2,
-			SwitchDelayMS:           1000,
-			RateLimitCooldownMS:     int((5 * time.Minute) / time.Millisecond),
-			RateLimitMaxCooldownMS:  int((2 * time.Hour) / time.Millisecond),
-			OverloadCooldownMS:      int((2 * time.Minute) / time.Millisecond),
-			OverloadMaxCooldownMS:   int((30 * time.Minute) / time.Millisecond),
-			SameAccountRetry429:     0,
-			SameAccountRetry529:     1,
-			SameAccountRetryDelayMS: 3000,
-			SessionAffinity:         true,
-			SessionAffinityTTL:      "1h",
+			Routing: routing,
 		},
 		PoolConfig: map[string]interface{}{},
 	}
@@ -164,6 +140,14 @@ func defaultClaudeCodeRoutingConfig() claudeapipool.RoutingConfig {
 	return claudeapipool.NormalizeRoutingConfig(claudeapipool.RoutingConfig{
 		PerAccountRPM:            6,
 		PerAccountConcurrency:    1,
+		StickyConcurrencyReserve: 1,
+		MaxSessions:              30,
+		StickyWaitMS:             2000,
+		FallbackWaitMS:           500,
+		MaxWaitersPerAccount:     5,
+		MaxWaitersGlobal:         200,
+		SessionAffinityTTLMS:     int(time.Hour / time.Millisecond),
+		ActiveSessionIdleTTLMS:   int((5 * time.Minute) / time.Millisecond),
 		MaxSwitches:              2,
 		SwitchDelayMS:            1000,
 		RateLimitCooldownMS:      int((5 * time.Minute) / time.Millisecond),
@@ -188,32 +172,40 @@ func defaultClaudeCodeRoutingConfig() claudeapipool.RoutingConfig {
 func defaultClaudeCodeProfile() ClaudeCodeProfile {
 	billingBlockEnabled := true
 	return ClaudeCodeProfile{
+		Revision:  DefaultClaudeCodeProfileRevision,
 		Version:   DefaultClaudeCodeProfileVersion,
 		UserAgent: "claude-cli/" + DefaultClaudeCodeProfileVersion + " (external, sdk-cli)",
 		Headers: map[string]string{
-			"Anthropic-Version":       "2023-06-01",
-			"X-App":                   "cli",
-			"X-Stainless-Retry-Count": "0",
-			"X-Stainless-Runtime":     "node",
-			"X-Stainless-Lang":        "js",
-			"X-Stainless-Timeout":     "600",
+			"Anthropic-Version":                         "2023-06-01",
+			"Anthropic-Dangerous-Direct-Browser-Access": "true",
+			"X-App":                       "cli",
+			"X-Stainless-Retry-Count":     "0",
+			"X-Stainless-Runtime":         "node",
+			"X-Stainless-Runtime-Version": "v26.3.0",
+			"X-Stainless-Package-Version": "0.94.0",
+			"X-Stainless-Os":              "MacOS",
+			"X-Stainless-Arch":            "arm64",
+			"X-Stainless-Lang":            "js",
+			"X-Stainless-Timeout":         "600",
 		},
+		HeaderOrder: helps.ClaudeCodeNodeHeaderOrder(),
 		Betas: []string{
 			"claude-code-20250219",
 			"interleaved-thinking-2025-05-14",
 			"thinking-token-count-2026-05-13",
 			"context-management-2025-06-27",
 			"prompt-caching-scope-2026-01-05",
-			"mid-conversation-system-2026-04-07",
-			"advisor-tool-2026-03-01",
-			"effort-2025-11-24",
 		},
 		SystemPrompt:        helps.ClaudeCodeStaticPrompt(),
 		BillingBlockEnabled: &billingBlockEnabled,
 		MetadataUserIDMode:  "account",
-		UpdatedFrom:         "builtin-trace-baseline",
+		UpdatedFrom:         "builtin-trace-baseline:2.1.207",
 		Locked:              true,
-		SystemPromptMode:    "builtin_full_claude_code",
+		SystemPromptMode:    "builtin_stable_2.1.207",
+		TLSProfile:          helps.ClaudeCodeNodeTLSProfileName,
+		TLSJA3:              helps.ClaudeCodeNodeTLSJA3,
+		TLSJA4:              helps.ClaudeCodeNodeTLSJA4,
+		TLSALPN:             helps.ClaudeCodeNodeTLSALPN,
 	}
 }
 
@@ -278,52 +270,18 @@ func normalizeConfigFile(doc *ConfigFile) {
 	if doc.ClaudeCode.PureMode == nil {
 		doc.ClaudeCode.PureMode = defaults.ClaudeCode.PureMode
 	}
-	doc.ClaudeCode.Cloak = normalizeCloakConfig(doc.ClaudeCode.Cloak)
-	if doc.ClaudeCode.Usage.CleanInputTokens == nil {
-		doc.ClaudeCode.Usage.CleanInputTokens = defaults.ClaudeCode.Usage.CleanInputTokens
+	if doc.ClaudeCode.AllowClientCacheTTL == nil {
+		doc.ClaudeCode.AllowClientCacheTTL = defaults.ClaudeCode.AllowClientCacheTTL
 	}
+	doc.ClaudeCode.Cloak = normalizeCloakConfig(doc.ClaudeCode.Cloak)
+	// pure-mode is the single downstream usage-cleaning switch. Keep the old
+	// clean-input field synchronized for stored-config and API compatibility.
+	cleanInputTokens := doc.ClaudeCode.PureMode != nil && *doc.ClaudeCode.PureMode
+	doc.ClaudeCode.Usage.CleanInputTokens = boolPtr(cleanInputTokens)
 	if doc.ClaudeCode.Usage.SystemPromptOverheadTokens <= 0 {
 		doc.ClaudeCode.Usage.SystemPromptOverheadTokens = defaults.ClaudeCode.Usage.SystemPromptOverheadTokens
 	}
-	if doc.ClaudeCode.PerAccountRPM < 0 {
-		doc.ClaudeCode.PerAccountRPM = 0
-	}
-	if doc.ClaudeCode.PerAccountConcurrency <= 0 {
-		doc.ClaudeCode.PerAccountConcurrency = defaults.ClaudeCode.PerAccountConcurrency
-	}
-	if doc.ClaudeCode.MaxSwitches < 0 {
-		doc.ClaudeCode.MaxSwitches = 0
-	}
-	if doc.ClaudeCode.SwitchDelayMS <= 0 {
-		doc.ClaudeCode.SwitchDelayMS = defaults.ClaudeCode.SwitchDelayMS
-	}
-	if doc.ClaudeCode.RateLimitCooldownMS <= 0 {
-		doc.ClaudeCode.RateLimitCooldownMS = defaults.ClaudeCode.RateLimitCooldownMS
-	}
-	if doc.ClaudeCode.RateLimitMaxCooldownMS < doc.ClaudeCode.RateLimitCooldownMS {
-		doc.ClaudeCode.RateLimitMaxCooldownMS = doc.ClaudeCode.RateLimitCooldownMS
-	}
-	if doc.ClaudeCode.OverloadCooldownMS <= 0 {
-		doc.ClaudeCode.OverloadCooldownMS = defaults.ClaudeCode.OverloadCooldownMS
-	}
-	if doc.ClaudeCode.OverloadMaxCooldownMS < doc.ClaudeCode.OverloadCooldownMS {
-		doc.ClaudeCode.OverloadMaxCooldownMS = doc.ClaudeCode.OverloadCooldownMS
-	}
-	if doc.ClaudeCode.SameAccountRetry429 < 0 {
-		doc.ClaudeCode.SameAccountRetry429 = 0
-	}
-	if doc.ClaudeCode.SameAccountRetry529 < 0 {
-		doc.ClaudeCode.SameAccountRetry529 = 0
-	}
-	if doc.ClaudeCode.SameAccountRetryDelayMS <= 0 {
-		doc.ClaudeCode.SameAccountRetryDelayMS = defaults.ClaudeCode.SameAccountRetryDelayMS
-	}
-	doc.ClaudeCode.SessionAffinityTTL = strings.TrimSpace(doc.ClaudeCode.SessionAffinityTTL)
-	if doc.ClaudeCode.SessionAffinityTTL == "" {
-		doc.ClaudeCode.SessionAffinityTTL = defaults.ClaudeCode.SessionAffinityTTL
-	}
 	doc.ClaudeCode.Routing = normalizeClaudeCodeRoutingConfig(doc.ClaudeCode, defaults.ClaudeCode.Routing)
-	doc.ClaudeCode.VirtualCache = claudeapipool.NormalizeVirtualCacheConfig(doc.ClaudeCode.VirtualCache)
 	if doc.PoolConfig == nil {
 		doc.PoolConfig = map[string]interface{}{}
 	}
@@ -338,6 +296,13 @@ func normalizeConfigFile(doc *ConfigFile) {
 
 func normalizeClaudeCodeProfile(profile ClaudeCodeProfile) ClaudeCodeProfile {
 	defaults := defaultClaudeCodeProfile()
+	profile.Revision = strings.TrimSpace(profile.Revision)
+	if shouldMigrateBuiltinClaudeCodeProfile(profile) {
+		return defaults
+	}
+	if profile.Revision != "" {
+		defaults.Revision = profile.Revision
+	}
 	profile.Version = strings.TrimSpace(profile.Version)
 	if profile.Version != "" {
 		defaults.Version = profile.Version
@@ -358,6 +323,11 @@ func normalizeClaudeCodeProfile(profile ClaudeCodeProfile) ClaudeCodeProfile {
 		}
 		if len(headers) > 0 {
 			defaults.Headers = headers
+		}
+	}
+	if len(profile.HeaderOrder) > 0 {
+		if order := normalizeStringList(profile.HeaderOrder); len(order) > 0 {
+			defaults.HeaderOrder = order
 		}
 	}
 	if len(profile.Betas) > 0 {
@@ -385,8 +355,35 @@ func normalizeClaudeCodeProfile(profile ClaudeCodeProfile) ClaudeCodeProfile {
 	if profile.SystemPromptMode != "" {
 		defaults.SystemPromptMode = profile.SystemPromptMode
 	}
+	if value := strings.TrimSpace(profile.TLSProfile); value != "" {
+		defaults.TLSProfile = value
+	}
+	if value := strings.TrimSpace(profile.TLSJA3); value != "" {
+		defaults.TLSJA3 = value
+	}
+	if value := strings.TrimSpace(profile.TLSJA4); value != "" {
+		defaults.TLSJA4 = value
+	}
+	if value := strings.TrimSpace(profile.TLSALPN); value != "" {
+		defaults.TLSALPN = value
+	}
 	defaults.Locked = true
 	return defaults
+}
+
+func shouldMigrateBuiltinClaudeCodeProfile(profile ClaudeCodeProfile) bool {
+	version := strings.TrimSpace(profile.Version)
+	if !profile.Locked {
+		return false
+	}
+	updatedFrom := strings.ToLower(strings.TrimSpace(profile.UpdatedFrom))
+	if updatedFrom != "" && !strings.HasPrefix(updatedFrom, "builtin") {
+		return false
+	}
+	if version == "2.1.177" || version == "2.1.178" {
+		return true
+	}
+	return version == DefaultClaudeCodeProfileVersion && strings.TrimSpace(profile.Revision) == "2.1.207-r1"
 }
 
 func normalizeCloakConfig(cfg *config.CloakConfig) *config.CloakConfig {
@@ -410,67 +407,58 @@ func normalizeCloakConfig(cfg *config.CloakConfig) *config.CloakConfig {
 func normalizeClaudeCodeRoutingConfig(cfg ClaudeCodePoolConfig, defaults claudeapipool.RoutingConfig) claudeapipool.RoutingConfig {
 	routing := cfg.Routing
 	if routing.PerAccountRPM == 0 {
-		routing.PerAccountRPM = cfg.PerAccountRPM
-		if routing.PerAccountRPM == 0 {
-			routing.PerAccountRPM = defaults.PerAccountRPM
-		}
+		routing.PerAccountRPM = defaults.PerAccountRPM
 	}
 	if routing.PerAccountConcurrency == 0 {
-		routing.PerAccountConcurrency = cfg.PerAccountConcurrency
-		if routing.PerAccountConcurrency == 0 {
-			routing.PerAccountConcurrency = defaults.PerAccountConcurrency
-		}
+		routing.PerAccountConcurrency = defaults.PerAccountConcurrency
+	}
+	if routing.StickyConcurrencyReserve == 0 {
+		routing.StickyConcurrencyReserve = defaults.StickyConcurrencyReserve
+	}
+	if routing.MaxSessions == 0 {
+		routing.MaxSessions = defaults.MaxSessions
+	}
+	if routing.StickyWaitMS == 0 {
+		routing.StickyWaitMS = defaults.StickyWaitMS
+	}
+	if routing.FallbackWaitMS == 0 {
+		routing.FallbackWaitMS = defaults.FallbackWaitMS
+	}
+	if routing.MaxWaitersPerAccount == 0 {
+		routing.MaxWaitersPerAccount = defaults.MaxWaitersPerAccount
+	}
+	if routing.MaxWaitersGlobal == 0 {
+		routing.MaxWaitersGlobal = defaults.MaxWaitersGlobal
+	}
+	if routing.SessionAffinityTTLMS == 0 {
+		routing.SessionAffinityTTLMS = defaults.SessionAffinityTTLMS
+	}
+	if routing.ActiveSessionIdleTTLMS == 0 {
+		routing.ActiveSessionIdleTTLMS = defaults.ActiveSessionIdleTTLMS
 	}
 	if routing.MaxSwitches == 0 {
-		routing.MaxSwitches = cfg.MaxSwitches
-		if routing.MaxSwitches == 0 {
-			routing.MaxSwitches = defaults.MaxSwitches
-		}
+		routing.MaxSwitches = defaults.MaxSwitches
 	}
 	if routing.SwitchDelayMS == 0 {
-		routing.SwitchDelayMS = cfg.SwitchDelayMS
-		if routing.SwitchDelayMS == 0 {
-			routing.SwitchDelayMS = defaults.SwitchDelayMS
-		}
+		routing.SwitchDelayMS = defaults.SwitchDelayMS
 	}
 	if routing.RateLimitCooldownMS == 0 {
-		routing.RateLimitCooldownMS = cfg.RateLimitCooldownMS
-		if routing.RateLimitCooldownMS == 0 {
-			routing.RateLimitCooldownMS = defaults.RateLimitCooldownMS
-		}
+		routing.RateLimitCooldownMS = defaults.RateLimitCooldownMS
 	}
 	if routing.RateLimitMaxCooldownMS == 0 {
-		routing.RateLimitMaxCooldownMS = cfg.RateLimitMaxCooldownMS
-		if routing.RateLimitMaxCooldownMS == 0 {
-			routing.RateLimitMaxCooldownMS = defaults.RateLimitMaxCooldownMS
-		}
+		routing.RateLimitMaxCooldownMS = defaults.RateLimitMaxCooldownMS
 	}
 	if routing.OverloadCooldownMS == 0 {
-		routing.OverloadCooldownMS = cfg.OverloadCooldownMS
-		if routing.OverloadCooldownMS == 0 {
-			routing.OverloadCooldownMS = defaults.OverloadCooldownMS
-		}
+		routing.OverloadCooldownMS = defaults.OverloadCooldownMS
 	}
 	if routing.OverloadMaxCooldownMS == 0 {
-		routing.OverloadMaxCooldownMS = cfg.OverloadMaxCooldownMS
-		if routing.OverloadMaxCooldownMS == 0 {
-			routing.OverloadMaxCooldownMS = defaults.OverloadMaxCooldownMS
-		}
-	}
-	if routing.SameAccountRetry429 == 0 {
-		routing.SameAccountRetry429 = cfg.SameAccountRetry429
+		routing.OverloadMaxCooldownMS = defaults.OverloadMaxCooldownMS
 	}
 	if routing.SameAccountRetry529 == 0 {
-		routing.SameAccountRetry529 = cfg.SameAccountRetry529
-		if routing.SameAccountRetry529 == 0 {
-			routing.SameAccountRetry529 = defaults.SameAccountRetry529
-		}
+		routing.SameAccountRetry529 = defaults.SameAccountRetry529
 	}
 	if routing.SameAccountRetryDelayMS == 0 {
-		routing.SameAccountRetryDelayMS = cfg.SameAccountRetryDelayMS
-		if routing.SameAccountRetryDelayMS == 0 {
-			routing.SameAccountRetryDelayMS = defaults.SameAccountRetryDelayMS
-		}
+		routing.SameAccountRetryDelayMS = defaults.SameAccountRetryDelayMS
 	}
 	if routing.CacheAffinityMinTokens == 0 {
 		routing.CacheAffinityMinTokens = defaults.CacheAffinityMinTokens
@@ -515,20 +503,26 @@ func EffectiveClaudeCodePool(cfg ClaudeCodePoolConfig) EffectiveClaudeCodePoolCo
 	if doc.ClaudeCode.PureMode != nil {
 		pureMode = *doc.ClaudeCode.PureMode
 	}
+	allowClientCacheTTL := false
+	if doc.ClaudeCode.AllowClientCacheTTL != nil {
+		allowClientCacheTTL = *doc.ClaudeCode.AllowClientCacheTTL
+	}
 	cloak := EffectiveCloakConfig{Mode: "auto"}
 	if doc.ClaudeCode.Cloak != nil {
 		cloak.Mode = strings.TrimSpace(doc.ClaudeCode.Cloak.Mode)
 		cloak.StrictMode = doc.ClaudeCode.Cloak.StrictMode
 		cloak.SensitiveWords = normalizeStringList(doc.ClaudeCode.Cloak.SensitiveWords)
 	}
+	usage := EffectiveClaudeCodeUsage(doc.ClaudeCode.Usage, doc.Profile)
+	usage.CleanInputTokens = pureMode
 	return EffectiveClaudeCodePoolConfig{
-		Enabled:      enabled,
-		PureMode:     pureMode,
-		Cloak:        cloak,
-		Usage:        EffectiveClaudeCodeUsage(doc.ClaudeCode.Usage, doc.Profile),
-		Log:          EffectiveAccountPoolLog(doc.ClaudeCode.Log),
-		VirtualCache: claudeapipool.EffectiveVirtualCache(doc.ClaudeCode.VirtualCache),
-		Routing:      claudeapipool.EffectiveRouting(doc.ClaudeCode.Routing),
+		Enabled:             enabled,
+		PureMode:            pureMode,
+		AllowClientCacheTTL: allowClientCacheTTL,
+		Cloak:               cloak,
+		Usage:               usage,
+		Log:                 EffectiveAccountPoolLog(doc.ClaudeCode.Log),
+		Routing:             claudeapipool.EffectiveRouting(doc.ClaudeCode.Routing),
 	}
 }
 
@@ -580,14 +574,14 @@ func EffectiveAccountPoolLog(cfg AccountPoolLogConfig) EffectiveAccountPoolLogCo
 
 // EffectiveClaudeCodeUsage returns normalized downstream-visible usage settings.
 func EffectiveClaudeCodeUsage(cfg ClaudeCodeUsageConfig, profile ClaudeCodeProfile) EffectiveClaudeCodeUsageConfig {
-	defaults := defaultConfigFile().ClaudeCode.Usage
+	cleanInputTokens := false
 	if cfg.CleanInputTokens == nil {
-		cfg.CleanInputTokens = defaults.CleanInputTokens
-	}
-	if cfg.SystemPromptOverheadTokens <= 0 {
-		cfg.SystemPromptOverheadTokens = defaults.SystemPromptOverheadTokens
+		cfg.CleanInputTokens = &cleanInputTokens
 	}
 	effectiveProfile := EffectiveClaudeCodeProfile(profile)
+	if cfg.SystemPromptOverheadTokens <= 0 {
+		cfg.SystemPromptOverheadTokens = ClaudeCodeProfileInjectedOverheadTokens(effectiveProfile)
+	}
 	return EffectiveClaudeCodeUsageConfig{
 		CleanInputTokens:           cfg.CleanInputTokens != nil && *cfg.CleanInputTokens,
 		SystemPromptOverheadTokens: cfg.SystemPromptOverheadTokens,
@@ -608,9 +602,11 @@ func EffectiveClaudeCodeProfile(cfg ClaudeCodeProfile) EffectiveClaudeCodeProfil
 	}
 	betas := append([]string(nil), normalized.Betas...)
 	return EffectiveClaudeCodeProfileConfig{
+		Revision:            normalized.Revision,
 		Version:             normalized.Version,
 		UserAgent:           normalized.UserAgent,
 		Headers:             headers,
+		HeaderOrder:         append([]string(nil), normalized.HeaderOrder...),
 		Betas:               betas,
 		SystemPrompt:        normalized.SystemPrompt,
 		BillingBlockEnabled: enabled,
@@ -619,29 +615,11 @@ func EffectiveClaudeCodeProfile(cfg ClaudeCodeProfile) EffectiveClaudeCodeProfil
 		UpdatedAt:           normalized.UpdatedAt,
 		Locked:              normalized.Locked,
 		SystemPromptMode:    normalized.SystemPromptMode,
-		TLSProfile:          "node-claude-code",
+		TLSProfile:          normalized.TLSProfile,
+		TLSJA3:              normalized.TLSJA3,
+		TLSJA4:              normalized.TLSJA4,
+		TLSALPN:             normalized.TLSALPN,
 	}
-}
-
-// ApplyClaudeCodePoolRuntimeConfig loads SQLite-backed pool config and applies runtime routing policy.
-func ApplyClaudeCodePoolRuntimeConfig(ctx context.Context, configFilePath string, cfg *config.Config) error {
-	if cfg == nil || !cfg.ResourcePools.Enabled {
-		return nil
-	}
-	store, err := Open(configFilePath, cfg)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = store.Close()
-	}()
-	doc, err := store.GetConfig(ctx)
-	if err != nil {
-		return err
-	}
-	effective := EffectiveClaudeCodePool(doc.ClaudeCode)
-	claudeapipool.SetScopedRoutingConfig(coreexecutor.PoolScopeClaudeAccountPool, effective.Routing)
-	return nil
 }
 
 // EffectiveTrace returns normalized local trace dump settings.

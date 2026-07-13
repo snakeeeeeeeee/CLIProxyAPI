@@ -76,6 +76,45 @@ func TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeSt
 	}
 }
 
+func TestServiceSyncRefreshedResourcePoolAuthReplacesRuntimeCredential(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	service := &Service{coreManager: manager}
+	auth := &coreauth.Auth{
+		ID:          "resource-pool-refresh-sync",
+		Provider:    "claude",
+		Status:      coreauth.StatusError,
+		Unavailable: true,
+		Attributes: map[string]string{
+			resourcepool.AttrClaudeOAuthPool: "true",
+		},
+		Metadata: map[string]any{
+			"access_token":  "old-access-token",
+			"refresh_token": "refresh-token",
+		},
+	}
+	if _, err := manager.Register(coreauth.WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	refreshed := auth.Clone()
+	refreshed.Status = coreauth.StatusActive
+	refreshed.Unavailable = false
+	refreshed.Metadata["access_token"] = "new-access-token"
+	if err := service.syncRefreshedResourcePoolAuth(context.Background(), refreshed); err != nil {
+		t.Fatalf("syncRefreshedResourcePoolAuth() error = %v", err)
+	}
+
+	got, ok := manager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatal("refreshed runtime auth is missing")
+	}
+	if token, _ := got.Metadata["access_token"].(string); token != "new-access-token" {
+		t.Fatalf("runtime access token = %q", token)
+	}
+	if got.Unavailable || got.Status != coreauth.StatusActive {
+		t.Fatalf("runtime auth status = %s unavailable=%v", got.Status, got.Unavailable)
+	}
+}
+
 func TestForceHomeRuntimeConfigEnablesUsageStatistics(t *testing.T) {
 	cfg := &config.Config{
 		UsageStatisticsEnabled: false,
@@ -198,9 +237,9 @@ func TestSyncResourcePoolAuthsUpdatesCleanInputRuntimeAttributes(t *testing.T) {
 	if _, err := store.RegisterClaudeCodeAccountWithAuth(ctx, auth.ID, "user@example.com", "", auth); err != nil {
 		t.Fatalf("register account: %v", err)
 	}
-	cleanDisabled := false
+	pureDisabled := false
 	if _, err := store.SaveClaudeCodePoolConfig(ctx, resourcepool.ClaudeCodePoolConfig{
-		Usage: resourcepool.ClaudeCodeUsageConfig{CleanInputTokens: &cleanDisabled},
+		PureMode: &pureDisabled,
 	}); err != nil {
 		t.Fatalf("save disabled config: %v", err)
 	}
@@ -215,10 +254,10 @@ func TestSyncResourcePoolAuthsUpdatesCleanInputRuntimeAttributes(t *testing.T) {
 		t.Fatalf("initial clean input attr = %q, want false", got)
 	}
 
-	cleanEnabled := true
+	pureEnabled := true
 	if _, err := store.SaveClaudeCodePoolConfig(ctx, resourcepool.ClaudeCodePoolConfig{
+		PureMode: &pureEnabled,
 		Usage: resourcepool.ClaudeCodeUsageConfig{
-			CleanInputTokens:           &cleanEnabled,
 			SystemPromptOverheadTokens: 1909,
 		},
 	}); err != nil {

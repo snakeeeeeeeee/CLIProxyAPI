@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
@@ -329,6 +330,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
+		if isClaudeCodeAccountPoolManagementAuth(auth) {
+			continue
+		}
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
 			files = append(files, entry)
 		}
@@ -339,6 +343,27 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
 	c.JSON(200, gin.H{"files": files})
+}
+
+func isClaudeCodeAccountPoolManagementAuth(auth *coreauth.Auth) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		return false
+	}
+	if auth.Attributes != nil {
+		if strings.EqualFold(strings.TrimSpace(auth.Attributes[resourcepool.AttrClaudeOAuthPool]), "true") ||
+			strings.EqualFold(strings.TrimSpace(auth.Attributes[claudeapipool.AttrOAuthPool]), "true") {
+			return true
+		}
+	}
+	if auth.Metadata != nil {
+		if accountPool, ok := auth.Metadata["resource_pool_account"].(bool); ok && accountPool {
+			return true
+		}
+		if poolType, _ := auth.Metadata["resource_pool_type"].(string); strings.EqualFold(strings.TrimSpace(poolType), "claude-code") {
+			return true
+		}
+	}
+	return false
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -1918,10 +1943,22 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	ctx = PopulateAuthContext(ctx, c)
 	pool := strings.TrimSpace(c.Query("pool"))
 	claudeCodePool := strings.EqualFold(pool, "claude-code")
-	loginProxyURL, bindProxyResourceID, errProxy := h.resolveClaudeCodeOAuthProxy(c)
-	if errProxy != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_proxy", "message": errProxy.Error()})
-		return
+	accountPoolID := strings.TrimSpace(c.Query("pool_id"))
+	if accountPoolID == "" {
+		accountPoolID = resourcepool.DefaultAccountPoolID
+	}
+	if claudeCodePool {
+		store, errStore := resourcepool.Open(h.configFilePath, h.cfg)
+		if errStore != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "open_failed", "message": errStore.Error()})
+			return
+		}
+		_, errPool := store.RequireActiveAccountPool(c.Request.Context(), accountPoolID)
+		_ = store.Close()
+		if errPool != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_pool", "message": errPool.Error()})
+			return
+		}
 	}
 
 	fmt.Println("Initializing Claude authentication...")
@@ -1933,13 +1970,26 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate PKCE codes"})
 		return
 	}
-
 	// Generate random state parameter
 	state, err := misc.GenerateRandomState()
 	if err != nil {
 		log.Errorf("Failed to generate state parameter: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
 		return
+	}
+	oauthReservationOwner := ""
+	if claudeCodePool {
+		oauthReservationOwner = "oauth-" + state
+	}
+	loginProxyURL, bindProxyResourceID, reservedProxyResourceID, errProxy := h.resolveClaudeCodeOAuthProxy(c, oauthReservationOwner)
+	if errProxy != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_proxy", "message": errProxy.Error()})
+		return
+	}
+	releaseOAuthReservation := func() {
+		if oauthReservationOwner != "" && reservedProxyResourceID != "" {
+			h.releaseOAuthProxyReservation(oauthReservationOwner)
+		}
 	}
 
 	// Initialize Claude auth service
@@ -1951,6 +2001,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		authURL, state, err = anthropicAuth.GenerateClaudeCodeAuthURL(state, pkceCodes)
 	}
 	if err != nil {
+		releaseOAuthReservation()
 		log.Errorf("Failed to generate authorization URL: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
 		return
@@ -1963,12 +2014,14 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	if isWebUI {
 		targetURL, errTarget := h.managementCallbackURL("/anthropic/callback")
 		if errTarget != nil {
+			releaseOAuthReservation()
 			log.WithError(errTarget).Error("failed to compute anthropic callback target")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
 			return
 		}
 		var errStart error
 		if forwarder, errStart = startCallbackForwarder(anthropicCallbackPort, "anthropic", targetURL); errStart != nil {
+			releaseOAuthReservation()
 			log.WithError(errStart).Error("failed to start anthropic callback forwarder")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
 			return
@@ -1976,6 +2029,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}
 
 	go func() {
+		defer releaseOAuthReservation()
 		if isWebUI {
 			defer stopCallbackForwarderInstance(anthropicCallbackPort, forwarder)
 		}
@@ -2064,6 +2118,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		if claudeCodePool {
 			record.Metadata["resource_pool_account"] = true
 			record.Metadata["resource_pool_type"] = "claude-code"
+			record.Metadata["resource_pool_id"] = accountPoolID
 			if tokenStorage.OrganizationUUID != "" {
 				record.Metadata["org_uuid"] = tokenStorage.OrganizationUUID
 			}
@@ -2077,7 +2132,11 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		savedPath := ""
 		if claudeCodePool {
 			var errRegister error
-			savedPath, errRegister = h.saveClaudeCodeOAuthAccount(ctx, record, tokenStorage.Email, bindProxyResourceID)
+			reservationOwner := ""
+			if bindProxyResourceID != "" && bindProxyResourceID == reservedProxyResourceID {
+				reservationOwner = oauthReservationOwner
+			}
+			savedPath, errRegister = h.saveClaudeCodeOAuthAccountWithReservationInPool(ctx, accountPoolID, record, tokenStorage.Email, bindProxyResourceID, reservationOwner, "login")
 			if errRegister != nil {
 				log.Errorf("Failed to register Claude Code account pool entry: %v", errRegister)
 				SetOAuthSessionError(state, "Failed to register Claude Code account pool entry")
@@ -2105,10 +2164,10 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
-func (h *Handler) resolveClaudeCodeOAuthProxy(c *gin.Context) (string, string, error) {
+func (h *Handler) resolveClaudeCodeOAuthProxy(c *gin.Context, reservationOwner string) (string, string, string, error) {
 	pool := strings.TrimSpace(c.Query("pool"))
 	if !strings.EqualFold(pool, "claude-code") {
-		return "", "", nil
+		return "", "", "", nil
 	}
 	mode := strings.ToLower(strings.TrimSpace(c.Query("login_proxy")))
 	proxyResourceID := strings.TrimSpace(c.Query("proxy_resource_id"))
@@ -2124,51 +2183,69 @@ func (h *Handler) resolveClaudeCodeOAuthProxy(c *gin.Context) (string, string, e
 		bindExplicitNone = true
 	}
 	if mode == "direct" {
-		return "direct", bindProxyResourceID, nil
+		return "direct", bindProxyResourceID, "", nil
 	}
 	h.mu.Lock()
 	cfg := h.cfg
 	configPath := h.configFilePath
 	h.mu.Unlock()
 	if cfg == nil || !cfg.ResourcePools.Enabled {
-		return "", "", fmt.Errorf("resource pools disabled")
+		return "", "", "", fmt.Errorf("resource pools disabled")
 	}
 	store, err := resourcepool.Open(configPath, cfg)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer closeResourcePoolStore(store)
 	ctx := c.Request.Context()
 	if mode == "auto" && proxyResourceID == "" {
-		available, err := store.ListAvailableProxies(ctx)
+		reservations, err := store.ReserveAvailableProxies(ctx, reservationOwner, "oauth-login", []string{"login"}, 10*time.Minute)
 		if err != nil {
-			return "", "", err
+			return "", "", "", err
 		}
-		if len(available) == 0 {
-			return "", "", fmt.Errorf("no available proxy resources")
+		if len(reservations) == 0 {
+			return "", "", "", fmt.Errorf("no available proxy resources")
 		}
-		proxyResourceID = available[0].ID
+		proxyResourceID = reservations[0].ProxyResourceID
 		if bindProxyResourceID == "" && !bindExplicitNone {
 			bindProxyResourceID = proxyResourceID
 		}
 	}
 	if proxyResourceID == "" {
-		return "", bindProxyResourceID, nil
+		return "", bindProxyResourceID, "", nil
+	}
+	if mode != "auto" {
+		if _, err := store.ReserveProxy(ctx, proxyResourceID, reservationOwner, "login", "oauth-login", 10*time.Minute); err != nil {
+			return "", "", "", err
+		}
 	}
 	proxy, err := store.GetProxy(ctx, proxyResourceID)
 	if err != nil {
-		return "", "", err
+		_ = store.ReleaseProxyReservations(ctx, reservationOwner)
+		return "", "", "", err
 	}
 	if !proxy.Enabled {
-		return "", "", fmt.Errorf("proxy resource is disabled")
+		_ = store.ReleaseProxyReservations(ctx, reservationOwner)
+		return "", "", "", fmt.Errorf("proxy resource is disabled")
 	}
 	if proxy.HealthStatus == resourcepool.HealthUnhealthy {
-		return "", "", fmt.Errorf("proxy resource is unhealthy")
+		_ = store.ReleaseProxyReservations(ctx, reservationOwner)
+		return "", "", "", fmt.Errorf("proxy resource is unhealthy")
 	}
-	return proxy.ProxyURL, bindProxyResourceID, nil
+	return proxy.ProxyURL, bindProxyResourceID, proxyResourceID, nil
 }
 
 func (h *Handler) saveClaudeCodeOAuthAccount(ctx context.Context, record *coreauth.Auth, email, proxyResourceID string) (string, error) {
+	return h.saveClaudeCodeOAuthAccountWithReservationInPool(ctx, resourcepool.DefaultAccountPoolID, record, email, proxyResourceID, "", "")
+}
+
+var claudeCodeInitialProbeSem = make(chan struct{}, 2)
+
+func (h *Handler) saveClaudeCodeOAuthAccountWithReservation(ctx context.Context, record *coreauth.Auth, email, proxyResourceID, reservationOwner, reservationItem string) (string, error) {
+	return h.saveClaudeCodeOAuthAccountWithReservationInPool(ctx, resourcepool.DefaultAccountPoolID, record, email, proxyResourceID, reservationOwner, reservationItem)
+}
+
+func (h *Handler) saveClaudeCodeOAuthAccountWithReservationInPool(ctx context.Context, poolID string, record *coreauth.Auth, email, proxyResourceID, reservationOwner, reservationItem string) (string, error) {
 	h.mu.Lock()
 	cfg := h.cfg
 	configPath := h.configFilePath
@@ -2189,7 +2266,7 @@ func (h *Handler) saveClaudeCodeOAuthAccount(ctx context.Context, record *coreau
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	account, errRegister := store.RegisterClaudeCodeAccountWithAuth(ctx, record.ID, email, proxyResourceID, record)
+	account, errRegister := store.RegisterClaudeCodeAccountWithAuthReservationInPool(ctx, poolID, record.ID, email, proxyResourceID, record, reservationOwner, reservationItem)
 	if errRegister != nil {
 		return "", errRegister
 	}
@@ -2204,7 +2281,48 @@ func (h *Handler) saveClaudeCodeOAuthAccount(ctx context.Context, record *coreau
 		resourcepool.PublishProxyChanged(proxyResourceID, "bind")
 	}
 	resourcepool.PublishStatsChanged("account")
+	h.startClaudeCodeAccountInitialProbe(account.ID)
 	return "resource-pools.db:" + record.ID, nil
+}
+
+func (h *Handler) startClaudeCodeAccountInitialProbe(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	h.mu.Lock()
+	cfg := h.cfg
+	configPath := h.configFilePath
+	h.mu.Unlock()
+	if cfg == nil {
+		return
+	}
+	go func() {
+		select {
+		case claudeCodeInitialProbeSem <- struct{}{}:
+			defer func() { <-claudeCodeInitialProbeSem }()
+		case <-time.After(5 * time.Minute):
+			return
+		}
+		store, err := resourcepool.Open(configPath, cfg)
+		if err != nil {
+			return
+		}
+		defer closeResourcePoolStore(store)
+		_, _ = resourcepool.RefreshStoredAccountQuota(context.Background(), configPath, cfg, store, accountID)
+		h.triggerConfigReload(context.Background())
+		resourcepool.PublishAccountChanged(accountID, "initial_probe")
+		resourcepool.PublishStatsChanged("account_health")
+	}()
+}
+
+func (h *Handler) releaseOAuthProxyReservation(owner string) {
+	store, err := h.openResourcePoolStoreForJob()
+	if err != nil {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	_ = store.ReleaseProxyReservations(context.Background(), owner)
 }
 
 func (h *Handler) RequestCodexToken(c *gin.Context) {

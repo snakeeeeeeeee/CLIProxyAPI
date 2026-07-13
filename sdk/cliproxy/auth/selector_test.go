@@ -555,6 +555,25 @@ func TestSessionAffinitySelector_SameSessionSameAuth(t *testing.T) {
 	}
 }
 
+func TestExtractAccountPoolSessionKeyUsesExplicitIdentifiersOnly(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":"same prompt"}]}`)
+	if got := ExtractAccountPoolSessionKey(nil, payload, nil); got != "" {
+		t.Fatalf("message-only session key = %q, want empty", got)
+	}
+	headers := http.Header{"X-Client-Request-Id": []string{"request-only"}}
+	if got := ExtractAccountPoolSessionKey(headers, payload, nil); got != "" {
+		t.Fatalf("request-id session key = %q, want empty", got)
+	}
+	headers.Set("X-Session-ID", "session-1")
+	if got := ExtractAccountPoolSessionKey(headers, payload, nil); got != "header:session-1" {
+		t.Fatalf("header session key = %q", got)
+	}
+	claudePayload := []byte(`{"metadata":{"user_id":"{\"device_id\":\"device\",\"account_uuid\":\"account\",\"session_id\":\"session-2\"}"}}`)
+	if got := ExtractAccountPoolSessionKey(nil, claudePayload, nil); got != "claude:session-2" {
+		t.Fatalf("Claude metadata session key = %q", got)
+	}
+}
+
 func TestSessionAffinitySelector_NoSessionFallback(t *testing.T) {
 	t.Parallel()
 

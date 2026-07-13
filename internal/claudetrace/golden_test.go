@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tidwall/sjson"
 )
 
 func TestGoldenTraceRegressionScenarios(t *testing.T) {
@@ -84,7 +86,12 @@ func TestGoldenTraceRegressionScenarios(t *testing.T) {
 
 func goldenScenarioTrace(t *testing.T, source, path, body string, stream bool) Trace {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com"+path+"?beta=true", strings.NewReader(body))
+	metadata := `{"device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","account_uuid":"11111111-2222-4333-8444-555555555555","session_id":"session-real"}`
+	bodyWithMetadata, err := sjson.Set(body, "metadata.user_id", metadata)
+	if err != nil {
+		t.Fatalf("set metadata: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com"+path+"?beta=true", strings.NewReader(bodyWithMetadata))
 	if err != nil {
 		t.Fatalf("NewRequest() error: %v", err)
 	}
@@ -99,7 +106,7 @@ func goldenScenarioTrace(t *testing.T, source, path, body string, stream bool) T
 	return CaptureRequest(req, CaptureOptions{
 		Source:            source,
 		RedactUserContent: true,
-		RequestBody:       []byte(body),
+		RequestBody:       []byte(bodyWithMetadata),
 		StatusCode:        http.StatusOK,
 		Stream:            stream,
 	})

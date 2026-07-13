@@ -29,6 +29,10 @@ var claudeOAuthUsageURL = defaultQuotaUsageURL
 
 // RefreshAccountQuota refreshes and stores one Claude OAuth usage snapshot.
 func RefreshAccountQuota(ctx context.Context, cfg *config.Config, store *Store, accountID string, auth *coreauth.Auth, persistAuth func(*coreauth.Auth) error) (*ClaudeCodeAccount, error) {
+	return refreshAccountQuota(ctx, cfg, store, accountID, auth, persistAuth, false)
+}
+
+func refreshAccountQuota(ctx context.Context, cfg *config.Config, store *Store, accountID string, auth *coreauth.Auth, persistAuth func(*coreauth.Auth) error, allowManualRecovery bool) (*ClaudeCodeAccount, error) {
 	if store == nil {
 		return nil, fmt.Errorf("resource pool store is nil")
 	}
@@ -37,54 +41,99 @@ func RefreshAccountQuota(ctx context.Context, cfg *config.Config, store *Store, 
 		return nil, err
 	}
 	if auth == nil {
-		return saveAccountQuotaError(ctx, store, account.ID, "stored auth not found")
+		return saveAccountQuotaError(ctx, store, account, 0, "stored auth not found")
 	}
 	if strings.TrimSpace(auth.ProxyURL) == "" && account.Proxy != nil {
 		auth.ProxyURL = strings.TrimSpace(account.Proxy.ProxyURL)
 	}
 
 	if err := ensureClaudeAccessToken(ctx, cfg, auth, persistAuth); err != nil {
-		return saveAccountQuotaError(ctx, store, account.ID, err.Error())
+		return saveAccountQuotaError(ctx, store, account, http.StatusUnauthorized, err.Error())
 	}
 	raw, statusCode, err := fetchClaudeOAuthUsage(ctx, cfg, auth)
+	if err != nil || statusCode >= 500 {
+		raw, statusCode, err = fetchClaudeOAuthUsage(ctx, cfg, auth)
+	}
 	if statusCode == http.StatusUnauthorized {
 		if errRefresh := refreshClaudeAccessToken(ctx, cfg, auth, persistAuth); errRefresh != nil {
-			return saveAccountQuotaError(ctx, store, account.ID, errRefresh.Error())
+			return saveAccountQuotaError(ctx, store, account, statusCode, errRefresh.Error())
 		}
 		raw, statusCode, err = fetchClaudeOAuthUsage(ctx, cfg, auth)
 	}
 	if err != nil {
-		return saveAccountQuotaError(ctx, store, account.ID, err.Error())
+		return saveAccountQuotaError(ctx, store, account, statusCode, err.Error())
 	}
 	if statusCode < 200 || statusCode >= 300 {
-		return saveAccountQuotaError(ctx, store, account.ID, fmt.Sprintf("usage endpoint returned status %d: %s", statusCode, strings.TrimSpace(string(raw))))
+		return saveAccountQuotaError(ctx, store, account, statusCode, fmt.Sprintf("usage endpoint returned status %d: %s", statusCode, strings.TrimSpace(string(raw))))
 	}
 	windows, err := ParseClaudeOAuthUsage(raw)
 	if err != nil {
-		return saveAccountQuotaError(ctx, store, account.ID, err.Error())
+		return saveAccountQuotaError(ctx, store, account, statusCode, err.Error())
 	}
 	now := time.Now()
-	return store.SaveAccountQuota(ctx, AccountQuota{
+	windows = mergeOAuthUsageWindows(account.Quota, windows, now)
+	_, err = store.SaveAccountQuota(ctx, AccountQuota{
 		AccountID: account.ID,
 		Status:    "ok",
 		Windows:   windows,
 		CheckedAt: &now,
 		RawJSON:   string(raw),
+		Source:    "oauth_usage",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return store.UpdateAccountHealth(ctx, account.ID, AccountHealthUpdate{
+		Source:              "oauth_usage",
+		Status:              AccountHealthHealthy,
+		CheckedAt:           &now,
+		NextCheckAt:         timePtr(nextAccountHealthCheck(account.ID, now, quotaDefaultInterval)),
+		AllowManualRecovery: allowManualRecovery,
 	})
 }
 
 // RefreshStoredAccountQuota refreshes quota using only SQLite-backed auth data.
 func RefreshStoredAccountQuota(ctx context.Context, configPath string, cfg *config.Config, store *Store, accountID string) (*ClaudeCodeAccount, error) {
+	return refreshStoredAccountQuota(ctx, configPath, cfg, store, accountID, false, nil)
+}
+
+// RecheckStoredAccountQuota explicitly allows a successful probe to clear manual recovery.
+func RecheckStoredAccountQuota(ctx context.Context, configPath string, cfg *config.Config, store *Store, accountID string) (*ClaudeCodeAccount, error) {
+	return refreshStoredAccountQuota(ctx, configPath, cfg, store, accountID, true, nil)
+}
+
+type accountQuotaAuthSync func(context.Context, *coreauth.Auth) error
+
+func refreshStoredAccountQuota(ctx context.Context, configPath string, cfg *config.Config, store *Store, accountID string, allowManualRecovery bool, syncAuth accountQuotaAuthSync) (*ClaudeCodeAccount, error) {
 	auth, err := GetStoredAuth(ctx, configPath, cfg, accountID)
 	if err != nil {
-		if account, saveErr := saveAccountQuotaError(ctx, store, accountID, err.Error()); saveErr == nil {
+		stored, _ := store.GetAccount(ctx, accountID)
+		if account, saveErr := saveAccountQuotaError(ctx, store, stored, 0, err.Error()); saveErr == nil {
 			return account, err
 		}
 		return nil, err
 	}
-	return RefreshAccountQuota(ctx, cfg, store, accountID, auth, func(updated *coreauth.Auth) error {
-		return store.SaveClaudeCodeAccountAuth(ctx, updated)
-	})
+	return refreshAccountQuota(ctx, cfg, store, accountID, auth, func(updated *coreauth.Auth) error {
+		return persistAndSyncAccountAuth(ctx, store, updated, syncAuth)
+	}, allowManualRecovery)
+}
+
+func persistAndSyncAccountAuth(ctx context.Context, store *Store, auth *coreauth.Auth, syncAuth accountQuotaAuthSync) error {
+	if store == nil {
+		return fmt.Errorf("resource pool store is nil")
+	}
+	if auth == nil {
+		return fmt.Errorf("auth is nil")
+	}
+	if err := store.SaveClaudeCodeAccountAuth(ctx, auth); err != nil {
+		return err
+	}
+	if syncAuth != nil {
+		if err := syncAuth(ctx, auth.Clone()); err != nil {
+			return fmt.Errorf("sync refreshed runtime auth: %w", err)
+		}
+	}
+	return nil
 }
 
 // EffectiveAccountQuota returns normalized background quota refresh settings.
@@ -121,7 +170,21 @@ func ParseClaudeOAuthUsage(raw []byte) ([]QuotaWindow, error) {
 		SevenDay       quotaUsageWindow `json:"seven_day"`
 		SevenDaySonnet quotaUsageWindow `json:"seven_day_sonnet"`
 		SevenDayOpus   quotaUsageWindow `json:"seven_day_opus"`
-		ExtraUsage     struct {
+		SevenDayFable  quotaUsageWindow `json:"seven_day_overage_included"`
+		Limits         []struct {
+			Kind     string   `json:"kind"`
+			Group    string   `json:"group"`
+			Percent  *float64 `json:"percent"`
+			ResetsAt string   `json:"resets_at"`
+			IsActive bool     `json:"is_active"`
+			Scope    *struct {
+				Model *struct {
+					ID          *string `json:"id"`
+					DisplayName string  `json:"display_name"`
+				} `json:"model"`
+			} `json:"scope"`
+		} `json:"limits"`
+		ExtraUsage struct {
 			IsEnabled    bool     `json:"is_enabled"`
 			Utilization  *float64 `json:"utilization"`
 			MonthlyLimit *float64 `json:"monthly_limit"`
@@ -131,7 +194,36 @@ func ParseClaudeOAuthUsage(raw []byte) ([]QuotaWindow, error) {
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, fmt.Errorf("parse usage response: %w", err)
 	}
-	out := make([]QuotaWindow, 0, 5)
+	for _, limit := range payload.Limits {
+		if !strings.EqualFold(strings.TrimSpace(limit.Kind), "weekly_scoped") && !strings.EqualFold(strings.TrimSpace(limit.Group), "weekly") {
+			continue
+		}
+		if !limit.IsActive && strings.TrimSpace(limit.ResetsAt) == "" {
+			continue
+		}
+		if limit.Scope == nil || limit.Scope.Model == nil {
+			continue
+		}
+		modelName := strings.TrimSpace(limit.Scope.Model.DisplayName)
+		if limit.Scope.Model.ID != nil && strings.TrimSpace(*limit.Scope.Model.ID) != "" {
+			modelName += " " + strings.TrimSpace(*limit.Scope.Model.ID)
+		}
+		var target *quotaUsageWindow
+		switch {
+		case strings.Contains(strings.ToLower(modelName), "sonnet"):
+			target = &payload.SevenDaySonnet
+		case strings.Contains(strings.ToLower(modelName), "opus"):
+			target = &payload.SevenDayOpus
+		case strings.Contains(strings.ToLower(modelName), "fable"):
+			target = &payload.SevenDayFable
+		}
+		if target == nil || target.Utilization != nil || strings.TrimSpace(target.ResetsAt) != "" {
+			continue
+		}
+		target.Utilization = limit.Percent
+		target.ResetsAt = strings.TrimSpace(limit.ResetsAt)
+	}
+	out := make([]QuotaWindow, 0, 6)
 	for _, spec := range []struct {
 		key    string
 		name   string
@@ -141,11 +233,16 @@ func ParseClaudeOAuthUsage(raw []byte) ([]QuotaWindow, error) {
 		{key: "seven_day", name: "7 天", window: payload.SevenDay},
 		{key: "seven_day_sonnet", name: "Sonnet 周额度", window: payload.SevenDaySonnet},
 		{key: "seven_day_opus", name: "Opus 周额度", window: payload.SevenDayOpus},
+		{key: "seven_day_fable", name: "Fable 周额度", window: payload.SevenDayFable},
 	} {
 		if spec.window.Utilization == nil && strings.TrimSpace(spec.window.ResetsAt) == "" {
 			continue
 		}
-		out = append(out, quotaWindowFromUsage(spec.key, spec.name, spec.window))
+		window := quotaWindowFromUsage(spec.key, spec.name, spec.window)
+		window.Source = "oauth_usage"
+		now := time.Now()
+		window.UpdatedAt = &now
+		out = append(out, window)
 	}
 	if payload.ExtraUsage.IsEnabled || payload.ExtraUsage.Utilization != nil || payload.ExtraUsage.MonthlyLimit != nil || payload.ExtraUsage.UsedCredits != nil {
 		used := 0.0
@@ -153,12 +250,14 @@ func ParseClaudeOAuthUsage(raw []byte) ([]QuotaWindow, error) {
 			used = clampPercent(*payload.ExtraUsage.Utilization)
 		}
 		out = append(out, QuotaWindow{
-			Key:           "extra_usage",
-			Name:          "额外用量",
-			UsedPercent:   used,
-			RemainPercent: clampPercent(100 - used),
-			MonthlyLimit:  payload.ExtraUsage.MonthlyLimit,
-			UsedCredits:   payload.ExtraUsage.UsedCredits,
+			Key:              "extra_usage",
+			Name:             "额外用量",
+			UsedPercent:      used,
+			RemainPercent:    clampPercent(100 - used),
+			UtilizationKnown: boolPtr(payload.ExtraUsage.Utilization != nil),
+			MonthlyLimit:     payload.ExtraUsage.MonthlyLimit,
+			UsedCredits:      payload.ExtraUsage.UsedCredits,
+			Source:           "oauth_usage",
 		})
 	}
 	return out, nil
@@ -175,10 +274,11 @@ func quotaWindowFromUsage(key, name string, usage quotaUsageWindow) QuotaWindow 
 		used = clampPercent(*usage.Utilization)
 	}
 	window := QuotaWindow{
-		Key:           key,
-		Name:          name,
-		UsedPercent:   used,
-		RemainPercent: clampPercent(100 - used),
+		Key:              key,
+		Name:             name,
+		UsedPercent:      used,
+		RemainPercent:    clampPercent(100 - used),
+		UtilizationKnown: boolPtr(usage.Utilization != nil),
 	}
 	if ts, err := time.Parse(time.RFC3339, strings.TrimSpace(usage.ResetsAt)); err == nil {
 		window.ResetsAt = &ts
@@ -186,20 +286,69 @@ func quotaWindowFromUsage(key, name string, usage quotaUsageWindow) QuotaWindow 
 	return window
 }
 
-func saveAccountQuotaError(ctx context.Context, store *Store, accountID, message string) (*ClaudeCodeAccount, error) {
+func saveAccountQuotaError(ctx context.Context, store *Store, current *ClaudeCodeAccount, statusCode int, message string) (*ClaudeCodeAccount, error) {
+	if current == nil {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(message))
+	}
 	now := time.Now()
+	windows := []QuotaWindow{}
+	if current.Quota != nil {
+		windows = current.Quota.Windows
+	}
 	account, err := store.SaveAccountQuota(ctx, AccountQuota{
-		AccountID: accountID,
+		AccountID: current.ID,
 		Status:    "error",
-		Windows:   []QuotaWindow{},
+		Windows:   windows,
 		CheckedAt: &now,
 		LastError: strings.TrimSpace(message),
+		Source:    quotaSource(current.Quota),
 	})
 	if err != nil {
 		return nil, err
 	}
+	status, reason, blockedUntil := classifyQuotaProbeFailure(statusCode, message, now)
+	_, _ = store.UpdateAccountHealth(ctx, current.ID, AccountHealthUpdate{
+		Source:       "oauth_usage",
+		Status:       status,
+		Reason:       reason,
+		BlockedUntil: blockedUntil,
+		CheckedAt:    &now,
+		NextCheckAt:  blockedUntil,
+	})
 	return account, fmt.Errorf("%s", strings.TrimSpace(message))
 }
+
+func classifyQuotaProbeFailure(statusCode int, message string, now time.Time) (string, string, *time.Time) {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	manual := func(reason string) (string, string, *time.Time) {
+		return AccountHealthManualRecovery, reason, nil
+	}
+	temporary := func(reason string, duration time.Duration) (string, string, *time.Time) {
+		until := now.Add(duration)
+		return AccountHealthTemporarilyBlocked, reason, &until
+	}
+	switch statusCode {
+	case http.StatusUnauthorized:
+		if strings.Contains(lower, "invalid_grant") || strings.Contains(lower, "missing refresh_token") || strings.Contains(lower, "invalid refresh") {
+			return manual("OAuth 凭据已失效")
+		}
+		return temporary("OAuth 刷新暂时失败", 10*time.Minute)
+	case http.StatusPaymentRequired:
+		return manual("账号需要处理账单")
+	case http.StatusForbidden:
+		if strings.Contains(lower, "cloudflare") || strings.Contains(lower, "challenge") {
+			return temporary("Cloudflare 验证", 10*time.Minute)
+		}
+		if strings.Contains(lower, "suspend") || strings.Contains(lower, "disabled") || strings.Contains(lower, "billing") || strings.Contains(lower, "invalid session") {
+			return manual("账号被拒绝，需要人工处理")
+		}
+		return temporary("上游拒绝访问", 5*time.Minute)
+	default:
+		return temporary("额度检查暂时失败", 5*time.Minute)
+	}
+}
+
+func timePtr(value time.Time) *time.Time { return &value }
 
 func ensureClaudeAccessToken(ctx context.Context, cfg *config.Config, auth *coreauth.Auth, persistAuth func(*coreauth.Auth) error) error {
 	if auth == nil {

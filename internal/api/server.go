@@ -47,6 +47,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
@@ -556,7 +557,7 @@ func (s *Server) setupRoutes() {
 	}
 
 	claudeAccountPool := s.engine.Group("/claude-acc-pool/v1")
-	claudeAccountPool.Use(AuthMiddleware(s.accessManager))
+	claudeAccountPool.Use(s.claudeAccountPoolAuthMiddleware())
 	claudeAccountPool.Use(s.claudeAccountPoolMiddleware())
 	{
 		claudeAccountPool.GET("/models", s.claudeAccountPoolModelsHandler)
@@ -654,6 +655,101 @@ func (s *Server) setupRoutes() {
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
 
+func (s *Server) claudeAccountPoolAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		generatedKey := generatedAccountPoolKeyFromRequest(c.Request)
+		if generatedKey != "" {
+			if s == nil || s.cfg == nil || !s.cfg.ResourcePools.Enabled {
+				writeClaudeAuthError(c, http.StatusUnauthorized, "invalid API key")
+				return
+			}
+			store, err := resourcepool.Open(s.configFilePath, s.cfg)
+			if err != nil {
+				log.WithError(err).Error("account-pool key store unavailable")
+				writeClaudeAuthError(c, http.StatusServiceUnavailable, "account pool is unavailable")
+				return
+			}
+			item, pool, errAuth := store.AuthenticatePoolAPIKey(c.Request.Context(), generatedKey)
+			_ = store.Close()
+			if errAuth != nil || item == nil || pool == nil {
+				writeClaudeAuthError(c, http.StatusUnauthorized, "invalid API key")
+				return
+			}
+			if !pool.Enabled || pool.ArchivedAt != nil {
+				writeClaudeAuthError(c, http.StatusServiceUnavailable, "account pool is unavailable")
+				return
+			}
+			metadata := map[string]string{
+				"source":     "account-pool-key",
+				"pool_id":    pool.ID,
+				"api_key_id": item.ID,
+				"key_prefix": item.KeyPrefix,
+				"legacy_key": "false",
+			}
+			c.Set("userApiKey", item.KeyPrefix)
+			c.Set("accessProvider", "account-pool-key")
+			c.Set("accessMetadata", metadata)
+			requestContext := handlers.WithAccountPoolIdentity(c.Request.Context(), pool.ID, item.ID)
+			requestContext = coreusage.WithAccountPoolBilling(requestContext, pool.ID, item.ID, resourcepool.ActiveModelPriceVersionID())
+			c.Request = c.Request.WithContext(requestContext)
+			c.Next()
+			return
+		}
+
+		if s == nil || s.accessManager == nil {
+			requestContext := handlers.WithAccountPoolIdentity(c.Request.Context(), resourcepool.DefaultAccountPoolID, "")
+			requestContext = coreusage.WithAccountPoolBilling(requestContext, resourcepool.DefaultAccountPoolID, "", resourcepool.ActiveModelPriceVersionID())
+			c.Request = c.Request.WithContext(requestContext)
+			c.Next()
+			return
+		}
+		result, authErr := s.accessManager.Authenticate(c.Request.Context(), c.Request)
+		if authErr != nil {
+			statusCode := authErr.HTTPStatusCode()
+			if statusCode >= http.StatusInternalServerError {
+				log.Errorf("authentication middleware error: %v", authErr)
+			}
+			writeClaudeAuthError(c, statusCode, authErr.Message)
+			return
+		}
+		if result != nil {
+			c.Set("userApiKey", result.Principal)
+			c.Set("accessProvider", result.Provider)
+			metadata := make(map[string]string, len(result.Metadata)+3)
+			for key, value := range result.Metadata {
+				metadata[key] = value
+			}
+			metadata["pool_id"] = resourcepool.DefaultAccountPoolID
+			metadata["legacy_key"] = "true"
+			c.Set("accessMetadata", metadata)
+		}
+		requestContext := handlers.WithAccountPoolIdentity(c.Request.Context(), resourcepool.DefaultAccountPoolID, "")
+		requestContext = coreusage.WithAccountPoolBilling(requestContext, resourcepool.DefaultAccountPoolID, "", resourcepool.ActiveModelPriceVersionID())
+		c.Request = c.Request.WithContext(requestContext)
+		c.Next()
+	}
+}
+
+func generatedAccountPoolKeyFromRequest(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	candidates := []string{strings.TrimSpace(req.Header.Get("X-Api-Key"))}
+	authorization := strings.TrimSpace(req.Header.Get("Authorization"))
+	if authorization != "" {
+		parts := strings.SplitN(authorization, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+			candidates = append(candidates, strings.TrimSpace(parts[1]))
+		}
+	}
+	for _, candidate := range candidates {
+		if strings.HasPrefix(candidate, "sk-cap-") {
+			return candidate
+		}
+	}
+	return ""
+}
+
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
 // The handler is served as-is without additional middleware beyond the standard stack already configured.
 func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
@@ -694,7 +790,8 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 func (s *Server) claudeAccountPoolMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request != nil {
-			c.Request = c.Request.WithContext(handlers.WithPoolScope(c.Request.Context(), coreexecutor.PoolScopeClaudeAccountPool))
+			ctx := handlers.WithPoolScope(c.Request.Context(), coreexecutor.PoolScopeClaudeAccountPool)
+			c.Request = c.Request.WithContext(ctx)
 		}
 		if c.Request == nil || c.Request.Method == http.MethodGet {
 			c.Next()
@@ -941,6 +1038,19 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/resource-pools/events", s.mgmt.StreamResourcePoolEvents)
 		mgmt.GET("/resource-pools/config", s.mgmt.GetResourcePoolConfig)
+		mgmt.GET("/claude-code-account-pools", s.mgmt.ListClaudeCodeAccountPools)
+		mgmt.POST("/claude-code-account-pools", s.mgmt.CreateClaudeCodeAccountPool)
+		mgmt.GET("/claude-code-account-pools/:id", s.mgmt.GetClaudeCodeAccountPool)
+		mgmt.PATCH("/claude-code-account-pools/:id", s.mgmt.PatchClaudeCodeAccountPool)
+		mgmt.DELETE("/claude-code-account-pools/:id", s.mgmt.DeleteClaudeCodeAccountPool)
+		mgmt.GET("/claude-code-account-pools/:id/config", s.mgmt.GetClaudeCodeAccountPoolConfig)
+		mgmt.PATCH("/claude-code-account-pools/:id/config", s.mgmt.PatchClaudeCodeAccountPoolConfig)
+		mgmt.GET("/claude-code-account-pool/api-keys", s.mgmt.ListClaudeCodePoolAPIKeys)
+		mgmt.POST("/claude-code-account-pool/api-keys", s.mgmt.CreateClaudeCodePoolAPIKey)
+		mgmt.PATCH("/claude-code-account-pool/api-keys/:id", s.mgmt.PatchClaudeCodePoolAPIKey)
+		mgmt.GET("/claude-code-account-pool/api-keys/:id/secret", s.mgmt.GetClaudeCodePoolAPIKeySecret)
+		mgmt.DELETE("/claude-code-account-pool/api-keys/:id", s.mgmt.DeleteClaudeCodePoolAPIKey)
+		mgmt.POST("/claude-code-account-pool/api-keys/:id/rotate", s.mgmt.RotateClaudeCodePoolAPIKey)
 		mgmt.GET("/claude-code-account-pool/config", s.mgmt.GetClaudeCodePoolConfig)
 		mgmt.PUT("/claude-code-account-pool/config", s.mgmt.PutClaudeCodePoolConfig)
 		mgmt.PATCH("/claude-code-account-pool/config", s.mgmt.PutClaudeCodePoolConfig)
@@ -964,6 +1074,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/claude-code-account-pool/usage-calibrations", s.mgmt.ListClaudeCodeUsageCalibrations)
 		mgmt.POST("/claude-code-account-pool/usage-calibrations/calibrate", s.mgmt.CalibrateClaudeCodeUsage)
 		mgmt.GET("/claude-code-account-pool/models", s.mgmt.ListClaudeCodePoolModels)
+		mgmt.GET("/claude-code-account-pool/model-prices", s.mgmt.GetClaudeCodeModelPrices)
+		mgmt.PUT("/claude-code-account-pool/model-prices", s.mgmt.PutClaudeCodeModelPrices)
+		mgmt.POST("/claude-code-account-pool/model-prices", s.mgmt.PutClaudeCodeModelPrices)
 		mgmt.POST("/claude-code-account-pool/models", s.mgmt.CreateClaudeCodePoolModel)
 		mgmt.POST("/claude-code-account-pool/models/fetch", s.mgmt.FetchClaudeCodePoolModels)
 		mgmt.PATCH("/claude-code-account-pool/models/:id", s.mgmt.PatchClaudeCodePoolModel)
@@ -982,16 +1095,22 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/claude-code-account-pool/accounts/import-auth", s.mgmt.ImportClaudeAuthToAccountPool)
 		mgmt.POST("/claude-code-account-pool/accounts/batch", s.mgmt.BatchClaudeCodeAccounts)
 		mgmt.PATCH("/claude-code-account-pool/accounts/:id", s.mgmt.PatchClaudeCodeAccount)
+		mgmt.POST("/claude-code-account-pool/accounts/:id/move", s.mgmt.MoveClaudeCodeAccount)
 		mgmt.PATCH("/claude-code-account-pool/accounts/:id/capacity", s.mgmt.PatchClaudeCodeAccountCapacity)
 		mgmt.GET("/claude-code-account-pool/accounts/:id/model-status", s.mgmt.ListClaudeCodeAccountModelStatus)
 		mgmt.DELETE("/claude-code-account-pool/accounts/:id", s.mgmt.DeleteClaudeCodeAccount)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/test", s.mgmt.TestClaudeCodeAccount)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/token/refresh", s.mgmt.RefreshClaudeCodeAccountToken)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/quota/refresh", s.mgmt.RefreshClaudeCodeAccountQuota)
+		mgmt.POST("/claude-code-account-pool/accounts/:id/recheck", s.mgmt.RecheckClaudeCodeAccount)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/bind-proxy", s.mgmt.BindClaudeCodeAccountProxy)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/unbind-proxy", s.mgmt.UnbindClaudeCodeAccountProxy)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/reset-cooling", s.mgmt.ResetClaudeCodeAccountCooling)
 		mgmt.GET("/claude-code-account-pool/auth-url", s.mgmt.RequestClaudeCodeAccountPoolAuthURL)
+		mgmt.POST("/claude-code-account-pool/session-key-jobs", s.mgmt.CreateSessionKeyJob)
+		mgmt.GET("/claude-code-account-pool/session-key-jobs/current", s.mgmt.GetCurrentSessionKeyJob)
+		mgmt.GET("/claude-code-account-pool/session-key-jobs/:id", s.mgmt.GetSessionKeyJob)
+		mgmt.POST("/claude-code-account-pool/session-key-jobs/:id/cancel", s.mgmt.CancelSessionKeyJob)
 
 		mgmt.GET("/codex-api-key", s.mgmt.GetCodexKeys)
 		mgmt.PUT("/codex-api-key", s.mgmt.PutCodexKeys)

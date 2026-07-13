@@ -131,6 +131,9 @@ func (s *Service) SyncResourcePoolAuths(ctx context.Context) error {
 		}
 		return nil
 	}
+	if err := resourcepool.ApplyClaudeCodePoolRuntimeConfig(ctx, configPath, cfg); err != nil {
+		return err
+	}
 	auths, err := resourcepool.ListStoredAuths(ctx, configPath, cfg)
 	if err != nil {
 		return err

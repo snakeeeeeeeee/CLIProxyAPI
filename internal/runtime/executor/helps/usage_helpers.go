@@ -660,12 +660,16 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
 	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
+	cacheCreation5mTokens := usageNode.Get("cache_creation.ephemeral_5m_input_tokens").Int()
+	cacheCreation1hTokens := usageNode.Get("cache_creation.ephemeral_1h_input_tokens").Int()
 	detail := usage.Detail{
-		InputTokens:         usageNode.Get("input_tokens").Int(),
-		OutputTokens:        usageNode.Get("output_tokens").Int(),
-		CachedTokens:        cacheReadTokens,
-		CacheReadTokens:     cacheReadTokens,
-		CacheCreationTokens: cacheCreationTokens,
+		InputTokens:           usageNode.Get("input_tokens").Int(),
+		OutputTokens:          usageNode.Get("output_tokens").Int(),
+		CachedTokens:          cacheReadTokens,
+		CacheReadTokens:       cacheReadTokens,
+		CacheCreationTokens:   cacheCreationTokens,
+		CacheCreation5mTokens: cacheCreation5mTokens,
+		CacheCreation1hTokens: cacheCreation1hTokens,
 	}
 	if detail.CachedTokens == 0 {
 		detail.CachedTokens = detail.CacheCreationTokens

@@ -21,9 +21,36 @@ var scopedRoutingPolicies = map[string]EffectiveRoutingConfig{}
 var routingPolicyMu sync.RWMutex
 
 type poolRouter struct {
-	mu            sync.Mutex
-	states        map[string]*routeState
-	accountStates map[string]*routeState
+	mu             sync.Mutex
+	states         map[string]*routeState
+	accountStates  map[string]*routeState
+	sessions       map[string]*sessionBinding
+	activeSessions map[string]*activeSession
+	lastSelected   map[string]time.Time
+	waiters        map[string]int
+	proxyCooling   map[string]time.Time
+	headrooms      map[string]map[string]headroomSnapshot
+	globalWaiters  int
+	changed        chan struct{}
+}
+
+type sessionBinding struct {
+	AuthID    string
+	ExpiresAt time.Time
+}
+
+type activeSession struct {
+	AuthID    string
+	ExpiresAt time.Time
+}
+
+type headroomSnapshot struct {
+	Value       float64
+	UsedPercent float64
+	Band        string
+	Window      string
+	ResetAt     time.Time
+	ExpiresAt   time.Time
 }
 
 type routeState struct {
@@ -32,24 +59,35 @@ type routeState struct {
 	CoolingUntil   time.Time
 	RateLimitLevel int
 	OverloadLevel  int
+	ManualBlocked  bool
 	UpdatedAt      time.Time
 }
 
 // RouteLease releases one in-flight pool route slot.
 type RouteLease struct {
-	router *poolRouter
-	key    string
-	once   sync.Once
+	router    *poolRouter
+	key       string
+	model     string
+	policy    EffectiveRoutingConfig
+	selection AccountRouteSelection
+	attempts  int
+	once      sync.Once
 }
 
 // RouteStatus summarizes local pool route state for one auth/model.
 type RouteStatus struct {
-	InFlight    int64     `json:"in_flight"`
-	RPMUsed     int       `json:"rpm_used"`
-	RPMLimit    int       `json:"rpm_limit"`
-	Cooling     bool      `json:"cooling"`
-	CoolingTo   time.Time `json:"cooling_until,omitempty"`
-	Unavailable bool      `json:"unavailable"`
+	InFlight          int64     `json:"in_flight"`
+	RPMUsed           int       `json:"rpm_used"`
+	RPMLimit          int       `json:"rpm_limit"`
+	ActiveSessions    int       `json:"active_sessions"`
+	MaxSessions       int       `json:"max_sessions"`
+	Waiters           int       `json:"waiters"`
+	Cooling           bool      `json:"cooling"`
+	AccountCooling    bool      `json:"account_cooling"`
+	ModelCooling      bool      `json:"model_cooling"`
+	ModelCoolingCount int       `json:"model_cooling_count"`
+	CoolingTo         time.Time `json:"cooling_until,omitempty"`
+	Unavailable       bool      `json:"unavailable"`
 }
 
 // SetRoutingConfig updates the runtime policy used by future pool routing.
@@ -106,6 +144,20 @@ func SetScopedRoutingConfig(scope string, cfg EffectiveRoutingConfig) {
 		scopedRoutingPolicies = make(map[string]EffectiveRoutingConfig)
 	}
 	scopedRoutingPolicies[scope] = normalizeEffectiveRoutingConfig(cfg)
+	for childScope := range scopedRoutingPolicies {
+		if strings.HasPrefix(childScope, scope+"/") {
+			scopedRoutingPolicies[childScope] = scopedRoutingPolicies[scope]
+			if childRouter := scopedRouters[childScope]; childRouter != nil {
+				childRouter.mu.Lock()
+				childRouter.signalChangedLocked()
+				childRouter.mu.Unlock()
+			}
+		}
+	}
+	router := scopedRouters[scope]
+	router.mu.Lock()
+	router.signalChangedLocked()
+	router.mu.Unlock()
 }
 
 // CurrentScopedRoutingConfig returns a named pool policy, falling back to the default pool policy.
@@ -120,8 +172,32 @@ func CurrentScopedRoutingConfig(scope string) EffectiveRoutingConfig {
 		if cfg, ok := scopedRoutingPolicies[scope]; ok {
 			return cfg
 		}
+		for parent := parentRoutingScope(scope); parent != ""; parent = parentRoutingScope(parent) {
+			if cfg, ok := scopedRoutingPolicies[parent]; ok {
+				return cfg
+			}
+		}
 	}
 	return defaultRoutingPolicy
+}
+
+// RemoveScopedRoutingScope drops an archived pool's policy and in-memory routing state.
+// Existing leases retain their router pointer and can still release normally.
+func RemoveScopedRoutingScope(scope string) {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return
+	}
+	routingPolicyMu.Lock()
+	defer routingPolicyMu.Unlock()
+	delete(scopedRoutingPolicies, scope)
+	delete(scopedRouters, scope)
+	for childScope := range scopedRoutingPolicies {
+		if strings.HasPrefix(childScope, scope+"/") {
+			delete(scopedRoutingPolicies, childScope)
+			delete(scopedRouters, childScope)
+		}
+	}
 }
 
 func scopedRouterAndPolicy(scope string) (*poolRouter, EffectiveRoutingConfig) {
@@ -136,7 +212,31 @@ func scopedRouterAndPolicy(scope string) (*poolRouter, EffectiveRoutingConfig) {
 	if router != nil && ok {
 		return router, policy
 	}
-	return defaultRouting, CurrentRoutingConfig()
+	routingPolicyMu.Lock()
+	defer routingPolicyMu.Unlock()
+	if router = scopedRouters[scope]; router == nil {
+		router = newPoolRouter()
+		scopedRouters[scope] = router
+	}
+	if policy, ok = scopedRoutingPolicies[scope]; !ok {
+		policy = defaultRoutingPolicy
+		for parent := parentRoutingScope(scope); parent != ""; parent = parentRoutingScope(parent) {
+			if parentPolicy, exists := scopedRoutingPolicies[parent]; exists {
+				policy = parentPolicy
+				break
+			}
+		}
+		scopedRoutingPolicies[scope] = policy
+	}
+	return router, policy
+}
+
+func parentRoutingScope(scope string) string {
+	scope = strings.Trim(strings.TrimSpace(scope), "/")
+	if index := strings.LastIndex(scope, "/"); index > 0 {
+		return scope[:index]
+	}
+	return ""
 }
 
 // TryAcquireRoute reserves local capacity for one upstream pool request.
@@ -164,8 +264,8 @@ func TryAcquireScopedRouteWithPolicyOptions(scope, authID, model string, overrid
 	if override.PerAccountConcurrency > 0 {
 		policy.PerAccountConcurrency = override.PerAccountConcurrency
 	}
-	if override.StickyBuffer > 0 {
-		policy.StickyBuffer = override.StickyBuffer
+	if override.StickyConcurrencyReserve > 0 {
+		policy.StickyConcurrencyReserve = override.StickyConcurrencyReserve
 	}
 	return router.tryAcquire(authID, model, policy, sticky, time.Now())
 }
@@ -186,6 +286,18 @@ func RouteStatusFor(authID, model string) RouteStatus {
 	return defaultRouting.status(authID, model, CurrentRoutingConfig(), time.Now())
 }
 
+// ScopedRouteStatusFor returns local route pressure for one auth/model in a named pool.
+func ScopedRouteStatusFor(scope, authID, model string) RouteStatus {
+	router, policy := scopedRouterAndPolicy(scope)
+	return router.status(authID, model, policy, time.Now())
+}
+
+// ScopedRouteStatusForWithPolicy returns model-aware pressure using a per-auth capacity override.
+func ScopedRouteStatusForWithPolicy(scope, authID, model string, override EffectiveRoutingConfig) RouteStatus {
+	router, policy := scopedRouterAndPolicy(scope)
+	return router.status(authID, model, mergeRoutingOverride(policy, override), time.Now())
+}
+
 // AggregateRouteStatus returns local route pressure across all models for one auth.
 func AggregateRouteStatus(authID string) RouteStatus {
 	return defaultRouting.aggregateStatus(authID, CurrentRoutingConfig(), time.Now())
@@ -200,18 +312,52 @@ func AggregateScopedRouteStatus(scope, authID string) RouteStatus {
 // AggregateScopedRouteStatusWithPolicy returns route pressure using a per-auth policy override.
 func AggregateScopedRouteStatusWithPolicy(scope, authID string, override EffectiveRoutingConfig) RouteStatus {
 	router, policy := scopedRouterAndPolicy(scope)
-	if override.PerAccountRPM > 0 {
-		policy.PerAccountRPM = override.PerAccountRPM
-	}
-	if override.PerAccountConcurrency > 0 {
-		policy.PerAccountConcurrency = override.PerAccountConcurrency
-	}
-	return router.aggregateStatus(authID, policy, time.Now())
+	return router.aggregateStatus(authID, mergeRoutingOverride(policy, override), time.Now())
 }
 
 // ResetRouteCooling clears local pool limiter/cooldown state.
 func ResetRouteCooling(authID string) {
 	defaultRouting.reset(authID)
+}
+
+// ResetScopedRouteCooling clears limiter and cooldown state in one named pool.
+func ResetScopedRouteCooling(scope, authID string) {
+	router, _ := scopedRouterAndPolicy(scope)
+	router.reset(authID)
+}
+
+// BlockScopedAccount removes an account from all model routes until recovery.
+func BlockScopedAccount(scope, authID string, cooldown time.Duration, manual bool) {
+	router, _ := scopedRouterAndPolicy(scope)
+	if router == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	state := router.ensureAccountStateLocked(accountRouteKey(authID))
+	state.ManualBlocked = manual
+	if manual {
+		state.CoolingUntil = time.Time{}
+	} else if cooldown > 0 {
+		state.CoolingUntil = time.Now().Add(cooldown)
+	}
+	state.UpdatedAt = time.Now()
+	router.signalChangedLocked()
+}
+
+// ClearScopedAccountBlock restores an account after refresh or manual recovery.
+func ClearScopedAccountBlock(scope, authID string) {
+	router, _ := scopedRouterAndPolicy(scope)
+	if router == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	state := router.ensureAccountStateLocked(accountRouteKey(authID))
+	state.ManualBlocked = false
+	state.CoolingUntil = time.Time{}
+	state.UpdatedAt = time.Now()
+	router.signalChangedLocked()
 }
 
 // CooldownForStatus returns the pool-specific cooldown for 429/529.
@@ -295,8 +441,15 @@ func ScopedSwitchDelay(scope string) time.Duration {
 
 func newPoolRouter() *poolRouter {
 	return &poolRouter{
-		states:        make(map[string]*routeState),
-		accountStates: make(map[string]*routeState),
+		states:         make(map[string]*routeState),
+		accountStates:  make(map[string]*routeState),
+		sessions:       make(map[string]*sessionBinding),
+		activeSessions: make(map[string]*activeSession),
+		lastSelected:   make(map[string]time.Time),
+		waiters:        make(map[string]int),
+		proxyCooling:   make(map[string]time.Time),
+		headrooms:      make(map[string]map[string]headroomSnapshot),
+		changed:        make(chan struct{}),
 	}
 }
 
@@ -369,7 +522,7 @@ func (r *poolRouter) tryAcquire(authID, model string, policy EffectiveRoutingCon
 		len(accountState.RecentStarts),
 		rpmLimit,
 	)
-	return &RouteLease{router: r, key: accountKey}, true
+	return &RouteLease{router: r, key: accountKey, model: strings.TrimSpace(model), policy: policy, attempts: 1}, true
 }
 
 func (r *poolRouter) noteResult(authID, model string, statusCode int, retryAfter *time.Duration, policy EffectiveRoutingConfig, now time.Time) {
@@ -466,7 +619,11 @@ func (r *poolRouter) status(authID, model string, policy EffectiveRoutingConfig,
 	if accountState != nil {
 		r.pruneRecentStartsLocked(accountState, now)
 	}
-	return statusFromRouteStates(accountState, modelState, policy, now)
+	r.pruneSessionsLocked(now)
+	status := statusFromRouteStates(accountState, modelState, policy, now)
+	status.ActiveSessions = r.activeSessionsForAuthLocked(authID)
+	status.Waiters = r.waiters[authID]
+	return status
 }
 
 func (r *poolRouter) aggregateStatus(authID string, policy EffectiveRoutingConfig, now time.Time) RouteStatus {
@@ -483,13 +640,18 @@ func (r *poolRouter) aggregateStatus(authID string, policy EffectiveRoutingConfi
 		r.pruneRecentStartsLocked(accountState, now)
 	}
 	out := statusFromRouteStates(accountState, nil, policy, now)
+	r.pruneSessionsLocked(now)
+	out.ActiveSessions = r.activeSessionsForAuthLocked(authID)
+	out.MaxSessions = policy.MaxSessions
+	out.Waiters = r.waiters[authID]
 	for key, state := range r.states {
 		if state == nil || !strings.HasPrefix(key, prefix) {
 			continue
 		}
 		if state.CoolingUntil.After(now) {
 			out.Cooling = true
-			out.Unavailable = true
+			out.ModelCooling = true
+			out.ModelCoolingCount++
 			out.CoolingTo = laterTime(out.CoolingTo, state.CoolingUntil)
 		}
 	}
@@ -515,11 +677,16 @@ func (r *poolRouter) reset(authID string) {
 	if authID == "" {
 		clear(r.states)
 		clear(r.accountStates)
+		clear(r.sessions)
+		clear(r.activeSessions)
+		clear(r.lastSelected)
+		r.signalChangedLocked()
 		return
 	}
 	prefix := authID + "\x00"
 	if state := r.accountStates[accountRouteKey(authID)]; state != nil {
 		state.CoolingUntil = time.Time{}
+		state.ManualBlocked = false
 		state.RateLimitLevel = 0
 		state.OverloadLevel = 0
 		state.RecentStarts = nil
@@ -538,6 +705,7 @@ func (r *poolRouter) reset(authID string) {
 			state.UpdatedAt = time.Now()
 		}
 	}
+	r.signalChangedLocked()
 }
 
 func (l *RouteLease) Release() {
@@ -555,6 +723,7 @@ func (l *RouteLease) Release() {
 			state.InFlight--
 		}
 		state.UpdatedAt = time.Now()
+		l.router.signalChangedLocked()
 		DebugLogf("claude api pool route released key=%s inflight=%d", debugAuthRef(l.key), state.InFlight)
 	})
 }
@@ -606,20 +775,29 @@ func (r *poolRouter) pruneRecentStartsLocked(state *routeState, now time.Time) {
 
 func statusFromRouteStates(accountState, modelState *routeState, policy EffectiveRoutingConfig, now time.Time) RouteStatus {
 	status := RouteStatus{
-		RPMLimit: routeRPMLimit(policy, true),
+		RPMLimit:    routeRPMLimit(policy, true),
+		MaxSessions: policy.MaxSessions,
 	}
 	if accountState != nil {
 		status.InFlight = accountState.InFlight
 		status.RPMUsed = len(accountState.RecentStarts)
-		if limit := routeConcurrencyLimit(policy, true); limit > 0 && accountState.InFlight >= int64(limit) {
+		if limit := routeConcurrencyLimit(policy, false); limit > 0 && accountState.InFlight >= int64(limit) {
 			status.Unavailable = true
 		}
 		if status.RPMLimit > 0 && len(accountState.RecentStarts) >= status.RPMLimit {
 			status.Unavailable = true
 		}
+		if accountState.ManualBlocked || accountState.CoolingUntil.After(now) {
+			status.Cooling = true
+			status.AccountCooling = true
+			status.Unavailable = true
+			status.CoolingTo = accountState.CoolingUntil
+		}
 	}
 	if modelState != nil && modelState.CoolingUntil.After(now) {
 		status.Cooling = true
+		status.ModelCooling = true
+		status.ModelCoolingCount = 1
 		status.Unavailable = true
 		status.CoolingTo = modelState.CoolingUntil
 	}
@@ -665,26 +843,22 @@ func cooldownForStatus(statusCode int, backoffLevel int, retryAfter *time.Durati
 
 func normalizeEffectiveRoutingConfig(cfg EffectiveRoutingConfig) EffectiveRoutingConfig {
 	normalized := EffectiveRouting(RoutingConfigFromEffective(cfg))
-	if cfg.StickyBuffer > 0 {
-		normalized.StickyBuffer = cfg.StickyBuffer
+	if cfg.StickyConcurrencyReserve > 0 {
+		normalized.StickyConcurrencyReserve = cfg.StickyConcurrencyReserve
 	}
 	return normalized
 }
 
 func routeConcurrencyLimit(policy EffectiveRoutingConfig, sticky bool) int {
 	limit := policy.PerAccountConcurrency
-	if sticky && policy.StickyBuffer > 0 {
-		limit += policy.StickyBuffer
+	if sticky && policy.StickyConcurrencyReserve > 0 {
+		limit += policy.StickyConcurrencyReserve
 	}
 	return limit
 }
 
 func routeRPMLimit(policy EffectiveRoutingConfig, sticky bool) int {
-	limit := policy.PerAccountRPM
-	if sticky && policy.StickyBuffer > 0 {
-		limit += policy.StickyBuffer
-	}
-	return limit
+	return policy.PerAccountRPM
 }
 
 func routeKey(authID, model string) string {

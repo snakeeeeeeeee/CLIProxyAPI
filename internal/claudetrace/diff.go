@@ -8,7 +8,7 @@ import (
 )
 
 // CompareTraceSets compares real Claude Code traces against account-pool traces.
-// It pairs traces by method, path, model, and stream flag, then compares each
+// It pairs traces by method, path, model, stream flag, and request kind, then compares each
 // pair in capture order. User message text hashes are intentionally ignored.
 func CompareTraceSets(realTraces, oursTraces []Trace) []DiffFinding {
 	realGroups := groupTraces(realTraces)
@@ -67,6 +67,9 @@ func CompareTracePair(realTrace, oursTrace Trace, prefix string) []DiffFinding {
 	if realTrace.Stream != oursTrace.Stream {
 		out = append(out, finding(SeverityFatal, prefix+".stream", fmt.Sprint(realTrace.Stream), fmt.Sprint(oursTrace.Stream), "stream flag differs"))
 	}
+	if realTrace.RequestKind != oursTrace.RequestKind {
+		out = append(out, finding(SeverityFatal, prefix+".request_kind", realTrace.RequestKind, oursTrace.RequestKind, "request kind differs"))
+	}
 	if realTrace.BodyShape.Model != oursTrace.BodyShape.Model {
 		out = append(out, finding(SeverityFatal, prefix+".body.model", realTrace.BodyShape.Model, oursTrace.BodyShape.Model, "model differs"))
 	}
@@ -88,12 +91,41 @@ func CompareTracePair(realTrace, oursTrace Trace, prefix string) []DiffFinding {
 	out = append(out, compareHeader(prefix, realTrace, oursTrace, "Anthropic-Beta", SeverityWarn, SeverityWarn, false)...)
 	out = append(out, compareHeader(prefix, realTrace, oursTrace, "X-Claude-Code-Session-Id", SeverityWarn, SeverityIgnoredDynamic, true)...)
 	out = append(out, compareHeader(prefix, realTrace, oursTrace, "X-Client-Request-Id", SeverityWarn, SeverityIgnoredDynamic, true)...)
+	out = append(out, compareString(prefix+".http_protocol", realTrace.HTTPProtocol, oursTrace.HTTPProtocol, SeverityWarn, "HTTP protocol differs")...)
+	out = append(out, compareString(prefix+".accept", realTrace.Accept, oursTrace.Accept, SeverityWarn, "Accept differs")...)
+	out = append(out, compareString(prefix+".accept_encoding", realTrace.AcceptEncoding, oursTrace.AcceptEncoding, SeverityWarn, "Accept-Encoding differs")...)
+	out = append(out, compareJSON(prefix+".stainless", realTrace.Stainless, oursTrace.Stainless, SeverityWarn, "Stainless tuple differs")...)
+	out = append(out, validateSessionInvariant(prefix+".real.session", realTrace.SchemaVersion, realTrace.Session)...)
+	out = append(out, validateSessionInvariant(prefix+".ours.session", oursTrace.SchemaVersion, oursTrace.Session)...)
+	if len(realTrace.RawHeaderOrder) > 0 && len(oursTrace.RawHeaderOrder) > 0 {
+		out = append(out, compareJSON(prefix+".raw_header_order", realTrace.RawHeaderOrder, oursTrace.RawHeaderOrder, SeverityWarn, "raw HTTP/1.1 header order differs")...)
+	}
+	if tlsFingerprintPresent(realTrace.TLSFingerprint) && tlsFingerprintPresent(oursTrace.TLSFingerprint) {
+		out = append(out, compareJSON(prefix+".tls_fingerprint", realTrace.TLSFingerprint, oursTrace.TLSFingerprint, SeverityWarn, "TLS fingerprint differs")...)
+	}
 
 	out = append(out, compareBodyShape(prefix, realTrace.BodyShape, oursTrace.BodyShape, mode)...)
 	if realTrace.RequestID != "" && oursTrace.RequestID != "" && realTrace.RequestID != oursTrace.RequestID {
 		out = append(out, finding(SeverityIgnoredDynamic, prefix+".response.request_id", realTrace.RequestID, oursTrace.RequestID, "upstream request ids are expected to differ"))
 	}
 	return out
+}
+
+func validateSessionInvariant(field string, schemaVersion int, invariant SessionInvariant) []DiffFinding {
+	if schemaVersion < 3 {
+		return nil
+	}
+	if invariant.HeaderPresent && invariant.MetadataPresent && !invariant.Match {
+		return []DiffFinding{finding(SeverityFatal, field, "header=metadata", "mismatch", "Session header does not match metadata.user_id.session_id")}
+	}
+	if invariant.HeaderPresent != invariant.MetadataPresent {
+		return []DiffFinding{finding(SeverityWarn, field, "both present", fmt.Sprintf("header=%v metadata=%v", invariant.HeaderPresent, invariant.MetadataPresent), "Session identity is only present in one request location")}
+	}
+	return nil
+}
+
+func tlsFingerprintPresent(value TLSFingerprint) bool {
+	return value.JA3 != "" || value.JA4 != "" || value.ALPN != ""
 }
 
 func compareHeader(prefix string, realTrace, oursTrace Trace, key, missingSeverity, mismatchSeverity string, dynamic bool) []DiffFinding {
@@ -131,6 +163,8 @@ func compareBodyShape(prefix string, realShape, oursShape BodyShape, mode string
 	}
 	out = append(out, compareString(prefix+".body.metadata_user_id_kind", realShape.MetadataUserIDKind, oursShape.MetadataUserIDKind, SeverityWarn, "metadata.user_id format differs")...)
 	out = append(out, compareString(prefix+".body.billing_block_kind", realShape.BillingBlockKind, oursShape.BillingBlockKind, SeverityFatal, "billing block format differs")...)
+	out = append(out, compareString(prefix+".body.billing_entrypoint", realShape.BillingEntrypoint, oursShape.BillingEntrypoint, SeverityFatal, "billing entrypoint differs")...)
+	out = append(out, compareBool(prefix+".body.billing_has_cch", realShape.BillingHasCCH, oursShape.BillingHasCCH, SeverityWarn, "billing CCH state differs")...)
 	out = append(out, compareInt(prefix+".body.system_block_count", realShape.SystemBlockCount, oursShape.SystemBlockCount, systemSeverity, "system block count differs")...)
 	out = append(out, compareJSON(prefix+".body.system_text_hashes", realShape.SystemTextHashes, oursShape.SystemTextHashes, systemSeverity, "system block text hashes/order differ")...)
 	out = append(out, compareInt(prefix+".body.tool_count", realShape.ToolCount, oursShape.ToolCount, toolSeverity, "tool count differs")...)
@@ -177,7 +211,17 @@ func traceGroupKey(trace Trace) string {
 		strings.TrimSpace(trace.Path),
 		model,
 		stream,
+		normalizeRequestKind(trace.RequestKind),
 	}, "|")
+}
+
+func normalizeRequestKind(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case RequestKindInteractive, RequestKindStructuredHelper, RequestKindCountTokens, RequestKindToolFollowup:
+		return strings.ToLower(strings.TrimSpace(kind))
+	default:
+		return RequestKindOther
+	}
 }
 
 func sortTraces(traces []Trace) {
@@ -196,6 +240,7 @@ func traceLabel(trace Trace) string {
 		strings.TrimSpace(trace.BodyShape.Model),
 		fmt.Sprintf("stream=%v", trace.Stream),
 		strings.TrimSpace(trace.RequestMode),
+		strings.TrimSpace(trace.RequestKind),
 		trace.CapturedAt.UTC().Format("2006-01-02T15:04:05.000000000Z"),
 	}, " ")
 }

@@ -47,6 +47,8 @@ func (h RuntimeHook) OnRouteEvent(ctx context.Context, event coreauth.RouteEvent
 		return
 	}
 	routingEvent := RoutingEvent{
+		PoolID:          account.PoolID,
+		APIKeyID:        event.APIKeyID,
 		RequestID:       event.RequestID,
 		AccountID:       account.ID,
 		AuthID:          event.AuthID,
@@ -57,6 +59,16 @@ func (h RuntimeHook) OnRouteEvent(ctx context.Context, event coreauth.RouteEvent
 		SessionKey:      event.SessionKey,
 		CapacityUsed:    event.CapacityUsed,
 		CapacityLimit:   event.CapacityLimit,
+		InFlight:        event.InFlight,
+		Concurrency:     event.Concurrency,
+		RPMUsed:         event.RPMUsed,
+		RPMLimit:        event.RPMLimit,
+		Attempt:         event.Attempt,
+		SwitchCount:     event.SwitchCount,
+		WaitMS:          event.WaitMS,
+		AffinityMode:    event.AffinityMode,
+		PrimaryHit:      event.PrimaryHit,
+		BackupLane:      event.BackupLane,
 		Decision:        event.Decision,
 		Reason:          event.Reason,
 		StatusCode:      event.StatusCode,
@@ -89,6 +101,12 @@ func (h RuntimeHook) OnRouteEvent(ctx context.Context, event coreauth.RouteEvent
 		Concurrency:     event.Concurrency,
 		RPMUsed:         event.RPMUsed,
 		RPMLimit:        event.RPMLimit,
+		Attempt:         event.Attempt,
+		SwitchCount:     event.SwitchCount,
+		WaitMS:          event.WaitMS,
+		AffinityMode:    event.AffinityMode,
+		PrimaryHit:      event.PrimaryHit,
+		BackupLane:      event.BackupLane,
 		Decision:        event.Decision,
 		Reason:          event.Reason,
 		StatusCode:      event.StatusCode,
@@ -129,7 +147,15 @@ func (h RuntimeHook) OnResult(ctx context.Context, result coreauth.Result) {
 	if !result.Success && statusCode == http.StatusOK {
 		statusCode = statusCodeFromAccountResult(false, message)
 	}
-	_ = store.MarkAccountModelResult(ctx, account.ID, result.Model, statusCode, message)
+	store.applyRuntimeHealthResult(ctx, account, statusCode, result.Success, message)
+	if result.Success {
+		_ = store.RecordAccountRuntimeError(ctx, account.ID, "")
+	}
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusPaymentRequired || statusCode == http.StatusForbidden || strings.TrimSpace(result.Model) == "" {
+		_ = store.RecordAccountRuntimeError(ctx, account.ID, message)
+	} else {
+		_ = store.MarkAccountModelResult(ctx, account.ID, result.Model, statusCode, message)
+	}
 	if !result.Success {
 		_ = WriteAccountPoolLog(ctx, h.ConfigPath, h.Config, AccountPoolLogEntry{
 			Level:      "warn",
@@ -161,6 +187,9 @@ func (p UsagePlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 	if strings.TrimSpace(record.AuthID) == "" {
 		return
 	}
+	if record.Failed && (record.Fail.StatusCode == http.StatusBadRequest || record.Fail.StatusCode == http.StatusUnprocessableEntity) {
+		return
+	}
 	store, err := Open(p.ConfigPath, p.Config)
 	if err != nil {
 		return
@@ -172,22 +201,9 @@ func (p UsagePlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 	if err != nil || account == nil {
 		return
 	}
-	inputTokens := record.Detail.InputTokens
-	doc, errConfig := store.GetConfig(ctx)
-	if errConfig == nil && doc != nil {
-		effective := EffectiveClaudeCodePool(doc.ClaudeCode)
-		if effective.Usage.CleanInputTokens {
-			overhead := effective.Usage.SystemPromptOverheadTokens
-			if calibration, errCalibration := store.GetUsageCalibration(ctx, record.Model, effective.Usage.ProfileFingerprint); errCalibration == nil && calibration != nil && calibration.Status == UsageCalibrationCalibrated {
-				overhead = calibration.OverheadTokens
-			}
-			inputTokens = CleanInputTokens(inputTokens, overhead)
-			if floor := CleanInputFloorFromContext(ctx); floor > inputTokens {
-				inputTokens = floor
-			}
-			if inputTokens > record.Detail.InputTokens {
-				inputTokens = record.Detail.InputTokens
-			}
+	if len(record.ResponseHeaders) > 0 {
+		if updated, errMerge := store.MergeAccountRateLimitHeaders(ctx, account.ID, record.ResponseHeaders); errMerge == nil && updated != nil {
+			account = updated
 		}
 	}
 	statusCode := http.StatusOK
@@ -201,23 +217,39 @@ func (p UsagePlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 	if rawTotal <= 0 {
 		rawTotal = record.Detail.InputTokens + record.Detail.OutputTokens + record.Detail.CacheReadTokens + record.Detail.CacheCreationTokens
 	}
-	_ = store.RecordUsageLedger(ctx, UsageLedgerEntry{
+	billing := coreusage.AccountPoolBillingFromContext(ctx)
+	apiKeyPreview := previewAPIKey(record.APIKey)
+	if billing.APIKeyID != "" {
+		if key, errKey := store.GetPoolAPIKey(ctx, billing.APIKeyID); errKey == nil && key != nil {
+			apiKeyPreview = key.KeyPrefix
+		}
+	}
+	entry := UsageLedgerEntry{
+		PoolID:              account.PoolID,
+		APIKeyID:            billing.APIKeyID,
 		RequestID:           logging.GetRequestID(ctx),
-		APIKeyPreview:       previewAPIKey(record.APIKey),
+		APIKeyPreview:       apiKeyPreview,
 		AccountID:           account.ID,
 		AuthID:              record.AuthID,
 		Model:               record.Model,
 		RequestedModel:      record.Alias,
 		StatusCode:          statusCode,
-		InputTokens:         inputTokens,
+		InputTokens:         record.Detail.InputTokens,
 		OutputTokens:        record.Detail.OutputTokens,
 		CacheReadTokens:     record.Detail.CacheReadTokens,
 		CacheCreationTokens: record.Detail.CacheCreationTokens,
+		CacheCreation5m:     record.Detail.CacheCreation5mTokens,
+		CacheCreation1h:     record.Detail.CacheCreation1hTokens,
 		RawInputTokens:      record.Detail.InputTokens,
 		RawTotalTokens:      rawTotal,
+		PriceVersionID:      billing.PriceVersionID,
 		Success:             !record.Failed,
 		CreatedAt:           record.RequestedAt,
-	})
+	}
+	if errPrice := store.ApplyUsagePricing(ctx, &entry); errPrice != nil {
+		entry.PricingStatus = "unpriced"
+	}
+	_ = store.RecordUsageLedger(ctx, entry)
 	level := "info"
 	event := "usage_success"
 	errorMessage := ""

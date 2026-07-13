@@ -266,6 +266,14 @@ func TestParseClaudeUsageIncludesCacheTokensInTotal(t *testing.T) {
 	}
 }
 
+func TestParseClaudeUsageIncludesCacheCreationDurations(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":11,"cache_creation_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":13,"ephemeral_1h_input_tokens":4}}}`)
+	detail := ParseClaudeUsage(data)
+	if detail.CacheCreationTokens != 17 || detail.CacheCreation5mTokens != 13 || detail.CacheCreation1hTokens != 4 {
+		t.Fatalf("cache creation detail = %+v", detail)
+	}
+}
+
 func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
 	data := []byte(`{"usage":{"input_tokens":3085,"output_tokens":253,"cache_creation_input_tokens":19514}}`)
 	detail := ParseClaudeUsage(data)

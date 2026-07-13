@@ -2,10 +2,13 @@ package resourcepool
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/tidwall/gjson"
 )
 
 func TestStoreImportsYAMLAndListsAvailableProxies(t *testing.T) {
@@ -49,6 +53,118 @@ proxies:
 	}
 }
 
+func TestOpenSerializesConcurrentNewDatabaseInitialization(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	initPath := filepath.Join(dir, "resource-pools.yaml")
+	if err := os.WriteFile(initPath, []byte("database-path: resource-pools.db\n"), 0o644); err != nil {
+		t.Fatalf("write init yaml: %v", err)
+	}
+	cfg := &config.Config{ResourcePools: config.ResourcePoolsConfig{Enabled: true, ConfigFile: "resource-pools.yaml"}}
+
+	const openers = 16
+	start := make(chan struct{})
+	stores := make(chan *Store, openers)
+	errs := make(chan error, openers)
+	var wg sync.WaitGroup
+	for range openers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			store, err := Open(configPath, cfg)
+			if err != nil {
+				errs <- err
+				return
+			}
+			stores <- store
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(stores)
+	close(errs)
+
+	for store := range stores {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	}
+	for err := range errs {
+		t.Errorf("Open() error = %v", err)
+	}
+}
+
+func TestOpenSQLiteStoreMigratesLegacyMultiPoolColumnsBeforeIndexes(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	legacyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite: %v", err)
+	}
+	legacySchema := `
+CREATE TABLE claude_code_accounts (
+	id TEXT PRIMARY KEY,
+	auth_id TEXT NOT NULL UNIQUE,
+	cloak_user_id TEXT NOT NULL DEFAULT '',
+	enabled INTEGER NOT NULL DEFAULT 1,
+	updated_at TEXT NOT NULL
+);
+CREATE TABLE claude_code_routing_events (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	account_id TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL
+);
+CREATE TABLE claude_code_usage_ledger (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	account_id TEXT NOT NULL DEFAULT '',
+	model TEXT NOT NULL DEFAULT '',
+	raw_input_tokens INTEGER NOT NULL DEFAULT 0,
+	raw_total_tokens INTEGER NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL
+);
+INSERT INTO claude_code_accounts(id, auth_id, updated_at) VALUES('account-1', 'auth-1', '2026-07-12T00:00:00Z');
+INSERT INTO claude_code_routing_events(account_id, created_at) VALUES('account-1', '2026-07-12T00:00:00Z');
+INSERT INTO claude_code_usage_ledger(account_id, model, created_at) VALUES('account-1', 'claude-sonnet-4-6', '2026-07-12T00:00:00Z');
+`
+	if _, err := legacyDB.Exec(legacySchema); err != nil {
+		_ = legacyDB.Close()
+		t.Fatalf("seed legacy sqlite: %v", err)
+	}
+	if err := legacyDB.Close(); err != nil {
+		t.Fatalf("close legacy sqlite: %v", err)
+	}
+
+	db, err := openSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("openSQLiteStore() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	for _, table := range []string{"claude_code_accounts", "claude_code_routing_events", "claude_code_usage_ledger"} {
+		var poolID string
+		if err := db.QueryRow(`SELECT pool_id FROM ` + table + ` LIMIT 1`).Scan(&poolID); err != nil {
+			t.Fatalf("read migrated %s pool id: %v", table, err)
+		}
+		if poolID != DefaultAccountPoolID {
+			t.Fatalf("migrated %s pool id = %q, want %q", table, poolID, DefaultAccountPoolID)
+		}
+	}
+
+	for _, index := range []string{
+		"idx_claude_code_accounts_pool",
+		"idx_claude_code_routing_events_pool",
+		"idx_claude_code_usage_ledger_pool",
+	} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, index).Scan(&count); err != nil {
+			t.Fatalf("inspect migrated index %s: %v", index, err)
+		}
+		if count != 1 {
+			t.Fatalf("migrated index %s count = %d, want 1", index, count)
+		}
+	}
+}
+
 func TestStoreEnforcesOneToOneBinding(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -78,6 +194,79 @@ func TestStoreEnforcesOneToOneBinding(t *testing.T) {
 	}
 }
 
+func TestProxyReservationsExcludeAndConsumeHealthyProxy(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	proxy, err := store.CreateProxy(ctx, ProxyResourceSeed{ProxyURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatalf("CreateProxy() error = %v", err)
+	}
+	if _, err := store.UpdateProxyHealth(ctx, proxy.ID, true, time.Millisecond, nil, 1); err != nil {
+		t.Fatalf("UpdateProxyHealth() error = %v", err)
+	}
+	reservations, err := store.ReserveHealthyProxies(ctx, "job-1", "session-key-login", []string{"item-1"}, 2*time.Minute)
+	if err != nil {
+		t.Fatalf("ReserveHealthyProxies() error = %v", err)
+	}
+	if len(reservations) != 1 || reservations[0].ProxyResourceID != proxy.ID {
+		t.Fatalf("reservations = %+v, want proxy %s", reservations, proxy.ID)
+	}
+	available, err := store.ListAvailableProxies(ctx)
+	if err != nil {
+		t.Fatalf("ListAvailableProxies() error = %v", err)
+	}
+	if len(available) != 0 {
+		t.Fatalf("available count = %d, want 0 while reserved", len(available))
+	}
+	if _, err := store.RegisterClaudeCodeAccount(ctx, "claude-other.json", "other@example.com", proxy.ID); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("RegisterClaudeCodeAccount() error = %v, want reserved", err)
+	}
+	account, err := store.RegisterClaudeCodeAccountWithAuthReservation(ctx, "claude-owner.json", "owner@example.com", proxy.ID, nil, "job-1", "item-1")
+	if err != nil {
+		t.Fatalf("RegisterClaudeCodeAccountWithAuthReservation() error = %v", err)
+	}
+	if account.ProxyResourceID != proxy.ID {
+		t.Fatalf("account proxy = %q, want %q", account.ProxyResourceID, proxy.ID)
+	}
+	if _, err := store.GetProxyReservation(ctx, "job-1", "item-1"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetProxyReservation() error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestProxyReservationsReleaseAndExpire(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	for _, port := range []string{"18081", "18082"} {
+		proxy, err := store.CreateProxy(ctx, ProxyResourceSeed{ProxyURL: "http://127.0.0.1:" + port})
+		if err != nil {
+			t.Fatalf("CreateProxy() error = %v", err)
+		}
+		if _, err := store.UpdateProxyHealth(ctx, proxy.ID, true, time.Millisecond, nil, 1); err != nil {
+			t.Fatalf("UpdateProxyHealth() error = %v", err)
+		}
+	}
+	reservations, err := store.ReserveHealthyProxies(ctx, "job-2", "session-key-login", []string{"item-1", "item-2", "item-3"}, 2*time.Minute)
+	if err != nil {
+		t.Fatalf("ReserveHealthyProxies() error = %v", err)
+	}
+	if len(reservations) != 2 {
+		t.Fatalf("reservation count = %d, want 2", len(reservations))
+	}
+	if err := store.ReleaseProxyReservation(ctx, "job-2", "item-1"); err != nil {
+		t.Fatalf("ReleaseProxyReservation() error = %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE proxy_reservations SET expires_at = ? WHERE owner_id = ?`, dbTime(time.Now().Add(-time.Minute)), "job-2"); err != nil {
+		t.Fatalf("expire reservation: %v", err)
+	}
+	available, err := store.ListHealthyAvailableProxies(ctx)
+	if err != nil {
+		t.Fatalf("ListHealthyAvailableProxies() error = %v", err)
+	}
+	if len(available) != 2 {
+		t.Fatalf("healthy available count = %d, want 2", len(available))
+	}
+}
+
 func TestRegisterClaudeCodeAccountGeneratesClaudeCodeUserID(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -88,6 +277,37 @@ func TestRegisterClaudeCodeAccountGeneratesClaudeCodeUserID(t *testing.T) {
 	}
 	if !strings.HasPrefix(account.CloakUserID, "user_") || !helps.IsValidUserID(account.CloakUserID) {
 		t.Fatalf("CloakUserID = %q, want Claude Code metadata.user_id format", account.CloakUserID)
+	}
+}
+
+func TestNewAccountStartsCheckingAndManualRecoveryNeedsExplicitClear(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, err := store.RegisterClaudeCodeAccount(ctx, "claude-health.json", "health@example.com", "")
+	if err != nil {
+		t.Fatalf("RegisterClaudeCodeAccount() error = %v", err)
+	}
+	if account.HealthStatus != AccountHealthChecking || account.EffectiveSchedulable {
+		t.Fatalf("new account lifecycle = %+v", account)
+	}
+	now := time.Now()
+	account, err = store.UpdateAccountHealth(ctx, account.ID, AccountHealthUpdate{Status: AccountHealthManualRecovery, Reason: "billing", CheckedAt: &now})
+	if err != nil {
+		t.Fatalf("UpdateAccountHealth(manual) error = %v", err)
+	}
+	account, err = store.UpdateAccountHealth(ctx, account.ID, AccountHealthUpdate{Status: AccountHealthHealthy, CheckedAt: &now})
+	if err != nil {
+		t.Fatalf("UpdateAccountHealth(success) error = %v", err)
+	}
+	if account.HealthStatus != AccountHealthManualRecovery {
+		t.Fatalf("ordinary success cleared manual recovery: %+v", account)
+	}
+	account, err = store.UpdateAccountHealth(ctx, account.ID, AccountHealthUpdate{Status: AccountHealthHealthy, CheckedAt: &now, AllowManualRecovery: true})
+	if err != nil {
+		t.Fatalf("UpdateAccountHealth(explicit recovery) error = %v", err)
+	}
+	if account.HealthStatus != AccountHealthHealthy {
+		t.Fatalf("explicit recovery did not clear state: %+v", account)
 	}
 }
 
@@ -446,17 +666,18 @@ func TestStoreSavesClaudeCodePoolConfig(t *testing.T) {
 	enabled := true
 	pure := false
 	clean := true
+	allowClientCacheTTL := true
 	doc, err := store.SaveClaudeCodePoolConfig(ctx, ClaudeCodePoolConfig{
-		Enabled:  &enabled,
-		PureMode: &pure,
+		Enabled:             &enabled,
+		PureMode:            &pure,
+		AllowClientCacheTTL: &allowClientCacheTTL,
 		Cloak: &config.CloakConfig{
 			Mode:           "always",
 			StrictMode:     true,
 			SensitiveWords: []string{"Claude", "Anthropic", "claude"},
 		},
 		Usage: ClaudeCodeUsageConfig{
-			CleanInputTokens:           &clean,
-			SystemPromptOverheadTokens: 1909,
+			CleanInputTokens: &clean,
 		},
 		Routing: claudeapipool.RoutingConfig{
 			PerAccountRPM:         3,
@@ -470,14 +691,17 @@ func TestStoreSavesClaudeCodePoolConfig(t *testing.T) {
 	if !effective.Enabled || effective.PureMode {
 		t.Fatalf("effective enabled/pure = %v/%v, want true/false", effective.Enabled, effective.PureMode)
 	}
+	if !effective.AllowClientCacheTTL {
+		t.Fatal("effective allow_client_cache_ttl = false, want true")
+	}
 	if effective.Cloak.Mode != "always" || !effective.Cloak.StrictMode {
 		t.Fatalf("effective cloak = %+v, want always strict", effective.Cloak)
 	}
 	if strings.Join(effective.Cloak.SensitiveWords, ",") != "Claude,Anthropic" {
 		t.Fatalf("effective cloak sensitive words = %+v, want deduped words", effective.Cloak.SensitiveWords)
 	}
-	if !effective.Usage.CleanInputTokens || effective.Usage.SystemPromptOverheadTokens != DefaultCleanInputOverheadTokens {
-		t.Fatalf("effective usage = %+v, want clean enabled with default overhead", effective.Usage)
+	if effective.Usage.CleanInputTokens || effective.Usage.SystemPromptOverheadTokens != DefaultCleanInputOverheadTokens {
+		t.Fatalf("effective usage = %+v, want pure mode to keep cleaning disabled with default overhead", effective.Usage)
 	}
 	if effective.Usage.ProfileFingerprint == "" {
 		t.Fatal("effective usage profile fingerprint is empty")
@@ -580,27 +804,18 @@ func TestStoreUsageCalibrationAndAuthOverlay(t *testing.T) {
 	}
 }
 
-func TestUsagePluginRecordsCleanInputTokens(t *testing.T) {
+func TestUsagePluginKeepsRawUsageInPureMode(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
-	clean := true
-	doc, err := store.SaveClaudeCodePoolConfig(ctx, ClaudeCodePoolConfig{
+	pure := true
+	_, err := store.SaveClaudeCodePoolConfig(ctx, ClaudeCodePoolConfig{
+		PureMode: &pure,
 		Usage: ClaudeCodeUsageConfig{
-			CleanInputTokens:           &clean,
 			SystemPromptOverheadTokens: 1909,
 		},
 	})
 	if err != nil {
 		t.Fatalf("SaveClaudeCodePoolConfig() error = %v", err)
-	}
-	fingerprint := EffectiveClaudeCodePool(doc.ClaudeCode).Usage.ProfileFingerprint
-	if _, err := store.UpsertUsageCalibration(ctx, UsageCalibration{
-		Model:              "claude-opus-4-8",
-		ProfileFingerprint: fingerprint,
-		OverheadTokens:     1909,
-		Status:             UsageCalibrationCalibrated,
-	}); err != nil {
-		t.Fatalf("UpsertUsageCalibration() error = %v", err)
 	}
 	auth := &coreauth.Auth{
 		ID:       "claude-clean@example.com.json",
@@ -622,7 +837,6 @@ func TestUsagePluginRecordsCleanInputTokens(t *testing.T) {
 		ConfigPath: store.initPath,
 		Config:     &config.Config{ResourcePools: config.ResourcePoolsConfig{Enabled: true, ConfigFile: "resource-pools.yaml"}},
 	}
-	ctx = WithCleanInputFloor(ctx, 3)
 	plugin.HandleUsage(ctx, coreusage.Record{
 		Provider: "claude",
 		Model:    "claude-opus-4-8",
@@ -630,8 +844,10 @@ func TestUsagePluginRecordsCleanInputTokens(t *testing.T) {
 		AuthID:   auth.ID,
 		APIKey:   "sk-test-abcdef123456",
 		Detail: coreusage.Detail{
-			InputTokens:  1910,
-			OutputTokens: 5,
+			InputTokens:         1910,
+			OutputTokens:        5,
+			CacheReadTokens:     15933,
+			CacheCreationTokens: 2386,
 		},
 		RequestedAt: time.Now(),
 	})
@@ -646,8 +862,11 @@ func TestUsagePluginRecordsCleanInputTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UsageSummary() error = %v", err)
 	}
-	if summary.InputTokens != 3 || summary.OutputTokens != 5 {
-		t.Fatalf("usage tokens = input %d output %d, want 3/5", summary.InputTokens, summary.OutputTokens)
+	if summary.InputTokens != 1910 || summary.OutputTokens != 5 || summary.CacheReadTokens != 15933 || summary.CacheCreationTokens != 2386 {
+		t.Fatalf("usage summary = %+v, want raw Anthropic usage", summary)
+	}
+	if summary.RawInputTokens != 1910 || summary.RawTotalTokens != 20234 {
+		t.Fatalf("raw usage summary = input %d total %d, want 1910/20234", summary.RawInputTokens, summary.RawTotalTokens)
 	}
 	if len(summary.Recent) != 1 || summary.Recent[0].AccountID != account.ID {
 		t.Fatalf("recent usage = %+v, want one row for account %s", summary.Recent, account.ID)
@@ -689,8 +908,11 @@ func TestListStoredAuthsAppliesClaudeCodePoolCloakAttributes(t *testing.T) {
 		t.Fatalf("stored auth count = %d, want 1", len(auths))
 	}
 	attrs := auths[0].Attributes
-	if attrs[claudeapipool.AttrPureMode] != "" {
-		t.Fatalf("pure mode attr = %q, want empty when disabled", attrs[claudeapipool.AttrPureMode])
+	if attrs[claudeapipool.AttrPureMode] != "false" {
+		t.Fatalf("pure mode attr = %q, want explicit false when disabled", attrs[claudeapipool.AttrPureMode])
+	}
+	if attrs[AttrAllowClientCacheTTL] != "false" {
+		t.Fatalf("allow client cache TTL attr = %q, want default false", attrs[AttrAllowClientCacheTTL])
 	}
 	if attrs[claudeapipool.AttrOAuthPool] != "true" || attrs[AttrClaudeOAuthPool] != "true" {
 		t.Fatalf("pool attrs = %+v, want oauth pool attrs", attrs)
@@ -760,6 +982,158 @@ func TestClaudeCodeProfileSnapshotPromoteDisabled(t *testing.T) {
 	}
 	if reloaded.Promoted || reloaded.PromotedAt != nil || reloaded.Status == "promoted" {
 		t.Fatalf("snapshot promoted marker = %+v, want unchanged reference snapshot", reloaded)
+	}
+}
+
+func TestPhistoryManifestJSONFindsClaudeCodeLatest(t *testing.T) {
+	page := []byte(`<!doctype html><html><body><script id="manifest" type="application/json">{"agents":[{"id":"claude-code","latest":{"version":"2.1.207"}}]}</script></body></html>`)
+	raw, err := phistoryManifestJSON(page)
+	if err != nil {
+		t.Fatalf("phistoryManifestJSON() error = %v", err)
+	}
+	if !strings.Contains(string(raw), `"version":"2.1.207"`) {
+		t.Fatalf("manifest = %s", raw)
+	}
+}
+
+func TestAccountPoolConfigV3RemovesLegacyVirtualCache(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	raw := `{"enabled":true,"virtual_cache":{"enabled":true,"hit-rate":0.95},"routing":{"per-account-rpm":6}}`
+	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_pool_json'`, raw); err != nil {
+		t.Fatalf("seed legacy config: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'account_pool_config_v3'`); err != nil {
+		t.Fatalf("delete migration marker: %v", err)
+	}
+	if err := store.migrateAccountPoolConfigV3(ctx); err != nil {
+		t.Fatalf("migrateAccountPoolConfigV3() error = %v", err)
+	}
+	var migrated string
+	if err := store.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = 'claude_code_pool_json'`).Scan(&migrated); err != nil {
+		t.Fatalf("read migrated config: %v", err)
+	}
+	if strings.Contains(migrated, "virtual_cache") || strings.Contains(migrated, "virtual-cache") {
+		t.Fatalf("migrated config still contains virtual cache: %s", migrated)
+	}
+}
+
+func TestAccountPoolPureUsageV4MakesPureModeAuthoritative(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	raw := `{"enabled":true,"pure_mode":false,"usage":{"clean_input_tokens":true,"system_prompt_overhead_tokens":1909}}`
+	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_pool_json'`, raw); err != nil {
+		t.Fatalf("seed legacy pure usage config: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'account_pool_pure_usage_v4'`); err != nil {
+		t.Fatalf("delete migration marker: %v", err)
+	}
+	if err := store.migrateAccountPoolPureUsageV4(ctx); err != nil {
+		t.Fatalf("migrateAccountPoolPureUsageV4() error = %v", err)
+	}
+	var migrated string
+	if err := store.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = 'claude_code_pool_json'`).Scan(&migrated); err != nil {
+		t.Fatalf("read migrated config: %v", err)
+	}
+	if gjson.Get(migrated, "usage.clean_input_tokens").Bool() {
+		t.Fatalf("legacy clean input flag did not follow pure mode: %s", migrated)
+	}
+}
+
+func TestBuildClaudeCodeProfileSnapshotArtifactsSeparatesStaticAndFullPrompt(t *testing.T) {
+	snapshot, err := BuildClaudeCodeProfileSnapshotArtifacts(
+		"phistory",
+		"2.1.207",
+		`{"version":"2.1.207"}`,
+		"",
+		"full dynamic prompt",
+		"stable prompt",
+		`[{"text":"stable prompt"}]`,
+	)
+	if err != nil {
+		t.Fatalf("BuildClaudeCodeProfileSnapshotArtifacts() error = %v", err)
+	}
+	if snapshot.StaticPromptLength != len("stable prompt") || snapshot.FullPromptLength != len("full dynamic prompt") {
+		t.Fatalf("snapshot lengths = static %d full %d", snapshot.StaticPromptLength, snapshot.FullPromptLength)
+	}
+	if snapshot.StaticPromptHash == "" || snapshot.FullPromptHash == "" || snapshot.StaticPromptHash == snapshot.FullPromptHash {
+		t.Fatalf("snapshot hashes = static %q full %q", snapshot.StaticPromptHash, snapshot.FullPromptHash)
+	}
+	if snapshot.NormalizedProfile == nil || snapshot.NormalizedProfile.SystemPrompt != "stable prompt" {
+		t.Fatalf("normalized profile = %+v, want stable prompt", snapshot.NormalizedProfile)
+	}
+}
+
+func TestStoreMigratesLegacyBuiltinClaudeCodeProfileWithoutDroppingData(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	auth := &coreauth.Auth{ID: "legacy-profile@example.com.json", Provider: "claude", Metadata: map[string]any{
+		"type":         "claude",
+		"email":        "legacy-profile@example.com",
+		"access_token": "token",
+	}}
+	if _, err := store.RegisterClaudeCodeAccountWithAuth(ctx, auth.ID, "legacy-profile@example.com", "", auth); err != nil {
+		t.Fatalf("RegisterClaudeCodeAccountWithAuth() error = %v", err)
+	}
+	snapshot, err := BuildClaudeCodeProfileSnapshot("phistory", "2.1.178", `{}`, "", "reference prompt")
+	if err != nil {
+		t.Fatalf("BuildClaudeCodeProfileSnapshot() error = %v", err)
+	}
+	if _, err := store.UpsertClaudeCodeProfileSnapshot(ctx, *snapshot); err != nil {
+		t.Fatalf("UpsertClaudeCodeProfileSnapshot() error = %v", err)
+	}
+	legacy := ClaudeCodeProfile{Version: "2.1.178", UpdatedFrom: "builtin-trace-baseline", Locked: true}
+	raw, _ := json.Marshal(legacy)
+	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_profile_json'`, string(raw)); err != nil {
+		t.Fatalf("write legacy profile: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_207_r2'`); err != nil {
+		t.Fatalf("delete migration marker: %v", err)
+	}
+	if err := store.migrateClaudeCodeProfileRevision(ctx); err != nil {
+		t.Fatalf("migrateClaudeCodeProfileRevision() error = %v", err)
+	}
+	doc, err := store.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig() error = %v", err)
+	}
+	if doc.Profile.Version != DefaultClaudeCodeProfileVersion || doc.Profile.Revision != DefaultClaudeCodeProfileRevision {
+		t.Fatalf("profile = %+v, want %s", doc.Profile, DefaultClaudeCodeProfileRevision)
+	}
+	accounts, err := store.ListAccounts(ctx)
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("accounts after migration = %d, err=%v", len(accounts), err)
+	}
+	snapshots, err := store.ListClaudeCodeProfileSnapshots(ctx)
+	if err != nil || len(snapshots) != 1 {
+		t.Fatalf("snapshots after migration = %d, err=%v", len(snapshots), err)
+	}
+}
+
+func TestBuiltinClaudeCodeProfileR2MigrationBoundary(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile ClaudeCodeProfile
+		want    bool
+	}{
+		{name: "legacy r1", profile: ClaudeCodeProfile{Revision: "2.1.207-r1", Version: "2.1.207", UpdatedFrom: "builtin-trace-baseline:2.1.207", Locked: true}, want: true},
+		{name: "current r2", profile: defaultClaudeCodeProfile(), want: false},
+		{name: "external profile", profile: ClaudeCodeProfile{Revision: "2.1.207-r1", Version: "2.1.207", UpdatedFrom: "manual", Locked: true}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldMigrateBuiltinClaudeCodeProfile(tt.profile); got != tt.want {
+				t.Fatalf("shouldMigrateBuiltinClaudeCodeProfile() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	profile := EffectiveClaudeCodeProfile(ClaudeCodeProfile{})
+	if profile.Revision != "2.1.207-r2" || profile.Headers["X-Stainless-Os"] != "MacOS" || profile.Headers["X-Stainless-Arch"] != "arm64" {
+		t.Fatalf("effective profile identity = revision %q platform %q/%q", profile.Revision, profile.Headers["X-Stainless-Os"], profile.Headers["X-Stainless-Arch"])
+	}
+	if len(profile.HeaderOrder) == 0 || profile.TLSJA3 == "" || profile.TLSJA4 == "" || profile.TLSALPN != "http/1.1" {
+		t.Fatalf("effective transport profile = %+v", profile)
 	}
 }
 

@@ -22,10 +22,9 @@ trace:
 claude-code-pool:
   enabled: true
   pure-mode: true
-  cloak:
-    mode: "auto"
-    strict-mode: false
-    sensitive-words: []
+  # Existing account-pool cache breakpoints default to 1h. Enable this only
+  # when downstream callers should be allowed to request an explicit 5m TTL.
+  allow-client-cache-ttl: false
   per-account-rpm: 6
   per-account-concurrency: 1
   max-switches: 2

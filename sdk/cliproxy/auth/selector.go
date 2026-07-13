@@ -555,6 +555,45 @@ func ExtractVirtualCacheSessionKey(headers http.Header, payload []byte, metadata
 	return ""
 }
 
+// ExtractAccountPoolSessionKey returns only explicit conversation identifiers
+// accepted by the Claude Code account-pool scheduler. It intentionally excludes
+// request IDs and message-content hashes.
+func ExtractAccountPoolSessionKey(headers http.Header, payload []byte, metadata map[string]any) string {
+	if len(payload) > 0 {
+		userID := strings.TrimSpace(gjson.GetBytes(payload, "metadata.user_id").String())
+		if userID != "" {
+			if matches := sessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
+				return "claude:" + matches[1]
+			}
+			if gjson.Valid(userID) && gjson.Parse(userID).IsObject() {
+				if sessionID := strings.TrimSpace(gjson.Get(userID, "session_id").String()); sessionID != "" {
+					return "claude:" + sessionID
+				}
+			}
+		}
+	}
+	if headers != nil {
+		if sessionID := strings.TrimSpace(headers.Get("X-Session-ID")); sessionID != "" {
+			return "header:" + sessionID
+		}
+		if sessionID := strings.TrimSpace(headers.Get("Session-Id")); sessionID != "" {
+			return "session:" + sessionID
+		}
+		if sessionID := strings.TrimSpace(headers.Get("X-Claude-Code-Session-Id")); sessionID != "" {
+			return "claude-header:" + sessionID
+		}
+	}
+	if len(payload) > 0 {
+		if conversationID := strings.TrimSpace(gjson.GetBytes(payload, "conversation_id").String()); conversationID != "" {
+			return "conversation:" + conversationID
+		}
+	}
+	if sessionID := strings.TrimSpace(metadataString(metadata, cliproxyexecutor.ExecutionSessionMetadataKey)); sessionID != "" {
+		return "execution:" + sessionID
+	}
+	return ""
+}
+
 func metadataUserIDVirtualCacheKey(userID string) string {
 	if gjson.Valid(userID) && gjson.Parse(userID).IsObject() {
 		parsed := gjson.Parse(userID)

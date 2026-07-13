@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
 // AuthStore routes Claude Code account-pool auth persistence to resource-pools.db
@@ -24,6 +26,16 @@ func NewAuthStore(delegate coreauth.Store, configPath string, cfg *config.Config
 	return &AuthStore{delegate: delegate, configPath: configPath, cfg: cfg}
 }
 
+// SetBaseDir forwards file-store directory configuration through the wrapper.
+func (s *AuthStore) SetBaseDir(dir string) {
+	if s == nil || s.delegate == nil {
+		return
+	}
+	if setter, ok := s.delegate.(interface{ SetBaseDir(string) }); ok {
+		setter.SetBaseDir(dir)
+	}
+}
+
 // List returns delegated auths plus SQLite-backed Claude Code account-pool auths.
 func (s *AuthStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
 	var out []*coreauth.Auth
@@ -35,13 +47,124 @@ func (s *AuthStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, items...)
+		for _, auth := range items {
+			if !isLegacyClaudeOAuthFile(auth) {
+				out = append(out, auth)
+				continue
+			}
+			migrated, errMigrate := s.migrateLegacyClaudeOAuth(ctx, auth)
+			if errMigrate != nil {
+				log.WithError(errMigrate).WithField("auth_id", auth.ID).Warn("legacy Claude OAuth migration skipped")
+				out = append(out, auth)
+				continue
+			}
+			if !migrated {
+				out = append(out, auth)
+				continue
+			}
+			if migrated && s.delegate != nil {
+				if errDelete := s.delegate.Delete(ctx, auth.ID); errDelete != nil {
+					log.WithError(errDelete).WithField("auth_id", auth.ID).Warn("legacy Claude OAuth migrated but source cleanup failed")
+				}
+			}
+		}
 	}
 	items, err := ListStoredAuths(ctx, s.configPath, s.cfg)
 	if err != nil {
 		return nil, err
 	}
-	return append(out, items...), nil
+	return mergeAuthsByID(out, items), nil
+}
+
+func (s *AuthStore) migrateLegacyClaudeOAuth(ctx context.Context, auth *coreauth.Auth) (bool, error) {
+	if s == nil || auth == nil {
+		return false, nil
+	}
+	store, err := Open(s.configPath, s.cfg)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+	doc, err := store.GetConfig(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !EffectiveClaudeCodePool(doc.ClaudeCode).Enabled {
+		return false, nil
+	}
+	migrating := auth.Clone()
+	if migrating.Attributes == nil {
+		migrating.Attributes = make(map[string]string)
+	}
+	migrating.Attributes[AttrClaudeOAuthPool] = "true"
+	migrating.Attributes[claudeapipool.AttrOAuthPool] = "true"
+	account, err := store.RegisterClaudeCodeAccountWithAuth(ctx, migrating.ID, authEmail(migrating), "", migrating)
+	if err != nil {
+		return false, fmt.Errorf("persist legacy Claude OAuth: %w", err)
+	}
+	stored, err := GetStoredAuth(ctx, s.configPath, s.cfg, account.ID)
+	if err != nil {
+		return false, fmt.Errorf("verify migrated Claude OAuth: %w", err)
+	}
+	if !hasOAuthTokens(stored) {
+		return false, fmt.Errorf("verify migrated Claude OAuth: token data is incomplete")
+	}
+	log.WithFields(log.Fields{
+		"auth_id":    migrating.ID,
+		"account_id": account.ID,
+	}).Info("legacy Claude OAuth migrated to account pool SQLite")
+	return true, nil
+}
+
+func isLegacyClaudeOAuthFile(auth *coreauth.Auth) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		return false
+	}
+	if coreauth.IsPluginVirtualAuth(auth) || isClaudeCodePoolAuth(auth) {
+		return false
+	}
+	if auth.Attributes != nil {
+		if strings.EqualFold(strings.TrimSpace(auth.Attributes[claudeapipool.AttrPool]), "true") {
+			return false
+		}
+		if backend := strings.TrimSpace(auth.Attributes[coreauth.AttributeSourceBackend]); backend != coreauth.AuthSourceFile {
+			return false
+		}
+	}
+	return hasOAuthTokens(auth)
+}
+
+func hasOAuthTokens(auth *coreauth.Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	accessToken, _ := auth.Metadata["access_token"].(string)
+	refreshToken, _ := auth.Metadata["refresh_token"].(string)
+	return strings.TrimSpace(accessToken) != "" && strings.TrimSpace(refreshToken) != ""
+}
+
+func mergeAuthsByID(groups ...[]*coreauth.Auth) []*coreauth.Auth {
+	out := make([]*coreauth.Auth, 0)
+	index := make(map[string]int)
+	for _, group := range groups {
+		for _, auth := range group {
+			if auth == nil {
+				continue
+			}
+			id := strings.TrimSpace(auth.ID)
+			if position, exists := index[id]; id != "" && exists {
+				out[position] = auth
+				continue
+			}
+			if id != "" {
+				index[id] = len(out)
+			}
+			out = append(out, auth)
+		}
+	}
+	return out
 }
 
 // Save persists pool auths to SQLite and delegates all other auths.

@@ -19,11 +19,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudetrace"
+	"golang.org/x/net/html"
 )
 
 const (
 	profileSnapshotSourcePhistory = "phistory"
-	phistoryGitHubAPIBase         = "https://api.github.com/repos/WEIFENG2333/phistory/contents/captures/claude-code"
+	phistoryHomepage              = "https://phistory.cc/"
 	phistoryRawBase               = "https://raw.githubusercontent.com/WEIFENG2333/phistory/main/captures/claude-code"
 	maxPhistoryFileBytes          = 2 << 20
 )
@@ -62,7 +64,15 @@ func (s *Store) FetchClaudeCodeProfileSnapshot(ctx context.Context, req ClaudeCo
 	if err != nil {
 		return nil, err
 	}
-	snapshot, err := BuildClaudeCodeProfileSnapshot(source, version, meta, trace, prompt)
+	staticPrompts, err := fetchPhistoryFile(ctx, version, "static-prompts.md")
+	if err != nil {
+		return nil, err
+	}
+	staticPromptsJSON, err := fetchPhistoryFile(ctx, version, "static-prompts.json")
+	if err != nil {
+		return nil, err
+	}
+	snapshot, err := BuildClaudeCodeProfileSnapshotArtifacts(source, version, meta, trace, prompt, staticPrompts, staticPromptsJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -78,19 +88,33 @@ func (s *Store) FetchClaudeCodeProfileSnapshot(ctx context.Context, req ClaudeCo
 
 // BuildClaudeCodeProfileSnapshot normalizes fetched Phistory artifacts.
 func BuildClaudeCodeProfileSnapshot(source, version, metaJSON, traceJSONL, promptMD string) (*ClaudeCodeProfileSnapshot, error) {
+	return BuildClaudeCodeProfileSnapshotArtifacts(source, version, metaJSON, traceJSONL, promptMD, "", "")
+}
+
+// BuildClaudeCodeProfileSnapshotArtifacts normalizes full and static Phistory artifacts.
+func BuildClaudeCodeProfileSnapshotArtifacts(source, version, metaJSON, traceJSONL, promptMD, staticPromptsMD, staticPromptsJSON string) (*ClaudeCodeProfileSnapshot, error) {
 	source = normalizeProfileSnapshotSource(source)
 	version = strings.TrimSpace(version)
 	if version == "" {
 		return nil, fmt.Errorf("version is required")
 	}
-	profile := normalizeProfileFromTrace(version, traceJSONL, promptMD)
+	profilePrompt := staticPromptsMD
+	if strings.TrimSpace(profilePrompt) == "" {
+		profilePrompt = promptMD
+	}
+	profile := normalizeProfileFromTrace(version, traceJSONL, profilePrompt)
 	normalizedRaw, err := json.Marshal(profile)
 	if err != nil {
 		return nil, fmt.Errorf("encode normalized profile: %w", err)
 	}
 	now := time.Now()
 	promptHash := sha256Hex([]byte(promptMD))
+	staticPromptHash := ""
+	if strings.TrimSpace(staticPromptsMD) != "" {
+		staticPromptHash = sha256Hex([]byte(staticPromptsMD))
+	}
 	traceHash := sha256Hex([]byte(traceJSONL))
+	requestKindSummary := summarizeTraceRequestKinds(traceJSONL)
 	return &ClaudeCodeProfileSnapshot{
 		ID:                    uuid.NewString(),
 		Source:                source,
@@ -99,9 +123,16 @@ func BuildClaudeCodeProfileSnapshot(source, version, metaJSON, traceJSONL, promp
 		MetaJSON:              strings.TrimSpace(metaJSON),
 		TraceJSONL:            strings.TrimSpace(traceJSONL),
 		PromptMD:              promptMD,
+		StaticPromptsMD:       staticPromptsMD,
+		StaticPromptsJSON:     strings.TrimSpace(staticPromptsJSON),
 		NormalizedProfileJSON: string(normalizedRaw),
 		NormalizedProfile:     &profile,
 		PromptHash:            promptHash,
+		StaticPromptHash:      staticPromptHash,
+		StaticPromptLength:    len(staticPromptsMD),
+		FullPromptHash:        promptHash,
+		FullPromptLength:      len(promptMD),
+		RequestKindSummary:    requestKindSummary,
 		TraceHash:             traceHash,
 		FetchedAt:             &now,
 		CreatedAt:             now,
@@ -115,7 +146,9 @@ func (s *Store) ListClaudeCodeProfileSnapshots(ctx context.Context) ([]ClaudeCod
 		return []ClaudeCodeProfileSnapshot{}, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, source, version, status, normalized_profile_json, prompt_hash, trace_hash,
+SELECT id, source, version, status, normalized_profile_json, prompt_hash,
+       static_prompt_hash, static_prompt_length, full_prompt_hash, full_prompt_length,
+       request_kind_summary_json, trace_hash,
        diff_report, fatal_count, warn_count, promoted, last_error, fetched_at,
        promoted_at, created_at, updated_at
 FROM claude_code_profile_snapshots
@@ -149,7 +182,9 @@ func (s *Store) GetClaudeCodeProfileSnapshot(ctx context.Context, id string) (*C
 	}
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, source, version, status, meta_json, trace_jsonl, prompt_md,
-       normalized_profile_json, prompt_hash, trace_hash, diff_report,
+       static_prompts_md, static_prompts_json, normalized_profile_json, prompt_hash,
+       static_prompt_hash, static_prompt_length, full_prompt_hash, full_prompt_length,
+       request_kind_summary_json, trace_hash, diff_report,
        fatal_count, warn_count, promoted, last_error, fetched_at, promoted_at,
        created_at, updated_at
 FROM claude_code_profile_snapshots
@@ -190,20 +225,32 @@ func (s *Store) UpsertClaudeCodeProfileSnapshot(ctx context.Context, snapshot Cl
 		}
 		snapshot.NormalizedProfileJSON = string(raw)
 	}
-	_, err := s.db.ExecContext(ctx, `
+	requestKindSummaryJSON, err := json.Marshal(snapshot.RequestKindSummary)
+	if err != nil {
+		return nil, fmt.Errorf("encode request-kind summary: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
 INSERT INTO claude_code_profile_snapshots(
-  id, source, version, status, meta_json, trace_jsonl, prompt_md,
-  normalized_profile_json, prompt_hash, trace_hash, diff_report,
+  id, source, version, status, meta_json, trace_jsonl, prompt_md, static_prompts_md, static_prompts_json,
+  normalized_profile_json, prompt_hash, static_prompt_hash, static_prompt_length,
+  full_prompt_hash, full_prompt_length, request_kind_summary_json, trace_hash, diff_report,
   fatal_count, warn_count, promoted, last_error, fetched_at, promoted_at,
   created_at, updated_at
-) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?)
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?)
 ON CONFLICT(source, version) DO UPDATE SET
   status = excluded.status,
   meta_json = excluded.meta_json,
   trace_jsonl = excluded.trace_jsonl,
   prompt_md = excluded.prompt_md,
+	static_prompts_md = excluded.static_prompts_md,
+	static_prompts_json = excluded.static_prompts_json,
   normalized_profile_json = excluded.normalized_profile_json,
   prompt_hash = excluded.prompt_hash,
+	static_prompt_hash = excluded.static_prompt_hash,
+	static_prompt_length = excluded.static_prompt_length,
+	full_prompt_hash = excluded.full_prompt_hash,
+	full_prompt_length = excluded.full_prompt_length,
+	request_kind_summary_json = excluded.request_kind_summary_json,
   trace_hash = excluded.trace_hash,
   diff_report = excluded.diff_report,
   fatal_count = excluded.fatal_count,
@@ -212,8 +259,9 @@ ON CONFLICT(source, version) DO UPDATE SET
   fetched_at = excluded.fetched_at,
   updated_at = excluded.updated_at
 `, snapshot.ID, snapshot.Source, snapshot.Version, strings.TrimSpace(snapshot.Status),
-		nonEmptyJSON(snapshot.MetaJSON), snapshot.TraceJSONL, snapshot.PromptMD,
-		nonEmptyJSON(snapshot.NormalizedProfileJSON), snapshot.PromptHash, snapshot.TraceHash, snapshot.DiffReport,
+		nonEmptyJSON(snapshot.MetaJSON), snapshot.TraceJSONL, snapshot.PromptMD, snapshot.StaticPromptsMD, nonEmptyJSON(snapshot.StaticPromptsJSON),
+		nonEmptyJSON(snapshot.NormalizedProfileJSON), snapshot.PromptHash, snapshot.StaticPromptHash, snapshot.StaticPromptLength,
+		snapshot.FullPromptHash, snapshot.FullPromptLength, nonEmptyJSON(string(requestKindSummaryJSON)), snapshot.TraceHash, snapshot.DiffReport,
 		snapshot.FatalCount, snapshot.WarnCount, boolInt(snapshot.Promoted), strings.TrimSpace(snapshot.LastError),
 		timePtrText(snapshot.FetchedAt), timePtrText(snapshot.PromotedAt), dbTime(snapshot.CreatedAt), dbTime(snapshot.UpdatedAt))
 	if err != nil {
@@ -228,7 +276,9 @@ func (s *Store) GetClaudeCodeProfileSnapshotBySourceVersion(ctx context.Context,
 	version = strings.TrimSpace(version)
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, source, version, status, meta_json, trace_jsonl, prompt_md,
-       normalized_profile_json, prompt_hash, trace_hash, diff_report,
+       static_prompts_md, static_prompts_json, normalized_profile_json, prompt_hash,
+       static_prompt_hash, static_prompt_length, full_prompt_hash, full_prompt_length,
+       request_kind_summary_json, trace_hash, diff_report,
        fatal_count, warn_count, promoted, last_error, fetched_at, promoted_at,
        created_at, updated_at
 FROM claude_code_profile_snapshots
@@ -286,8 +336,12 @@ func DiffClaudeCodeProfileSnapshot(current EffectiveClaudeCodeProfileConfig, sna
 	compareHeaderMap("header", current.Headers, effectiveSnapshot.Headers, addIssue)
 	compareStringSet("beta", current.Betas, effectiveSnapshot.Betas, addIssue)
 	currentPromptHash := sha256Hex([]byte(strings.TrimSpace(current.SystemPrompt)))
-	if snapshot.PromptHash != "" && currentPromptHash != snapshot.PromptHash {
-		addIssue("warn", fmt.Sprintf("system prompt hash current=%s snapshot=%s", shortHash(currentPromptHash), shortHash(snapshot.PromptHash)))
+	snapshotPromptHash := snapshot.StaticPromptHash
+	if snapshotPromptHash == "" {
+		snapshotPromptHash = snapshot.PromptHash
+	}
+	if snapshotPromptHash != "" && currentPromptHash != snapshotPromptHash {
+		addIssue("warn", fmt.Sprintf("stable prompt hash current=%s snapshot=%s", shortHash(currentPromptHash), shortHash(snapshotPromptHash)))
 	}
 	if len(diff.Issues) == 0 {
 		diff.Report = "ok: 当前 profile 与快照摘要一致"
@@ -330,35 +384,91 @@ func (s *Store) PromoteClaudeCodeProfileSnapshot(ctx context.Context, id string)
 }
 
 func fetchLatestPhistoryClaudeCodeVersion(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, phistoryGitHubAPIBase+"?ref=main", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, phistoryHomepage, nil)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
 	body, err := doProfileSnapshotHTTPRequest(req, maxPhistoryFileBytes)
 	if err != nil {
 		return "", fmt.Errorf("fetch Phistory versions: %w", err)
 	}
-	var entries []struct {
-		Name string `json:"name"`
-		Type string `json:"type"`
+	manifestRaw, err := phistoryManifestJSON(body)
+	if err != nil {
+		return "", err
 	}
-	if err := json.Unmarshal(body, &entries); err != nil {
-		return "", fmt.Errorf("decode Phistory versions: %w", err)
+	var manifest struct {
+		Agents []struct {
+			ID     string `json:"id"`
+			Latest struct {
+				Version string `json:"version"`
+			} `json:"latest"`
+		} `json:"agents"`
 	}
-	versions := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Type == "dir" && claudeCodeVersionPattern.MatchString(strings.TrimSpace(entry.Name)) {
-			versions = append(versions, strings.TrimSpace(entry.Name))
+	if err := json.Unmarshal(manifestRaw, &manifest); err != nil {
+		return "", fmt.Errorf("decode Phistory manifest: %w", err)
+	}
+	for _, agent := range manifest.Agents {
+		if agent.ID == "claude-code" && claudeCodeVersionPattern.MatchString(strings.TrimSpace(agent.Latest.Version)) {
+			return strings.TrimSpace(agent.Latest.Version), nil
 		}
 	}
-	if len(versions) == 0 {
-		return "", fmt.Errorf("no Claude Code versions found in Phistory")
+	return "", fmt.Errorf("Claude Code latest version missing from Phistory manifest")
+}
+
+func phistoryManifestJSON(page []byte) ([]byte, error) {
+	doc, err := html.Parse(bytes.NewReader(page))
+	if err != nil {
+		return nil, fmt.Errorf("parse Phistory homepage: %w", err)
 	}
-	sort.Slice(versions, func(i, j int) bool {
-		return compareSemver(versions[i], versions[j]) < 0
-	})
-	return versions[len(versions)-1], nil
+	var visit func(*html.Node) string
+	visit = func(node *html.Node) string {
+		if node.Type == html.ElementNode && node.Data == "script" {
+			for _, attr := range node.Attr {
+				if attr.Key == "id" && attr.Val == "manifest" && node.FirstChild != nil {
+					return node.FirstChild.Data
+				}
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			if value := visit(child); value != "" {
+				return value
+			}
+		}
+		return ""
+	}
+	raw := strings.TrimSpace(visit(doc))
+	if raw == "" || !json.Valid([]byte(raw)) {
+		return nil, fmt.Errorf("Phistory manifest script is missing or invalid")
+	}
+	return []byte(raw), nil
+}
+
+func summarizeTraceRequestKinds(traceJSONL string) map[string]int {
+	summary := make(map[string]int)
+	scanner := bufio.NewScanner(strings.NewReader(traceJSONL))
+	scanner.Buffer(make([]byte, 0, 64*1024), maxPhistoryFileBytes)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var entry struct {
+			Request struct {
+				Path string          `json:"path"`
+				Body json.RawMessage `json:"body"`
+			} `json:"request"`
+		}
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+		path := entry.Request.Path
+		if index := strings.IndexByte(path, '?'); index >= 0 {
+			path = path[:index]
+		}
+		kind := claudetrace.InferRequestKind(path, entry.Request.Body)
+		summary[kind]++
+	}
+	return summary
 }
 
 func fetchPhistoryFile(ctx context.Context, version, name string) (string, error) {
@@ -507,6 +617,7 @@ func scanProfileSnapshot(rows interface {
 }, full bool) (ClaudeCodeProfileSnapshot, error) {
 	var snapshot ClaudeCodeProfileSnapshot
 	var promoted int
+	var requestKindSummaryJSON string
 	var fetchedRaw, promotedRaw sql.NullString
 	var createdRaw, updatedRaw string
 	if full {
@@ -518,8 +629,15 @@ func scanProfileSnapshot(rows interface {
 			&snapshot.MetaJSON,
 			&snapshot.TraceJSONL,
 			&snapshot.PromptMD,
+			&snapshot.StaticPromptsMD,
+			&snapshot.StaticPromptsJSON,
 			&snapshot.NormalizedProfileJSON,
 			&snapshot.PromptHash,
+			&snapshot.StaticPromptHash,
+			&snapshot.StaticPromptLength,
+			&snapshot.FullPromptHash,
+			&snapshot.FullPromptLength,
+			&requestKindSummaryJSON,
 			&snapshot.TraceHash,
 			&snapshot.DiffReport,
 			&snapshot.FatalCount,
@@ -541,6 +659,11 @@ func scanProfileSnapshot(rows interface {
 			&snapshot.Status,
 			&snapshot.NormalizedProfileJSON,
 			&snapshot.PromptHash,
+			&snapshot.StaticPromptHash,
+			&snapshot.StaticPromptLength,
+			&snapshot.FullPromptHash,
+			&snapshot.FullPromptLength,
+			&requestKindSummaryJSON,
 			&snapshot.TraceHash,
 			&snapshot.DiffReport,
 			&snapshot.FatalCount,
@@ -556,6 +679,7 @@ func scanProfileSnapshot(rows interface {
 		}
 	}
 	snapshot.Promoted = promoted != 0
+	_ = json.Unmarshal([]byte(requestKindSummaryJSON), &snapshot.RequestKindSummary)
 	snapshot.FetchedAt = parseNullTime(fetchedRaw)
 	snapshot.PromotedAt = parseNullTime(promotedRaw)
 	snapshot.CreatedAt = parseDBTime(createdRaw)

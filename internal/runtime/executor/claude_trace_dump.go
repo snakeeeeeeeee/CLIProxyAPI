@@ -47,6 +47,10 @@ func (e *ClaudeExecutor) dumpClaudeAccountPoolTrace(ctx context.Context, auth *c
 	if responseErr != nil {
 		errText = responseErr.Error()
 	}
+	requestPath := ""
+	if req != nil && req.URL != nil {
+		requestPath = req.URL.Path
+	}
 	trace := claudetrace.CaptureRequest(req, claudetrace.CaptureOptions{
 		Source:            claudetrace.SourceOurs,
 		RedactUserContent: traceCfg.RedactUserContent,
@@ -56,6 +60,12 @@ func (e *ClaudeExecutor) dumpClaudeAccountPoolTrace(ctx context.Context, auth *c
 		ResponseError:     errText,
 		Stream:            stream,
 		RequestMode:       claudeAccountPoolTraceRequestMode(ctx, body),
+		RequestKind:       claudetrace.InferRequestKind(requestPath, body),
+		TLSProfile:        claudeAccountPoolTraceTLSProfile(req),
+		TLSJA3:            helps.ClaudeCodeNodeTLSJA3,
+		TLSJA4:            helps.ClaudeCodeNodeTLSJA4,
+		TLSALPN:           helps.ClaudeCodeNodeTLSALPN,
+		RawHeaderOrder:    helps.ClaudeCodeNodeHeaderOrderForAuth(auth),
 	})
 	if _, err := claudetrace.SaveTrace(traceCfg.DumpDir, trace); err != nil {
 		helps.LogWithRequestID(ctx).WithError(err).Warn("claude account-pool trace dump failed")
@@ -71,6 +81,7 @@ func (e *ClaudeExecutor) logClaudeAccountPoolOutboundShape(ctx context.Context, 
 		configPath = resourcepool.DefaultConfigFileName
 	}
 	shape := claudetrace.BuildBodyShape(body)
+	session := claudetrace.CaptureRequest(req, claudetrace.CaptureOptions{RequestBody: body}).Session
 	mode := claudeAccountPoolTraceRequestMode(ctx, body)
 	headers := http.Header{}
 	if req != nil {
@@ -87,8 +98,10 @@ func (e *ClaudeExecutor) logClaudeAccountPoolOutboundShape(ctx context.Context, 
 		proxyID = auth.Attributes[resourcepool.AttrProxyResourceID]
 	}
 	path := ""
+	httpProtocol := ""
 	if req != nil && req.URL != nil {
 		path = req.URL.Path
+		httpProtocol = req.Proto
 	}
 	entry := resourcepool.AccountPoolLogEntry{
 		Level:           "debug",
@@ -102,6 +115,8 @@ func (e *ClaudeExecutor) logClaudeAccountPoolOutboundShape(ctx context.Context, 
 		Error:           errText,
 		Details: map[string]any{
 			"mode":                   mode,
+			"request_kind":           claudetrace.InferRequestKind(path, body),
+			"profile_revision":       claudeCodeAccountPoolProfileFromAuth(auth).Revision,
 			"stream":                 stream,
 			"user_agent":             headers.Get("User-Agent"),
 			"x_app":                  headers.Get("X-App"),
@@ -110,8 +125,14 @@ func (e *ClaudeExecutor) logClaudeAccountPoolOutboundShape(ctx context.Context, 
 			"metadata_user_id_kind":  shape.MetadataUserIDKind,
 			"system_block_count":     shape.SystemBlockCount,
 			"billing_block_kind":     shape.BillingBlockKind,
+			"billing_entrypoint":     shape.BillingEntrypoint,
 			"cch_signed":             claudeAccountPoolTraceCCHSigned(body),
 			"tls_profile":            claudeAccountPoolTraceTLSProfile(req),
+			"tls_ja3":                helps.ClaudeCodeNodeTLSJA3,
+			"tls_ja4":                helps.ClaudeCodeNodeTLSJA4,
+			"tls_alpn":               helps.ClaudeCodeNodeTLSALPN,
+			"session_identity_match": session.Match,
+			"http_protocol":          httpProtocol,
 			"tool_count":             shape.ToolCount,
 			"has_thinking":           shape.HasThinking,
 			"has_context_management": shape.HasContextManagement,

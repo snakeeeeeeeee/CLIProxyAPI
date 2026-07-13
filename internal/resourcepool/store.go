@@ -13,9 +13,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -41,13 +43,72 @@ CREATE TABLE IF NOT EXISTS proxy_resources (
 	updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS claude_code_pools (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+	description TEXT NOT NULL DEFAULT '',
+	enabled INTEGER NOT NULL DEFAULT 1,
+	is_default INTEGER NOT NULL DEFAULT 0,
+	config_json TEXT NOT NULL DEFAULT '{}',
+	archived_at TEXT,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS claude_code_pool_api_keys (
+	id TEXT PRIMARY KEY,
+	pool_id TEXT NOT NULL,
+	name TEXT NOT NULL,
+	key_prefix TEXT NOT NULL,
+	key_hash TEXT NOT NULL UNIQUE,
+	key_secret TEXT NOT NULL DEFAULT '',
+	enabled INTEGER NOT NULL DEFAULT 1,
+	expires_at TEXT,
+	revoked_at TEXT,
+	last_used_at TEXT,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	FOREIGN KEY(pool_id) REFERENCES claude_code_pools(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_claude_code_pool_api_keys_pool ON claude_code_pool_api_keys(pool_id, revoked_at, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS claude_code_model_price_versions (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	revision INTEGER NOT NULL UNIQUE,
+	source TEXT NOT NULL DEFAULT 'manual',
+	note TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS claude_code_model_prices (
+	version_id INTEGER NOT NULL,
+	model_pattern TEXT NOT NULL,
+	input_per_million REAL NOT NULL DEFAULT 0,
+	output_per_million REAL NOT NULL DEFAULT 0,
+	cache_write_5m_per_million REAL NOT NULL DEFAULT 0,
+	cache_write_1h_per_million REAL NOT NULL DEFAULT 0,
+	cache_read_per_million REAL NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL,
+	PRIMARY KEY(version_id, model_pattern),
+	FOREIGN KEY(version_id) REFERENCES claude_code_model_price_versions(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_claude_code_model_prices_version ON claude_code_model_prices(version_id, model_pattern);
+
 CREATE TABLE IF NOT EXISTS claude_code_accounts (
 	id TEXT PRIMARY KEY,
+	pool_id TEXT NOT NULL DEFAULT 'default',
 	auth_id TEXT NOT NULL UNIQUE,
 	cloak_user_id TEXT NOT NULL DEFAULT '',
 	auth_json TEXT NOT NULL DEFAULT '',
 	email TEXT NOT NULL DEFAULT '',
 	enabled INTEGER NOT NULL DEFAULT 1,
+	health_status TEXT NOT NULL DEFAULT 'healthy',
+	blocked_until TEXT,
+	blocked_reason TEXT NOT NULL DEFAULT '',
+	last_health_check_at TEXT,
+	next_health_check_at TEXT,
 	priority INTEGER NOT NULL DEFAULT 0,
 	proxy_resource_id TEXT UNIQUE,
 	note TEXT NOT NULL DEFAULT '',
@@ -58,8 +119,23 @@ CREATE TABLE IF NOT EXISTS claude_code_accounts (
 	last_error TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL,
-	FOREIGN KEY(proxy_resource_id) REFERENCES proxy_resources(id) ON DELETE SET NULL
+	FOREIGN KEY(proxy_resource_id) REFERENCES proxy_resources(id) ON DELETE SET NULL,
+	FOREIGN KEY(pool_id) REFERENCES claude_code_pools(id) ON DELETE RESTRICT
 );
+
+CREATE TABLE IF NOT EXISTS proxy_reservations (
+	proxy_resource_id TEXT PRIMARY KEY,
+	owner_id TEXT NOT NULL,
+	item_id TEXT NOT NULL,
+	purpose TEXT NOT NULL,
+	expires_at TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	FOREIGN KEY(proxy_resource_id) REFERENCES proxy_resources(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_reservations_owner_item ON proxy_reservations(owner_id, item_id);
+CREATE INDEX IF NOT EXISTS idx_proxy_reservations_expiry ON proxy_reservations(expires_at);
 
 CREATE TABLE IF NOT EXISTS claude_code_account_capacity (
 	account_id TEXT PRIMARY KEY,
@@ -131,6 +207,8 @@ CREATE TABLE IF NOT EXISTS pool_events (
 
 CREATE TABLE IF NOT EXISTS claude_code_routing_events (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	pool_id TEXT NOT NULL DEFAULT 'default',
+	api_key_id TEXT NOT NULL DEFAULT '',
 	request_id TEXT NOT NULL DEFAULT '',
 	account_id TEXT NOT NULL DEFAULT '',
 	auth_id TEXT NOT NULL DEFAULT '',
@@ -153,6 +231,8 @@ CREATE INDEX IF NOT EXISTS idx_claude_code_routing_events_account ON claude_code
 
 CREATE TABLE IF NOT EXISTS claude_code_usage_ledger (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	pool_id TEXT NOT NULL DEFAULT 'default',
+	api_key_id TEXT NOT NULL DEFAULT '',
 	request_id TEXT NOT NULL DEFAULT '',
 	api_key_preview TEXT NOT NULL DEFAULT '',
 	account_id TEXT NOT NULL DEFAULT '',
@@ -164,8 +244,13 @@ CREATE TABLE IF NOT EXISTS claude_code_usage_ledger (
 	output_tokens INTEGER NOT NULL DEFAULT 0,
 	cache_read_tokens INTEGER NOT NULL DEFAULT 0,
 	cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+	cache_creation_5m_tokens INTEGER NOT NULL DEFAULT 0,
+	cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0,
 	raw_input_tokens INTEGER NOT NULL DEFAULT 0,
 	raw_total_tokens INTEGER NOT NULL DEFAULT 0,
+	price_version_id INTEGER NOT NULL DEFAULT 0,
+	price_model_pattern TEXT NOT NULL DEFAULT '',
+	pricing_status TEXT NOT NULL DEFAULT 'unpriced',
 	estimated_cost REAL NOT NULL DEFAULT 0,
 	success INTEGER NOT NULL DEFAULT 0,
 	created_at TEXT NOT NULL
@@ -197,8 +282,15 @@ CREATE TABLE IF NOT EXISTS claude_code_profile_snapshots (
 	meta_json TEXT NOT NULL DEFAULT '{}',
 	trace_jsonl TEXT NOT NULL DEFAULT '',
 	prompt_md TEXT NOT NULL DEFAULT '',
+	static_prompts_md TEXT NOT NULL DEFAULT '',
+	static_prompts_json TEXT NOT NULL DEFAULT '',
 	normalized_profile_json TEXT NOT NULL DEFAULT '{}',
 	prompt_hash TEXT NOT NULL DEFAULT '',
+	static_prompt_hash TEXT NOT NULL DEFAULT '',
+	static_prompt_length INTEGER NOT NULL DEFAULT 0,
+	full_prompt_hash TEXT NOT NULL DEFAULT '',
+	full_prompt_length INTEGER NOT NULL DEFAULT 0,
+	request_kind_summary_json TEXT NOT NULL DEFAULT '{}',
 	trace_hash TEXT NOT NULL DEFAULT '',
 	diff_report TEXT NOT NULL DEFAULT '',
 	fatal_count INTEGER NOT NULL DEFAULT 0,
@@ -222,6 +314,8 @@ type Store struct {
 	initPath string
 }
 
+var storeInitializationMu sync.Mutex
+
 // Open opens the SQLite resource pool store and performs first-run YAML import.
 func Open(configFilePath string, cfg *config.Config) (*Store, error) {
 	initPath := ResolveConfigPath(configFilePath, cfg)
@@ -236,6 +330,8 @@ func Open(configFilePath string, cfg *config.Config) (*Store, error) {
 	if !filepath.IsAbs(dbPath) {
 		dbPath = filepath.Join(filepath.Dir(initPath), dbPath)
 	}
+	storeInitializationMu.Lock()
+	defer storeInitializationMu.Unlock()
 	db, err := openSQLiteStore(dbPath)
 	if err != nil {
 		return nil, err
@@ -245,7 +341,285 @@ func Open(configFilePath string, cfg *config.Config) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.migrateAccountPoolRoutingV2(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migrateAccountPoolConfigV3(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migrateAccountPoolPureUsageV4(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migrateClaudeCodeProfileRevision(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migrateAccountLifecycleV5(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migrateMultiPoolV6(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migrateModelPricingV7(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migratePermanentPoolAPIKeysV8(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migrateAccountPoolConfigInheritanceV9(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return store, nil
+}
+
+func (s *Store) migrateMultiPoolV6(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	const marker = "account_pool_multi_pool_v6"
+	var value string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, marker).Scan(&value); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read multi-pool v6 migration marker: %w", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin multi-pool v6 migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	now := dbTime(time.Now())
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO claude_code_pools(id, name, description, enabled, is_default, created_at, updated_at)
+VALUES(?, ?, '', 1, 1, ?, ?)
+ON CONFLICT(id) DO UPDATE SET name = excluded.name, enabled = 1, is_default = 1, archived_at = NULL, updated_at = excluded.updated_at
+	`, DefaultAccountPoolID, DefaultAccountPoolID, now, now); err != nil {
+		return fmt.Errorf("ensure default account pool: %w", err)
+	}
+	for _, table := range []string{"claude_code_accounts", "claude_code_routing_events", "claude_code_usage_ledger"} {
+		if _, err := tx.ExecContext(ctx, `UPDATE `+table+` SET pool_id = ? WHERE TRIM(pool_id) = ''`, DefaultAccountPoolID); err != nil {
+			return fmt.Errorf("backfill %s pool id: %w", table, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pool_config(key, value, created_at, updated_at) VALUES(?, '1', ?, ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at`, marker, now, now); err != nil {
+		return fmt.Errorf("write multi-pool v6 migration marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit multi-pool v6 migration: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateAccountLifecycleV5(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	const marker = "account_pool_lifecycle_v5"
+	var value string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, marker).Scan(&value); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read account lifecycle v5 migration marker: %w", err)
+	}
+	doc, err := s.GetConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if doc.ClaudeCode.Routing.ActiveSessionIdleTTLMS <= 0 {
+		doc.ClaudeCode.Routing.ActiveSessionIdleTTLMS = int((5 * time.Minute) / time.Millisecond)
+	}
+	if doc.ClaudeCode.Routing.MaxWaitersPerAccount == 20 {
+		doc.ClaudeCode.Routing.MaxWaitersPerAccount = 5
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin account lifecycle v5 migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	if err := savePoolConfigTx(ctx, tx, doc); err != nil {
+		return err
+	}
+	now := dbTime(time.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pool_config(key, value, created_at, updated_at) VALUES(?, '1', ?, ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at`, marker, now, now); err != nil {
+		return fmt.Errorf("write account lifecycle v5 migration marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit account lifecycle v5 migration: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateAccountPoolConfigV3(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	const marker = "account_pool_config_v3"
+	var markerValue string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, marker).Scan(&markerValue); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read account-pool config v3 migration marker: %w", err)
+	}
+	doc, err := s.GetConfig(ctx)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin account-pool config v3 migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	if err := savePoolConfigTx(ctx, tx, doc); err != nil {
+		return err
+	}
+	now := dbTime(time.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pool_config(key, value, created_at, updated_at) VALUES(?, '1', ?, ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at`, marker, now, now); err != nil {
+		return fmt.Errorf("write account-pool config v3 migration marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit account-pool config v3 migration: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateAccountPoolPureUsageV4(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	const marker = "account_pool_pure_usage_v4"
+	var markerValue string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, marker).Scan(&markerValue); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read account-pool pure usage v4 migration marker: %w", err)
+	}
+	doc, err := s.GetConfig(ctx)
+	if err != nil {
+		return err
+	}
+	// normalizeConfigFile makes pure-mode authoritative and synchronizes the
+	// legacy clean-input field before the config is persisted.
+	normalizeConfigFile(doc)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin account-pool pure usage v4 migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	if err := savePoolConfigTx(ctx, tx, doc); err != nil {
+		return err
+	}
+	now := dbTime(time.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pool_config(key, value, created_at, updated_at) VALUES(?, '1', ?, ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at`, marker, now, now); err != nil {
+		return fmt.Errorf("write account-pool pure usage v4 migration marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit account-pool pure usage v4 migration: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateClaudeCodeProfileRevision(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	const marker = "claude_code_profile_2_1_207_r2"
+	var markerValue string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, marker).Scan(&markerValue); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read claude code profile migration marker: %w", err)
+	}
+	var rawProfile string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = 'claude_code_profile_json'`).Scan(&rawProfile); err != nil {
+		return fmt.Errorf("read claude code profile for migration: %w", err)
+	}
+	var storedProfile ClaudeCodeProfile
+	if err := json.Unmarshal([]byte(rawProfile), &storedProfile); err != nil {
+		return fmt.Errorf("decode claude code profile for migration: %w", err)
+	}
+	requiresUpgrade := shouldMigrateBuiltinClaudeCodeProfile(storedProfile)
+	doc, err := s.GetConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if requiresUpgrade {
+		doc.Profile = defaultClaudeCodeProfile()
+		if doc.ClaudeCode.Usage.SystemPromptOverheadTokens == 1909 {
+			doc.ClaudeCode.Usage.SystemPromptOverheadTokens = DefaultCleanInputOverheadTokens
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin claude code profile migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	if requiresUpgrade {
+		if err := savePoolConfigTx(ctx, tx, doc); err != nil {
+			return err
+		}
+	}
+	now := dbTime(time.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pool_config(key, value, created_at, updated_at) VALUES(?, '1', ?, ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at`, marker, now, now); err != nil {
+		return fmt.Errorf("write claude code profile migration marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit claude code profile migration: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateAccountPoolRoutingV2(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	const marker = "account_pool_routing_v2"
+	var markerValue string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, marker).Scan(&markerValue); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read account-pool routing migration marker: %w", err)
+	}
+	var rawConfig string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = 'claude_code_pool_json'`).Scan(&rawConfig); err != nil {
+		return fmt.Errorf("read account-pool routing config for migration: %w", err)
+	}
+	requiresReset := !strings.Contains(rawConfig, `"session-affinity-ttl-ms"`)
+	doc, err := s.GetConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if requiresReset {
+		doc.ClaudeCode.Routing = defaultClaudeCodeRoutingConfig()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin account-pool routing migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	if requiresReset {
+		if err := savePoolConfigTx(ctx, tx, doc); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE claude_code_account_capacity SET base_rpm = 6, concurrency_limit = 1, max_sessions = 30, sticky_buffer = 1, updated_at = ?`, dbTime(time.Now())); err != nil {
+			return fmt.Errorf("reset account-pool capacity defaults: %w", err)
+		}
+	}
+	now := dbTime(time.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pool_config(key, value, created_at, updated_at) VALUES(?, '1', ?, ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at`, marker, now, now); err != nil {
+		return fmt.Errorf("write account-pool routing migration marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit account-pool routing migration: %w", err)
+	}
+	return nil
 }
 
 // Path returns the database path.
@@ -313,6 +687,12 @@ func migrateSQLiteStore(db *sql.DB) error {
 	if db == nil {
 		return fmt.Errorf("resource pool sqlite is nil")
 	}
+	if err := ensureColumn(db, "claude_code_pool_api_keys", "key_secret", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "claude_code_pools", "config_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
+		return err
+	}
 	if err := ensureColumn(db, "claude_code_accounts", "auth_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
@@ -334,6 +714,24 @@ func migrateSQLiteStore(db *sql.DB) error {
 	if err := ensureColumn(db, "claude_code_accounts", "last_error", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := ensureColumn(db, "claude_code_accounts", "health_status", "TEXT NOT NULL DEFAULT 'healthy'"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "claude_code_accounts", "blocked_until", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "claude_code_accounts", "blocked_reason", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "claude_code_accounts", "last_health_check_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "claude_code_accounts", "next_health_check_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "claude_code_accounts", "pool_id", "TEXT NOT NULL DEFAULT 'default'"); err != nil {
+		return err
+	}
 	if _, err := db.Exec(`
 	CREATE TABLE IF NOT EXISTS claude_code_account_quota (
 		account_id TEXT PRIMARY KEY,
@@ -349,6 +747,19 @@ func migrateSQLiteStore(db *sql.DB) error {
 		return fmt.Errorf("migrate claude code account quota table: %w", err)
 	}
 	if _, err := db.Exec(`
+	CREATE TABLE IF NOT EXISTS proxy_reservations (
+		proxy_resource_id TEXT PRIMARY KEY,
+		owner_id TEXT NOT NULL,
+		item_id TEXT NOT NULL,
+		purpose TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		FOREIGN KEY(proxy_resource_id) REFERENCES proxy_resources(id) ON DELETE CASCADE
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_reservations_owner_item ON proxy_reservations(owner_id, item_id);
+	CREATE INDEX IF NOT EXISTS idx_proxy_reservations_expiry ON proxy_reservations(expires_at);
+
 	CREATE TABLE IF NOT EXISTS claude_code_account_capacity (
 		account_id TEXT PRIMARY KEY,
 		base_rpm INTEGER NOT NULL DEFAULT 6,
@@ -411,8 +822,13 @@ func migrateSQLiteStore(db *sql.DB) error {
 		output_tokens INTEGER NOT NULL DEFAULT 0,
 		cache_read_tokens INTEGER NOT NULL DEFAULT 0,
 		cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+		cache_creation_5m_tokens INTEGER NOT NULL DEFAULT 0,
+		cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0,
 		raw_input_tokens INTEGER NOT NULL DEFAULT 0,
 		raw_total_tokens INTEGER NOT NULL DEFAULT 0,
+		price_version_id INTEGER NOT NULL DEFAULT 0,
+		price_model_pattern TEXT NOT NULL DEFAULT '',
+		pricing_status TEXT NOT NULL DEFAULT 'unpriced',
 		estimated_cost REAL NOT NULL DEFAULT 0,
 		success INTEGER NOT NULL DEFAULT 0,
 		created_at TEXT NOT NULL
@@ -420,6 +836,28 @@ func migrateSQLiteStore(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_claude_code_usage_ledger_created ON claude_code_usage_ledger(created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_claude_code_usage_ledger_account ON claude_code_usage_ledger(account_id, created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_claude_code_usage_ledger_model ON claude_code_usage_ledger(model, created_at DESC);
+
+	CREATE TABLE IF NOT EXISTS claude_code_model_price_versions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		revision INTEGER NOT NULL UNIQUE,
+		source TEXT NOT NULL DEFAULT 'manual',
+		note TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS claude_code_model_prices (
+		version_id INTEGER NOT NULL,
+		model_pattern TEXT NOT NULL,
+		input_per_million REAL NOT NULL DEFAULT 0,
+		output_per_million REAL NOT NULL DEFAULT 0,
+		cache_write_5m_per_million REAL NOT NULL DEFAULT 0,
+		cache_write_1h_per_million REAL NOT NULL DEFAULT 0,
+		cache_read_per_million REAL NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY(version_id, model_pattern),
+		FOREIGN KEY(version_id) REFERENCES claude_code_model_price_versions(id) ON DELETE RESTRICT
+	);
+	CREATE INDEX IF NOT EXISTS idx_claude_code_model_prices_version ON claude_code_model_prices(version_id, model_pattern);
 
 	CREATE TABLE IF NOT EXISTS claude_code_usage_calibrations (
 		model TEXT NOT NULL,
@@ -442,8 +880,15 @@ func migrateSQLiteStore(db *sql.DB) error {
 		meta_json TEXT NOT NULL DEFAULT '{}',
 		trace_jsonl TEXT NOT NULL DEFAULT '',
 		prompt_md TEXT NOT NULL DEFAULT '',
+		static_prompts_md TEXT NOT NULL DEFAULT '',
+		static_prompts_json TEXT NOT NULL DEFAULT '',
 		normalized_profile_json TEXT NOT NULL DEFAULT '{}',
 		prompt_hash TEXT NOT NULL DEFAULT '',
+		static_prompt_hash TEXT NOT NULL DEFAULT '',
+		static_prompt_length INTEGER NOT NULL DEFAULT 0,
+		full_prompt_hash TEXT NOT NULL DEFAULT '',
+		full_prompt_length INTEGER NOT NULL DEFAULT 0,
+		request_kind_summary_json TEXT NOT NULL DEFAULT '{}',
 		trace_hash TEXT NOT NULL DEFAULT '',
 		diff_report TEXT NOT NULL DEFAULT '',
 		fatal_count INTEGER NOT NULL DEFAULT 0,
@@ -465,6 +910,69 @@ func migrateSQLiteStore(db *sql.DB) error {
 	}
 	if err := ensureColumn(db, "claude_code_usage_ledger", "raw_total_tokens", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
+	}
+	for column, definition := range map[string]string{
+		"cache_creation_5m_tokens": "INTEGER NOT NULL DEFAULT 0",
+		"cache_creation_1h_tokens": "INTEGER NOT NULL DEFAULT 0",
+		"price_version_id":         "INTEGER NOT NULL DEFAULT 0",
+		"price_model_pattern":      "TEXT NOT NULL DEFAULT ''",
+		"pricing_status":           "TEXT NOT NULL DEFAULT 'unpriced'",
+	} {
+		if err := ensureColumn(db, "claude_code_usage_ledger", column, definition); err != nil {
+			return err
+		}
+	}
+	for column, definition := range map[string]string{
+		"static_prompts_md":         "TEXT NOT NULL DEFAULT ''",
+		"static_prompts_json":       "TEXT NOT NULL DEFAULT ''",
+		"static_prompt_hash":        "TEXT NOT NULL DEFAULT ''",
+		"static_prompt_length":      "INTEGER NOT NULL DEFAULT 0",
+		"full_prompt_hash":          "TEXT NOT NULL DEFAULT ''",
+		"full_prompt_length":        "INTEGER NOT NULL DEFAULT 0",
+		"request_kind_summary_json": "TEXT NOT NULL DEFAULT '{}'",
+	} {
+		if err := ensureColumn(db, "claude_code_profile_snapshots", column, definition); err != nil {
+			return err
+		}
+	}
+	for column, definition := range map[string]string{
+		"in_flight":         "INTEGER NOT NULL DEFAULT 0",
+		"concurrency_limit": "INTEGER NOT NULL DEFAULT 0",
+		"rpm_used":          "INTEGER NOT NULL DEFAULT 0",
+		"rpm_limit":         "INTEGER NOT NULL DEFAULT 0",
+		"attempt":           "INTEGER NOT NULL DEFAULT 0",
+		"switch_count":      "INTEGER NOT NULL DEFAULT 0",
+		"wait_ms":           "INTEGER NOT NULL DEFAULT 0",
+		"affinity_mode":     "TEXT NOT NULL DEFAULT ''",
+		"primary_hit":       "INTEGER NOT NULL DEFAULT 0",
+		"backup_lane":       "INTEGER NOT NULL DEFAULT 0",
+	} {
+		if err := ensureColumn(db, "claude_code_routing_events", column, definition); err != nil {
+			return err
+		}
+	}
+	for table, columns := range map[string]map[string]string{
+		"claude_code_routing_events": {
+			"pool_id":    "TEXT NOT NULL DEFAULT 'default'",
+			"api_key_id": "TEXT NOT NULL DEFAULT ''",
+		},
+		"claude_code_usage_ledger": {
+			"pool_id":    "TEXT NOT NULL DEFAULT 'default'",
+			"api_key_id": "TEXT NOT NULL DEFAULT ''",
+		},
+	} {
+		for column, definition := range columns {
+			if err := ensureColumn(db, table, column, definition); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := db.Exec(`
+CREATE INDEX IF NOT EXISTS idx_claude_code_accounts_pool ON claude_code_accounts(pool_id, enabled, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_claude_code_routing_events_pool ON claude_code_routing_events(pool_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_claude_code_usage_ledger_pool ON claude_code_usage_ledger(pool_id, created_at DESC);
+	`); err != nil {
+		return fmt.Errorf("create multi-pool indexes: %w", err)
 	}
 	return nil
 }
@@ -834,6 +1342,11 @@ func (s *Store) ListAvailableProxies(ctx context.Context) ([]ProxyResource, erro
 	return s.listProxies(ctx, "available")
 }
 
+// ListHealthyAvailableProxies returns proxies eligible for SessionKey login.
+func (s *Store) ListHealthyAvailableProxies(ctx context.Context) ([]ProxyResource, error) {
+	return s.listProxies(ctx, "healthy_available")
+}
+
 // ListEnabledProxiesForHealth returns all enabled proxies for health checking.
 func (s *Store) ListEnabledProxiesForHealth(ctx context.Context) ([]ProxyResource, error) {
 	return s.listProxies(ctx, "enabled")
@@ -846,16 +1359,21 @@ func (s *Store) listProxies(ctx context.Context, mode string) ([]ProxyResource, 
 	where := ""
 	switch mode {
 	case "available":
-		where = `WHERE p.enabled = 1 AND (p.health_status = 'healthy' OR p.health_status = 'unknown') AND a.id IS NULL`
+		where = `WHERE p.enabled = 1 AND (p.health_status = 'healthy' OR p.health_status = 'unknown') AND a.id IS NULL AND r.proxy_resource_id IS NULL`
+	case "healthy_available":
+		where = `WHERE p.enabled = 1 AND p.health_status = 'healthy' AND a.id IS NULL AND r.proxy_resource_id IS NULL`
 	case "enabled":
 		where = `WHERE p.enabled = 1`
 	}
+	now := dbTime(time.Now())
 	rows, err := s.db.QueryContext(ctx, `
 SELECT p.id, p.name, p.proxy_url, p.exit_ip, p.enabled, p.health_status, p.latency_ms,
        p.consecutive_failures, p.last_checked_at, p.last_error, p.tags_json, p.note,
-       p.created_at, p.updated_at, COALESCE(a.id, ''), COALESCE(a.email, '')
+       p.created_at, p.updated_at, COALESCE(a.id, ''), COALESCE(a.email, ''),
+	   CASE WHEN r.proxy_resource_id IS NULL THEN 0 ELSE 1 END, r.expires_at
 FROM proxy_resources p
 LEFT JOIN claude_code_accounts a ON a.proxy_resource_id = p.id
+LEFT JOIN proxy_reservations r ON r.proxy_resource_id = p.id AND r.expires_at > ?
 `+where+`
 ORDER BY
   CASE
@@ -867,7 +1385,7 @@ ORDER BY
   END,
   p.updated_at DESC,
   p.name ASC
-`)
+`, now)
 	if err != nil {
 		return nil, fmt.Errorf("list proxy resources: %w", err)
 	}
@@ -897,11 +1415,13 @@ func (s *Store) GetProxy(ctx context.Context, id string) (*ProxyResource, error)
 	rows, err := s.db.QueryContext(ctx, `
 SELECT p.id, p.name, p.proxy_url, p.exit_ip, p.enabled, p.health_status, p.latency_ms,
        p.consecutive_failures, p.last_checked_at, p.last_error, p.tags_json, p.note,
-       p.created_at, p.updated_at, COALESCE(a.id, ''), COALESCE(a.email, '')
+       p.created_at, p.updated_at, COALESCE(a.id, ''), COALESCE(a.email, ''),
+	   CASE WHEN r.proxy_resource_id IS NULL THEN 0 ELSE 1 END, r.expires_at
 FROM proxy_resources p
 LEFT JOIN claude_code_accounts a ON a.proxy_resource_id = p.id
+LEFT JOIN proxy_reservations r ON r.proxy_resource_id = p.id AND r.expires_at > ?
 WHERE p.id = ?
-`, id)
+`, dbTime(time.Now()), id)
 	if err != nil {
 		return nil, fmt.Errorf("get proxy resource: %w", err)
 	}
@@ -988,6 +1508,13 @@ func (s *Store) DeleteProxy(ctx context.Context, id string) error {
 		return fmt.Errorf("begin delete proxy: %w", err)
 	}
 	defer rollbackUnlessCommitted(tx)
+	var reserved int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM proxy_reservations WHERE proxy_resource_id = ? AND expires_at > ?`, id, dbTime(time.Now())).Scan(&reserved); err != nil {
+		return fmt.Errorf("check proxy reservation before delete: %w", err)
+	}
+	if reserved > 0 {
+		return fmt.Errorf("proxy resource is reserved")
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE claude_code_accounts SET proxy_resource_id = NULL, updated_at = ? WHERE proxy_resource_id = ?`, dbTime(time.Now()), id); err != nil {
 		return fmt.Errorf("unbind proxy before delete: %w", err)
 	}
@@ -1073,12 +1600,33 @@ WHERE id = ?
 
 // RegisterClaudeCodeAccount creates or updates a Claude Code OAuth account row.
 func (s *Store) RegisterClaudeCodeAccount(ctx context.Context, authID, email, proxyResourceID string) (*ClaudeCodeAccount, error) {
-	return s.RegisterClaudeCodeAccountWithAuth(ctx, authID, email, proxyResourceID, nil)
+	return s.RegisterClaudeCodeAccountInPool(ctx, DefaultAccountPoolID, authID, email, proxyResourceID)
+}
+
+// RegisterClaudeCodeAccountInPool creates or updates an account in one explicit pool.
+func (s *Store) RegisterClaudeCodeAccountInPool(ctx context.Context, poolID, authID, email, proxyResourceID string) (*ClaudeCodeAccount, error) {
+	return s.RegisterClaudeCodeAccountWithAuthInPool(ctx, poolID, authID, email, proxyResourceID, nil)
 }
 
 // RegisterClaudeCodeAccountWithAuth creates or updates a Claude Code OAuth account row
 // and optionally persists the complete flattened auth JSON in SQLite.
 func (s *Store) RegisterClaudeCodeAccountWithAuth(ctx context.Context, authID, email, proxyResourceID string, auth *coreauth.Auth) (*ClaudeCodeAccount, error) {
+	return s.RegisterClaudeCodeAccountWithAuthInPool(ctx, DefaultAccountPoolID, authID, email, proxyResourceID, auth)
+}
+
+// RegisterClaudeCodeAccountWithAuthInPool persists an auth in one explicit pool.
+func (s *Store) RegisterClaudeCodeAccountWithAuthInPool(ctx context.Context, poolID, authID, email, proxyResourceID string, auth *coreauth.Auth) (*ClaudeCodeAccount, error) {
+	return s.RegisterClaudeCodeAccountWithAuthReservationInPool(ctx, poolID, authID, email, proxyResourceID, auth, "", "")
+}
+
+// RegisterClaudeCodeAccountWithAuthReservation registers an account and consumes its matching proxy reservation.
+func (s *Store) RegisterClaudeCodeAccountWithAuthReservation(ctx context.Context, authID, email, proxyResourceID string, auth *coreauth.Auth, reservationOwner, reservationItem string) (*ClaudeCodeAccount, error) {
+	return s.RegisterClaudeCodeAccountWithAuthReservationInPool(ctx, DefaultAccountPoolID, authID, email, proxyResourceID, auth, reservationOwner, reservationItem)
+}
+
+// RegisterClaudeCodeAccountWithAuthReservationInPool registers an account in one pool and consumes its matching proxy reservation.
+func (s *Store) RegisterClaudeCodeAccountWithAuthReservationInPool(ctx context.Context, poolID, authID, email, proxyResourceID string, auth *coreauth.Auth, reservationOwner, reservationItem string) (*ClaudeCodeAccount, error) {
+	poolID = normalizeAccountPoolID(poolID)
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return nil, fmt.Errorf("auth id is required")
@@ -1094,28 +1642,42 @@ func (s *Store) RegisterClaudeCodeAccountWithAuth(ctx context.Context, authID, e
 		return nil, fmt.Errorf("begin register claude code account: %w", err)
 	}
 	defer rollbackUnlessCommitted(tx)
+	var poolArchived sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT archived_at FROM claude_code_pools WHERE id = ?`, poolID).Scan(&poolArchived); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("account pool %q not found", poolID)
+		}
+		return nil, fmt.Errorf("read claude code account pool: %w", err)
+	}
+	if poolArchived.Valid {
+		return nil, ErrAccountPoolArchived
+	}
 	accountID := ""
-	err = tx.QueryRowContext(ctx, `SELECT id FROM claude_code_accounts WHERE auth_id = ?`, authID).Scan(&accountID)
+	existingPoolID := ""
+	err = tx.QueryRowContext(ctx, `SELECT id, pool_id FROM claude_code_accounts WHERE auth_id = ?`, authID).Scan(&accountID, &existingPoolID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("read claude code account by auth: %w", err)
+	}
+	if err == nil && normalizeAccountPoolID(existingPoolID) != poolID {
+		return nil, fmt.Errorf("%w: account is in pool %q", ErrAccountInOtherPool, normalizeAccountPoolID(existingPoolID))
 	}
 	now := time.Now()
 	if errors.Is(err, sql.ErrNoRows) {
 		accountID = uuid.NewString()
 		if proxyResourceID != "" {
-			if err := assertProxyBindableTx(ctx, tx, accountID, proxyResourceID); err != nil {
+			if err := assertProxyBindableTx(ctx, tx, accountID, proxyResourceID, reservationOwner, reservationItem); err != nil {
 				return nil, err
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO claude_code_accounts(id, auth_id, cloak_user_id, auth_json, email, enabled, priority, proxy_resource_id, excluded_models_json, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, 1, 0, NULLIF(?, ''), '[]', ?, ?)
-`, accountID, authID, generateClaudeCodeCloakUserID(), authJSON, email, proxyResourceID, dbTime(now), dbTime(now)); err != nil {
+INSERT INTO claude_code_accounts(id, pool_id, auth_id, cloak_user_id, auth_json, email, enabled, health_status, next_health_check_at, priority, proxy_resource_id, excluded_models_json, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?, 0, NULLIF(?, ''), '[]', ?, ?)
+`, accountID, poolID, authID, generateClaudeCodeCloakUserID(), authJSON, email, AccountHealthChecking, dbTime(now), proxyResourceID, dbTime(now), dbTime(now)); err != nil {
 			return nil, mapSQLiteConstraintError(err, "claude code account")
 		}
 	} else {
 		if proxyResourceID != "" {
-			if err := assertProxyBindableTx(ctx, tx, accountID, proxyResourceID); err != nil {
+			if err := assertProxyBindableTx(ctx, tx, accountID, proxyResourceID, reservationOwner, reservationItem); err != nil {
 				return nil, err
 			}
 		}
@@ -1124,20 +1686,38 @@ UPDATE claude_code_accounts
 SET email = CASE WHEN ? = '' THEN email ELSE ? END,
     auth_json = CASE WHEN ? = '' THEN auth_json ELSE ? END,
     enabled = 1,
+    health_status = ?,
+    blocked_until = NULL,
+    blocked_reason = '',
+    next_health_check_at = ?,
     proxy_resource_id = CASE WHEN ? = '' THEN proxy_resource_id ELSE ? END,
     updated_at = ?
 WHERE id = ?
-`, email, email, authJSON, authJSON, proxyResourceID, proxyResourceID, dbTime(now), accountID); err != nil {
+`, email, email, authJSON, authJSON, AccountHealthChecking, dbTime(now), proxyResourceID, proxyResourceID, dbTime(now), accountID); err != nil {
 			return nil, mapSQLiteConstraintError(err, "claude code account")
 		}
 	}
-	if err := insertEventTx(ctx, tx, "account.register", "claude code account registered", map[string]string{"account_id": accountID, "auth_id": authID}); err != nil {
+	if proxyResourceID != "" && reservationOwner != "" {
+		res, errDelete := tx.ExecContext(ctx, `DELETE FROM proxy_reservations WHERE proxy_resource_id = ? AND owner_id = ? AND item_id = ?`, proxyResourceID, reservationOwner, reservationItem)
+		if errDelete != nil {
+			return nil, fmt.Errorf("consume proxy reservation: %w", errDelete)
+		}
+		affected, _ := res.RowsAffected()
+		if affected == 0 {
+			return nil, fmt.Errorf("proxy reservation expired or does not match")
+		}
+	}
+	if err := insertEventTx(ctx, tx, "account.register", "claude code account registered", map[string]string{"account_id": accountID, "auth_id": authID, "pool_id": poolID}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit register claude code account: %w", err)
 	}
-	return s.GetAccount(ctx, accountID)
+	registered, err := s.GetAccount(ctx, accountID)
+	if err == nil {
+		ApplyAccountLifecycleRouting(registered)
+	}
+	return registered, err
 }
 
 // SaveClaudeCodeAccountAuth updates the flattened auth JSON for a pool account.
@@ -1247,9 +1827,16 @@ func generateClaudeCodeCloakUserID() string {
 
 // ListAccounts returns all Claude Code account rows.
 func (s *Store) ListAccounts(ctx context.Context) ([]ClaudeCodeAccount, error) {
+	return s.ListAccountsByPool(ctx, "")
+}
+
+// ListAccountsByPool returns all accounts or only members of one pool.
+func (s *Store) ListAccountsByPool(ctx context.Context, poolID string) ([]ClaudeCodeAccount, error) {
+	poolID = strings.TrimSpace(poolID)
 	rows, err := s.db.QueryContext(ctx, `
-SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
-       a.email, a.enabled, a.priority, COALESCE(a.proxy_resource_id, ''),
+SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
+       a.email, a.enabled, a.health_status, a.blocked_until, a.blocked_reason, a.last_health_check_at, a.next_health_check_at,
+       a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
        q.status, q.windows_json, q.raw_json, q.last_error, q.checked_at,
@@ -1259,8 +1846,9 @@ SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 
 FROM claude_code_accounts a
 LEFT JOIN claude_code_account_quota q ON q.account_id = a.id
 LEFT JOIN proxy_resources p ON p.id = a.proxy_resource_id
+WHERE (? = '' OR a.pool_id = ?)
 ORDER BY a.enabled DESC, a.updated_at DESC, a.email ASC
-	`)
+	`, poolID, poolID)
 	if err != nil {
 		return nil, fmt.Errorf("list claude code accounts: %w", err)
 	}
@@ -1294,8 +1882,9 @@ func (s *Store) GetAccount(ctx context.Context, id string) (*ClaudeCodeAccount, 
 		return nil, fmt.Errorf("account id is required")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
-       a.email, a.enabled, a.priority, COALESCE(a.proxy_resource_id, ''),
+SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
+       a.email, a.enabled, a.health_status, a.blocked_until, a.blocked_reason, a.last_health_check_at, a.next_health_check_at,
+       a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
        q.status, q.windows_json, q.raw_json, q.last_error, q.checked_at,
@@ -1337,8 +1926,9 @@ func (s *Store) GetAccountByAuthID(ctx context.Context, authID string) (*ClaudeC
 		return nil, fmt.Errorf("auth id is required")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
-       a.email, a.enabled, a.priority, COALESCE(a.proxy_resource_id, ''),
+SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
+       a.email, a.enabled, a.health_status, a.blocked_until, a.blocked_reason, a.last_health_check_at, a.next_health_check_at,
+       a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
        q.status, q.windows_json, q.raw_json, q.last_error, q.checked_at,
@@ -1381,6 +1971,9 @@ func (s *Store) PatchAccount(ctx context.Context, id string, patch AccountPatch)
 	}
 	email := current.Email
 	enabled := current.Enabled
+	if patch.Schedulable != nil {
+		enabled = *patch.Schedulable
+	}
 	priority := current.Priority
 	note := current.Note
 	excluded := current.ExcludedModels
@@ -1413,7 +2006,7 @@ func (s *Store) PatchAccount(ctx context.Context, id string, patch AccountPatch)
 	}
 	defer rollbackUnlessCommitted(tx)
 	if patch.ProxyResourceID != nil && proxyID != "" {
-		if err := assertProxyBindableTx(ctx, tx, current.ID, proxyID); err != nil {
+		if err := assertProxyBindableTx(ctx, tx, current.ID, proxyID, "", ""); err != nil {
 			return nil, err
 		}
 	}
@@ -1427,7 +2020,11 @@ WHERE id = ?
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit patch claude code account: %w", err)
 	}
-	return s.GetAccount(ctx, current.ID)
+	updated, err := s.GetAccount(ctx, current.ID)
+	if err == nil {
+		ApplyAccountLifecycleRouting(updated)
+	}
+	return updated, err
 }
 
 // BindAccountProxy binds one proxy to one Claude Code account.
@@ -1451,6 +2048,7 @@ func (s *Store) DeleteAccount(ctx context.Context, accountID string) error {
 	if accountID == "" {
 		return fmt.Errorf("account id is required")
 	}
+	account, _ := s.GetAccount(ctx, accountID)
 	res, err := s.db.ExecContext(ctx, `DELETE FROM claude_code_accounts WHERE id = ?`, accountID)
 	if err != nil {
 		return fmt.Errorf("delete claude code account: %w", err)
@@ -1458,6 +2056,11 @@ func (s *Store) DeleteAccount(ctx context.Context, accountID string) error {
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
 		return sql.ErrNoRows
+	}
+	if account != nil && strings.TrimSpace(account.AuthID) != "" {
+		routingScope := AccountRoutingScope(account.PoolID)
+		claudeapipool.ClearScopedAccountQuotaRouting(routingScope, account.AuthID)
+		claudeapipool.ClearScopedAccountBindings(routingScope, account.AuthID)
 	}
 	return nil
 }
@@ -1500,7 +2103,7 @@ func (s *Store) SaveAccountQuota(ctx context.Context, quota AccountQuota) (*Clau
 		return nil, err
 	}
 	status := normalizeQuotaStatus(quota.Status)
-	windowsJSON, err := encodeQuotaWindows(quota.Windows)
+	windowsJSON, err := encodeQuotaWindows(normalizeQuotaWindows(quota.Windows))
 	if err != nil {
 		return nil, err
 	}
@@ -1759,8 +2362,9 @@ func (s *Store) FindAccountOverlay(ctx context.Context, authID, email string) (*
 		return nil, false, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT a.id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
-       a.email, a.enabled, a.priority, COALESCE(a.proxy_resource_id, ''),
+SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
+	       a.email, a.enabled, a.health_status, a.blocked_until, a.blocked_reason, a.last_health_check_at, a.next_health_check_at,
+	       a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
        q.status, q.windows_json, q.raw_json, q.last_error, q.checked_at,
@@ -1836,7 +2440,7 @@ func (s *Store) Summary(ctx context.Context) (ConsoleSummary, error) {
 	return summary, nil
 }
 
-func assertProxyBindableTx(ctx context.Context, tx *sql.Tx, accountID, proxyID string) error {
+func assertProxyBindableTx(ctx context.Context, tx *sql.Tx, accountID, proxyID, reservationOwner, reservationItem string) error {
 	var enabled int
 	var health string
 	if err := tx.QueryRowContext(ctx, `SELECT enabled, health_status FROM proxy_resources WHERE id = ?`, proxyID).Scan(&enabled, &health); err != nil {
@@ -1850,6 +2454,14 @@ func assertProxyBindableTx(ctx context.Context, tx *sql.Tx, accountID, proxyID s
 	}
 	if normalizeHealthStatus(health, true) == HealthUnhealthy {
 		return fmt.Errorf("proxy resource is unhealthy")
+	}
+	var reservedOwner, reservedItem string
+	errReservation := tx.QueryRowContext(ctx, `SELECT owner_id, item_id FROM proxy_reservations WHERE proxy_resource_id = ? AND expires_at > ?`, proxyID, dbTime(time.Now())).Scan(&reservedOwner, &reservedItem)
+	if errReservation != nil && !errors.Is(errReservation, sql.ErrNoRows) {
+		return fmt.Errorf("check proxy reservation: %w", errReservation)
+	}
+	if errReservation == nil && (reservationOwner == "" || reservedOwner != reservationOwner || reservedItem != reservationItem) {
+		return fmt.Errorf("proxy resource is reserved")
 	}
 	var boundAccount string
 	err := tx.QueryRowContext(ctx, `SELECT id FROM claude_code_accounts WHERE proxy_resource_id = ? AND id <> ? LIMIT 1`, proxyID, accountID).Scan(&boundAccount)
@@ -1870,6 +2482,8 @@ func scanProxy(rows interface {
 	var lastChecked sql.NullString
 	var tagsJSON string
 	var createdRaw, updatedRaw string
+	var reserved int
+	var reservedUntil sql.NullString
 	if err := rows.Scan(
 		&proxy.ID,
 		&proxy.Name,
@@ -1887,10 +2501,14 @@ func scanProxy(rows interface {
 		&updatedRaw,
 		&proxy.BoundAccountID,
 		&proxy.BoundAccountEmail,
+		&reserved,
+		&reservedUntil,
 	); err != nil {
 		return proxy, fmt.Errorf("scan proxy resource: %w", err)
 	}
 	proxy.Enabled = enabled != 0
+	proxy.Reserved = reserved != 0
+	proxy.ReservedUntil = parseNullTime(reservedUntil)
 	proxy.HealthStatus = normalizeHealthStatus(proxy.HealthStatus, proxy.Enabled)
 	proxy.LastCheckedAt = parseNullTime(lastChecked)
 	proxy.CreatedAt = parseDBTime(createdRaw)
@@ -1907,7 +2525,7 @@ func scanAccountWithProxy(rows interface {
 	var enabled, hasAuthData int
 	var authJSON, excludedJSON string
 	var accountCreatedRaw, accountUpdatedRaw string
-	var accountLastTestRaw sql.NullString
+	var accountLastTestRaw, blockedUntilRaw, lastHealthCheckRaw, nextHealthCheckRaw sql.NullString
 	var quotaStatus, quotaWindowsJSON, quotaRawJSON, quotaLastError, quotaCheckedRaw sql.NullString
 	var proxyID sql.NullString
 	var proxyName, proxyURL, proxyExitIP, proxyHealth, proxyLastError, proxyTagsJSON, proxyNote sql.NullString
@@ -1915,12 +2533,18 @@ func scanAccountWithProxy(rows interface {
 	var proxyLastChecked, proxyCreatedRaw, proxyUpdatedRaw sql.NullString
 	if err := rows.Scan(
 		&account.ID,
+		&account.PoolID,
 		&account.AuthID,
 		&account.CloakUserID,
 		&hasAuthData,
 		&authJSON,
 		&account.Email,
 		&enabled,
+		&account.HealthStatus,
+		&blockedUntilRaw,
+		&account.BlockedReason,
+		&lastHealthCheckRaw,
+		&nextHealthCheckRaw,
 		&account.Priority,
 		&account.ProxyResourceID,
 		&account.Note,
@@ -1954,6 +2578,11 @@ func scanAccountWithProxy(rows interface {
 		return account, fmt.Errorf("scan claude code account: %w", err)
 	}
 	account.Enabled = enabled != 0
+	account.Schedulable = account.Enabled
+	account.HealthStatus = normalizeAccountHealthStatus(account.HealthStatus)
+	account.BlockedUntil = parseNullTime(blockedUntilRaw)
+	account.LastHealthCheckAt = parseNullTime(lastHealthCheckRaw)
+	account.NextHealthCheckAt = parseNullTime(nextHealthCheckRaw)
 	account.HasAuthData = hasAuthData != 0
 	account.TokenExpiresAt = tokenExpiresAtFromAuthJSON(authJSON)
 	account.TestStatus = normalizeAccountTestStatus(account.TestStatus)
@@ -1965,7 +2594,7 @@ func scanAccountWithProxy(rows interface {
 		quota := &AccountQuota{
 			AccountID: account.ID,
 			Status:    normalizeQuotaStatus(nullString(quotaStatus)),
-			Windows:   decodeQuotaWindows(nullString(quotaWindowsJSON)),
+			Windows:   normalizeQuotaWindows(decodeQuotaWindows(nullString(quotaWindowsJSON))),
 			CheckedAt: parseNullTime(quotaCheckedRaw),
 			LastError: nullString(quotaLastError),
 			RawJSON:   nullString(quotaRawJSON),
@@ -1995,6 +2624,7 @@ func scanAccountWithProxy(rows interface {
 		proxy.BoundAccountEmail = account.Email
 		account.Proxy = proxy
 	}
+	account.applyDerivedHealth(time.Now())
 	return account, nil
 }
 
@@ -2028,6 +2658,15 @@ func normalizeAccountTestStatus(status string) string {
 		return strings.ToLower(strings.TrimSpace(status))
 	default:
 		return "unknown"
+	}
+}
+
+func normalizeAccountHealthStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case AccountHealthChecking, AccountHealthHealthy, AccountHealthTemporarilyBlocked, AccountHealthManualRecovery:
+		return strings.ToLower(strings.TrimSpace(status))
+	default:
+		return AccountHealthHealthy
 	}
 }
 

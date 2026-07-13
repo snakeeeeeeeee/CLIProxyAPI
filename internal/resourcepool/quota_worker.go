@@ -7,20 +7,22 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
 var quotaRefresherOnce sync.Once
 
 // StartAccountQuotaRefresher starts the background Claude OAuth usage refresher once per process.
-func StartAccountQuotaRefresher(ctx context.Context, configFilePath string, cfgProvider func() *config.Config) {
+func StartAccountQuotaRefresher(ctx context.Context, configFilePath string, cfgProvider func() *config.Config, syncAuth func(context.Context, *coreauth.Auth) error) {
 	quotaRefresherOnce.Do(func() {
-		go runAccountQuotaRefresher(ctx, configFilePath, cfgProvider)
+		go runAccountQuotaRefresher(ctx, configFilePath, cfgProvider, syncAuth)
 	})
 }
 
-func runAccountQuotaRefresher(ctx context.Context, configFilePath string, cfgProvider func() *config.Config) {
+func runAccountQuotaRefresher(ctx context.Context, configFilePath string, cfgProvider func() *config.Config, syncAuth accountQuotaAuthSync) {
 	log.Info("resource pool account quota refresher started")
+	const schedulerTick = 15 * time.Second
 	for {
 		cfg := currentResourcePoolConfig(cfgProvider)
 		if cfg == nil || !cfg.ResourcePools.Enabled {
@@ -50,19 +52,19 @@ func runAccountQuotaRefresher(ctx context.Context, configFilePath string, cfgPro
 		}
 		quotaCfg := EffectiveAccountQuota(doc.AccountQuota)
 		if quotaCfg.Enabled != nil && !*quotaCfg.Enabled {
-			if !sleepOrDone(ctx, quotaInterval(quotaCfg)) {
+			if !sleepOrDone(ctx, schedulerTick) {
 				return
 			}
 			continue
 		}
-		runOneAccountQuotaSweep(ctx, configFilePath, cfg, quotaCfg)
-		if !sleepOrDone(ctx, quotaInterval(quotaCfg)) {
+		runOneAccountQuotaSweep(ctx, configFilePath, cfg, quotaCfg, syncAuth)
+		if !sleepOrDone(ctx, schedulerTick) {
 			return
 		}
 	}
 }
 
-func runOneAccountQuotaSweep(ctx context.Context, configFilePath string, cfg *config.Config, quotaCfg AccountQuotaConfig) {
+func runOneAccountQuotaSweep(ctx context.Context, configFilePath string, cfg *config.Config, quotaCfg AccountQuotaConfig, syncAuth accountQuotaAuthSync) {
 	store, err := Open(configFilePath, cfg)
 	if err != nil {
 		log.WithError(err).Warn("open resource pool store for quota sweep failed")
@@ -84,9 +86,14 @@ func runOneAccountQuotaSweep(ctx context.Context, configFilePath string, cfg *co
 	}
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
+	now := time.Now()
 	for _, account := range accounts {
 		account := account
-		if !account.Enabled || !account.HasAuthData || strings.TrimSpace(account.ID) == "" {
+		ApplyAccountLifecycleRouting(&account)
+		if !account.HasAuthData || strings.TrimSpace(account.ID) == "" || account.HealthStatus == AccountHealthManualRecovery {
+			continue
+		}
+		if account.NextHealthCheckAt != nil && account.NextHealthCheckAt.After(now) {
 			continue
 		}
 		select {
@@ -108,10 +115,11 @@ func runOneAccountQuotaSweep(ctx context.Context, configFilePath string, cfg *co
 					log.WithError(errClose).Warn("close resource pool store after account quota refresh failed")
 				}
 			}()
-			if _, err := RefreshStoredAccountQuota(ctx, configFilePath, cfg, accountStore, account.ID); err != nil {
+			if _, err := refreshStoredAccountQuota(ctx, configFilePath, cfg, accountStore, account.ID, false, syncAuth); err != nil {
 				log.WithError(err).WithField("account_id", account.ID).Debug("refresh claude code account quota failed")
 			}
 			PublishAccountChanged(account.ID, "quota")
+			PublishStatsChanged("account_health")
 		}()
 	}
 	wg.Wait()

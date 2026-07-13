@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"strconv"
 	"strings"
 	"time"
 
@@ -786,6 +787,7 @@ type statusErr struct {
 	code       int
 	msg        string
 	retryAfter *time.Duration
+	headers    http.Header
 }
 
 func (e statusErr) Error() string {
@@ -796,3 +798,70 @@ func (e statusErr) Error() string {
 }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
+func (e statusErr) Headers() http.Header       { return e.headers.Clone() }
+
+func statusErrFromResponse(code int, message string, headers http.Header) statusErr {
+	return statusErr{
+		code:       code,
+		msg:        message,
+		retryAfter: retryAfterFromUpstreamHeaders(headers, time.Now()),
+		headers:    headers.Clone(),
+	}
+}
+
+func retryAfterFromUpstreamHeaders(headers http.Header, now time.Time) *time.Duration {
+	if headers == nil {
+		return nil
+	}
+	if raw := strings.TrimSpace(headers.Get("Retry-After")); raw != "" {
+		if seconds, err := strconv.ParseFloat(raw, 64); err == nil && seconds >= 0 {
+			value := time.Duration(seconds * float64(time.Second))
+			return &value
+		}
+		if resetAt, err := http.ParseTime(raw); err == nil {
+			value := max(resetAt.Sub(now), 0)
+			return &value
+		}
+	}
+	var earliest time.Time
+	for _, key := range []string{
+		"Anthropic-Ratelimit-Unified-Reset",
+		"Anthropic-Ratelimit-Requests-Reset",
+		"Anthropic-Ratelimit-Tokens-Reset",
+		"Anthropic-Ratelimit-Input-Tokens-Reset",
+		"Anthropic-Ratelimit-Output-Tokens-Reset",
+		"Anthropic-Ratelimit-5h-Reset",
+		"Anthropic-Ratelimit-7d-Reset",
+	} {
+		resetAt, ok := parseUpstreamResetTime(headers.Get(key), now)
+		if ok && (earliest.IsZero() || resetAt.Before(earliest)) {
+			earliest = resetAt
+		}
+	}
+	if earliest.IsZero() {
+		return nil
+	}
+	value := max(earliest.Sub(now), 0)
+	return &value
+}
+
+func parseUpstreamResetTime(raw string, now time.Time) (time.Time, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, false
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return parsed, true
+	}
+	if parsed, err := http.ParseTime(raw); err == nil {
+		return parsed, true
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || value < 0 {
+		return time.Time{}, false
+	}
+	if value > float64(now.Unix()) {
+		return time.Unix(int64(value), 0), true
+	}
+	return now.Add(time.Duration(value * float64(time.Second))), true
+}
