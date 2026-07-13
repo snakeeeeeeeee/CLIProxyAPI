@@ -1,7 +1,7 @@
 import { Edit3, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { api, type ClaudeCodeModel, type ModelPrice, type ModelPriceUpdate, type ModelPriceVersion } from "../api";
+import { api, type AccountRow, type ClaudeCodeModel, type ModelPrice, type ModelPriceUpdate, type ModelPriceVersion } from "../api";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog";
@@ -11,20 +11,63 @@ import { Select } from "../components/ui/select";
 import { Textarea } from "../components/ui/textarea";
 import { cn } from "../lib/utils";
 
-export function ModelPricingPage({ models, pricing, onChanged, notify }: {
+export function ModelPricingPage({ accounts, models, pricing, onChanged, notify }: {
+  accounts: AccountRow[];
   models: ClaudeCodeModel[];
   pricing?: ModelPriceVersion;
   onChanged: () => Promise<void>;
   notify: (message: string, danger?: boolean) => void;
 }) {
   const [tab, setTab] = useState<"mapping" | "pricing">("pricing");
+  const [fetchDialogOpen, setFetchDialogOpen] = useState(false);
+  const [selectedAccountID, setSelectedAccountID] = useState("");
   const [modelEditor, setModelEditor] = useState<ClaudeCodeModel | null | undefined>(undefined);
   const [priceEditor, setPriceEditor] = useState<ModelPrice | null | undefined>(undefined);
-  const fetchModels = useMutation({ mutationFn: () => api.fetchPoolModels(""), onSuccess: async () => { await onChanged(); notify("模型列表已刷新"); }, onError: (error) => notify(String(error), true) });
+  const runnableAccounts = accounts.map((row) => row.account).filter((account) => account.effective_schedulable && account.has_auth_data);
+  const fetchModels = useMutation({
+    mutationFn: api.fetchPoolModels,
+    onSuccess: async (data) => {
+      await onChanged();
+      setFetchDialogOpen(false);
+      notify(`已从账号获取 ${data.items.length} 个模型`);
+    },
+    onError: (error) => notify(String(error), true)
+  });
   const deleteModel = useMutation({ mutationFn: api.deletePoolModel, onSuccess: async () => { await onChanged(); notify("模型映射已删除"); }, onError: (error) => notify(String(error), true) });
+  const openFetchDialog = () => {
+    if (runnableAccounts.length === 0) {
+      notify("暂无可用于获取模型的账号", true);
+      return;
+    }
+    if (!runnableAccounts.some((account) => account.id === selectedAccountID)) {
+      setSelectedAccountID(runnableAccounts[0].id);
+    }
+    setFetchDialogOpen(true);
+  };
   return <div className="grid min-w-0 gap-4">
-    <div className="flex min-w-0 flex-wrap items-center justify-between gap-2"><div className="inline-flex h-9 rounded-md border bg-muted p-0.5"><button type="button" className={tabClass(tab === "mapping")} onClick={() => setTab("mapping")}>模型映射</button><button type="button" className={tabClass(tab === "pricing")} onClick={() => setTab("pricing")}>标准价格</button></div><div className="flex flex-wrap gap-2">{tab === "mapping" ? <><Button variant="outline" onClick={() => fetchModels.mutate()}><RefreshCw className="h-4 w-4" />从账号获取</Button><Button onClick={() => setModelEditor(null)}><Plus className="h-4 w-4" />新增映射</Button></> : <Button onClick={() => setPriceEditor(null)}><Plus className="h-4 w-4" />新增价格</Button>}</div></div>
+    <div className="flex min-w-0 flex-wrap items-center justify-between gap-2"><div className="inline-flex h-9 rounded-md border bg-muted p-0.5"><button type="button" className={tabClass(tab === "mapping")} onClick={() => setTab("mapping")}>模型映射</button><button type="button" className={tabClass(tab === "pricing")} onClick={() => setTab("pricing")}>标准价格</button></div><div className="flex flex-wrap gap-2">{tab === "mapping" ? <><Button variant="outline" onClick={openFetchDialog} disabled={fetchModels.isPending}><RefreshCw className={cn("h-4 w-4", fetchModels.isPending && "animate-spin")} />从账号获取</Button><Button onClick={() => setModelEditor(null)}><Plus className="h-4 w-4" />新增映射</Button></> : <Button onClick={() => setPriceEditor(null)}><Plus className="h-4 w-4" />新增价格</Button>}</div></div>
     {tab === "mapping" ? <ModelMappings models={models} onEdit={setModelEditor} onDelete={(id) => { if (globalThis.confirm("确认删除这个模型映射？")) deleteModel.mutate(id); }} /> : <PriceTable version={pricing} onEdit={setPriceEditor} onRemove={(price) => { if (globalThis.confirm(`从下一价格版本移除 ${price.model_pattern}？`)) void savePriceUpdate({ model_pattern: price.model_pattern, input_per_million: 0, output_per_million: 0, cache_write_5m_per_million: 0, cache_write_1h_per_million: 0, cache_read_per_million: 0, remove: true }, onChanged, notify); }} />}
+    <Dialog open={fetchDialogOpen} onOpenChange={setFetchDialogOpen}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>选择账号</DialogTitle>
+          <DialogDescription>使用所选账号及其绑定代理获取 Anthropic 模型列表。</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-2">
+          <Label htmlFor="model-fetch-account">账号</Label>
+          <Select id="model-fetch-account" value={selectedAccountID} onChange={(event) => setSelectedAccountID(event.target.value)}>
+            {runnableAccounts.map((account) => <option key={account.id} value={account.id}>{account.email || account.auth_id.slice(0, 12)} · {account.pool_id}</option>)}
+          </Select>
+        </div>
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="outline" onClick={() => setFetchDialogOpen(false)}>取消</Button>
+          <Button type="button" onClick={() => fetchModels.mutate(selectedAccountID)} disabled={!selectedAccountID || fetchModels.isPending}>
+            <RefreshCw className={cn("h-4 w-4", fetchModels.isPending && "animate-spin")} />
+            获取模型
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
     <ModelEditor open={modelEditor !== undefined} model={modelEditor || undefined} onClose={() => setModelEditor(undefined)} onChanged={onChanged} notify={notify} />
     <PriceEditor open={priceEditor !== undefined} price={priceEditor || undefined} onClose={() => setPriceEditor(undefined)} onChanged={onChanged} notify={notify} />
   </div>;

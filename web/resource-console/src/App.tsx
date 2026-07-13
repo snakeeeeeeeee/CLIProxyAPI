@@ -196,6 +196,7 @@ function App() {
   const currentPoolID = view === "pool" ? (activeLocation.poolID || "default") : "";
   const poolListUsageWindow: UsageWindow = view === "overview" ? usageWindow : "all";
   const accountDataEnabled = dataEnabled && (view === "pool" || view === "settings");
+  const accountListEnabled = accountDataEnabled || (dataEnabled && view === "models");
 
   const showToast = (message: string, tone: ToastState["tone"] = "default") => {
     setToast({ message, tone });
@@ -225,7 +226,7 @@ function App() {
 
   const configQuery = useQuery({ queryKey: ["resource-config"], queryFn: api.config, enabled: dataEnabled });
   const poolsQuery = useQuery({ queryKey: ["account-pools", poolListUsageWindow], queryFn: () => api.accountPools(poolListUsageWindow), enabled: dataEnabled });
-  const accountsQuery = useQuery({ queryKey: ["accounts", currentPoolID, "30d"], queryFn: () => api.accounts(currentPoolID, "30d"), enabled: accountDataEnabled });
+  const accountsQuery = useQuery({ queryKey: ["accounts", currentPoolID, "30d"], queryFn: () => api.accounts(currentPoolID, "30d"), enabled: accountListEnabled });
   const apiKeysQuery = useQuery({ queryKey: ["pool-api-keys", currentPoolID, "all"], queryFn: () => api.poolAPIKeys(currentPoolID, "all"), enabled: dataEnabled });
   const proxiesQuery = useQuery({ queryKey: ["proxies"], queryFn: api.proxies, enabled: dataEnabled });
   const availableQuery = useQuery({ queryKey: ["available-proxies"], queryFn: api.availableProxies, enabled: dataEnabled });
@@ -540,7 +541,7 @@ function App() {
       ) : view === "proxies" ? (
         <ProxyView proxies={proxies} loading={loading} onEdit={(proxy) => setModal({ type: "proxy", proxy })} onToast={showToast} onDone={invalidateAll} />
       ) : view === "models" ? (
-        <ModelPricingPage models={poolModels} pricing={modelPrices} onChanged={invalidateAll} notify={notify} />
+        <ModelPricingPage accounts={accounts} models={poolModels} pricing={modelPrices} onChanged={invalidateAll} notify={notify} />
       ) : (
         accountWorkspace("config")
       )}
