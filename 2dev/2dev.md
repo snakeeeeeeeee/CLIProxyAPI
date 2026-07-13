@@ -525,6 +525,8 @@ Retry-After: <seconds>
 - 429/529：模型级冷却，不把整个账号显示为不可用。
 - transport/proxy：连续失败达到阈值后临时摘除账号和代理。
 
+`/claude-acc-pool/v1/messages` 的 JSON 错误使用 Anthropic envelope：顶层 `type=error`，包含 `error.type`、`error.message` 和 `request_id`；`request_id` 与响应的 `request-id` 或 `x-request-id` Header 保持一致。HTTP 400 中上游泛化的 `upstream_error` 会规范为 `invalid_request_error`。
+
 注意：
 
 - 账号池调度状态保存在当前服务进程内，服务仍按单实例运行。
@@ -539,6 +541,7 @@ Retry-After: <seconds>
 - 默认忽略客户端传入的 5m/1h TTL，并统一使用 1h。
 - 在系统设置开启“允许请求参数控制缓存 TTL”后，显式 `ttl: "5m"` 或 `ttl: "1h"` 会被保留；没有显式 TTL 的断点仍使用 1h。
 - 不凭空给 tools 或 messages 增加缓存断点，只处理请求中已有断点和账号池 profile 自带断点。
+- 普通 API mimic 会把客户端 system 语义迁移到首条 user reminder；原 system 文本块显式声明的 `cache_control` 会随对应 reminder 块一起迁移，不会因伪装改写丢失。
 - 同时适用于非流式、流式、真实 Claude Code passthrough、普通 API mimic、`count_tokens` 和管理账号测试。
 - 普通 `/v1/*`、Claude API Pool 和其他 provider 不受影响。
 
@@ -560,6 +563,8 @@ Claude Code 账号池 -> 配置 -> 基础配置 -> 纯净计费模式
 - 真实 Claude Code passthrough 不进行扣减。
 - 客户端未声明缓存时，mimic 产生的缓存创建和读取对下游归零。
 - 网关自有缓存归零不依赖 profile 开销估算值；只使用“总注入开销减去已观测缓存 Token”的剩余部分扣减未缓存输入，避免估算偏低时把缓存差额转入 `input_tokens`。
+- 如果已观测网关缓存 Token 超过 profile 总开销校准，说明单一校准值无法继续识别非缓存 profile 残余；此时下游 `input_tokens` 回退为客户端原始请求的可见输入估算。
+- `count_tokens` 响应没有缓存桶可供拆分；客户端未声明缓存时直接使用原始请求的可见输入估算，避免 profile 总开销估算误差形成固定偏移。
 - 客户端自带缓存控制时，只扣除校准或估算的账号池注入开销，保留剩余的客户端缓存 usage。
 - 不影响 Anthropic 真实请求。
 - 不影响 Anthropic 真实消耗。
@@ -645,7 +650,7 @@ Claude Code 账号池 -> 配置 -> 账号池日志
 
 Trace 工具用于对齐真实 Claude Code 请求形态。
 
-当前生产基线为 Claude Code `2.1.207` / profile revision `2.1.207-r2`。后续版本必须先录制真实 trace 并完成 diff，不能只根据 Phistory 自动升级生产 profile。
+当前生产基线为 Claude Code `2.1.207` / profile revision `2.1.207-r3`。后续版本必须先录制真实 trace 并完成 diff，不能只根据 Phistory 自动升级生产 profile。
 
 ### 录制真实 Claude Code trace
 
@@ -735,20 +740,49 @@ go run ./cmd/claude_trace_diff \
 
 普通 API mimic：
 
-- 使用 `2.1.207-r2` UA、billing、identity、稳定 prompt、metadata 和模型/body 对应 beta。
-- 使用 OAuth access token 时，凭证层会在 `claude-code-20250219` 后条件性加入 `oauth-2025-04-20`；该标记不属于 API Key profile 基线，真实 Claude Code passthrough 仍保留客户端原值。
+- 使用 `2.1.207-r3` UA、billing、Agent SDK identity、工具无关稳定核心、metadata 和请求能力对应 beta。
+- 使用 OAuth access token 时，最终 beta 为客户端/请求能力 beta 加凭证必需的 `oauth-2025-04-20`；真实 Claude Code passthrough 保留客户端顺序并只补充凭证必需项。
 - Header Session 与 `metadata.user_id.session_id` 来自同一个最终请求 Session；trace 只记录二者是否一致，不保存 Session 原值。
 - Stainless 平台固定为已验证的 `MacOS/arm64`，并与 Node HTTP/1.1 uTLS、Header 顺序、JA3/JA4 一起作为同一 profile 管理。
 - 不伪造 Claude Code 自带工具，不自动增加 thinking 或 output config。
 - 客户端自带 tools/tool_use/tool_result 时保持原结构，也不会自动给最后一个 tool 增加 cache control。
 - 客户端 system 文本放入首条 user message 的 system-reminder，原始语义保留。
-- 无显式 session 时每个请求生成独立 Session ID；显式 session/conversation 会稳定复用。
+- 显式 session/conversation 按 `pool_id + api_key_id + conversation` 生成稳定 Session；不使用请求级 `X-Client-Request-Id`。
+- 无显式 session 时按账号池 Key 和选中账号复用 1 小时临时 Session；该值不参与调度亲和，池、Key 或账号变化时自动隔离。
 
 TLS 和有序 HTTP/1.1 serializer 只对账号池访问 Anthropic 官方域名生效，自定义 base URL 和普通 `/v1/*` 不使用该 profile。外部普通 API 请求不会注入完整 Claude Code 动态 prompt 或内置工具；需要完整工具运行时的请求应由真实 Claude Code passthrough。
 
 账号池路由 scope 由 `/claude-acc-pool/v1` middleware 写入请求上下文，并在 handler 创建可取消执行上下文时显式继承。额度 worker 发生 OAuth token 轮换后会同步更新 SQLite 与 Auth Manager runtime auth，因此业务请求和 `/api/oauth/usage` 不会使用不同代的 access token。
 
-## 17. 常见排障
+## 17. 运行一致性诊断
+
+页面入口：
+
+```text
+/account-pool.html#/settings
+```
+
+Management API：
+
+```text
+GET /v0/management/claude-code-account-pool/diagnostics
+```
+
+诊断只读取本地配置和 SQLite，不发送 Anthropic 请求，也不持续轮询。页面可见、手动刷新或账号/代理/池/配置 SSE 变化后才重新读取。
+
+主要信息：
+
+- 构建版本、Commit、构建时间和 Go 平台；使用 `scripts/build-all.sh` 可注入版本信息，普通 `go build` 可能显示“Commit 未注入”。
+- 当前数据库路径和实例短指纹。复制同一数据库指纹保持不变，重建数据库会变化，可用于识别 Docker 挂载错误。
+- Profile revision/fingerprint、Header 数量/顺序摘要、TLS profile 和 ALPN。
+- 额度维护开关、配置间隔、15 秒扫描 tick、并发和全局代理模式。
+- 每个账号的短账号/设备指纹、池 ID、代理资源 ID、最近观测出口、Token/额度时间、采集传输类别和标准化问题码。
+
+诊断不会返回邮箱、Auth ID、access/refresh token、Session、API Key、完整代理 URL/凭据或原始错误正文。接口响应带 `Cache-Control: no-store`。
+
+额度 worker 的 15 秒 tick 只扫描到期账号，实际成功采集间隔由 `account-quota.interval` 控制。手动刷新会绕过到期判断，并与后台同账号请求 singleflight 去重。配置了无效代理时，登录、Token 刷新、额度和推理都会返回代理错误，不会静默直连。
+
+## 18. 常见排障
 
 ### OAuth 失效
 
@@ -805,7 +839,7 @@ web/resource-console/dist/
 web/resource-console/node_modules/
 ```
 
-## 18. 模型额度显示与账号测试
+## 19. 模型额度显示与账号测试
 
 - 额度窗口以 Anthropic 实际返回为准。共享窗口为 `5h` 和 `7d`，模型独立窗口为可选数据。
 - `7d S / 7d O / 7d F` 中，“共享”表示上游没有返回该模型的独立周窗口，调度使用共享 `7d` 约束。

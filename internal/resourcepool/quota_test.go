@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -177,6 +179,14 @@ func TestStoreSaveAccountQuotaRoundTrips(t *testing.T) {
 		t.Fatalf("RegisterClaudeCodeAccountWithAuth() error = %v", err)
 	}
 	now := time.Now().UTC().Truncate(time.Second)
+	probe := &AccountQuotaProbe{
+		RequestedAt:      now,
+		ProfileRevision:  DefaultClaudeCodeProfileRevision,
+		TransportProfile: "oauth-usage/node-macos-arm64-http1",
+		ProxyMode:        "bound",
+		ProxyResourceID:  "proxy-a",
+		StatusCode:       http.StatusOK,
+	}
 	if _, err := store.SaveAccountQuota(ctx, AccountQuota{
 		AccountID: account.ID,
 		Status:    "ok",
@@ -185,6 +195,7 @@ func TestStoreSaveAccountQuotaRoundTrips(t *testing.T) {
 			{Key: "five_hour", Name: "5 小时", UsedPercent: 25, RemainPercent: 75},
 		},
 		RawJSON: `{"five_hour":{"utilization":25}}`,
+		Probe:   probe,
 	}); err != nil {
 		t.Fatalf("SaveAccountQuota() error = %v", err)
 	}
@@ -198,6 +209,9 @@ func TestStoreSaveAccountQuotaRoundTrips(t *testing.T) {
 	}
 	if got.Quota.Windows[0].RemainPercent != 75 {
 		t.Fatalf("remain percent = %.1f", got.Quota.Windows[0].RemainPercent)
+	}
+	if got.Quota.Probe == nil || got.Quota.Probe.ProfileRevision != DefaultClaudeCodeProfileRevision || got.Quota.Probe.ProxyResourceID != "proxy-a" {
+		t.Fatalf("probe = %+v", got.Quota.Probe)
 	}
 	items, err := store.ListAccounts(ctx)
 	if err != nil {
@@ -218,12 +232,28 @@ func TestRefreshAccountQuotaSavesUsageSnapshot(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/oauth/usage" {
+			http.Error(w, "unexpected request target", http.StatusBadRequest)
+			return
+		}
 		if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
 			http.Error(w, fmt.Sprintf("Authorization = %q", got), http.StatusUnauthorized)
 			return
 		}
 		if got := r.Header.Get("anthropic-beta"); got != quotaOAuthBetaHeader {
 			http.Error(w, fmt.Sprintf("anthropic-beta = %q", got), http.StatusBadRequest)
+			return
+		}
+		if got := r.Header.Get("User-Agent"); got != "claude-cli/2.1.207 (external, sdk-cli)" {
+			http.Error(w, fmt.Sprintf("User-Agent = %q", got), http.StatusBadRequest)
+			return
+		}
+		if got := r.Header.Get("X-Claude-Code-Session-Id"); got != "" {
+			http.Error(w, "quota request must not carry a Session", http.StatusBadRequest)
+			return
+		}
+		if r.ContentLength > 0 {
+			http.Error(w, "quota request must not carry a body", http.StatusBadRequest)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -246,7 +276,7 @@ func TestRefreshAccountQuotaSavesUsageSnapshot(t *testing.T) {
 		t.Fatalf("RegisterClaudeCodeAccountWithAuth() error = %v", err)
 	}
 	oldUsageURL := claudeOAuthUsageURL
-	claudeOAuthUsageURL = server.URL
+	claudeOAuthUsageURL = server.URL + "/api/oauth/usage"
 	t.Cleanup(func() { claudeOAuthUsageURL = oldUsageURL })
 
 	got, err := RefreshAccountQuota(ctx, &config.Config{}, store, account.ID, auth, nil)
@@ -258,6 +288,166 @@ func TestRefreshAccountQuotaSavesUsageSnapshot(t *testing.T) {
 	}
 	if got.Quota.Windows[0].RemainPercent != 80 {
 		t.Fatalf("remain percent = %.1f", got.Quota.Windows[0].RemainPercent)
+	}
+	if got.Quota.Probe == nil || got.Quota.Probe.TransportProfile != "oauth-usage/node-macos-arm64-http1" || got.Quota.Probe.ProxyMode != "direct" || got.Quota.Probe.StatusCode != http.StatusOK {
+		t.Fatalf("quota probe = %+v", got.Quota.Probe)
+	}
+}
+
+func TestRefreshAccountQuotaUsesConfiguredInterval(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	doc, err := store.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig() error = %v", err)
+	}
+	doc.AccountQuota.Interval = "40s"
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	if err := savePoolConfigTx(ctx, tx, doc); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("savePoolConfigTx() error = %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+
+	fixedNow := time.Date(2026, 7, 14, 3, 0, 0, 0, time.UTC)
+	previousNow := accountQuotaNow
+	accountQuotaNow = func() time.Time { return fixedNow }
+	t.Cleanup(func() { accountQuotaNow = previousNow })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":20}}`))
+	}))
+	defer server.Close()
+	previousURL := claudeOAuthUsageURL
+	claudeOAuthUsageURL = server.URL
+	t.Cleanup(func() { claudeOAuthUsageURL = previousURL })
+	auth := quotaTestAuth("configured-interval-auth")
+	account, err := store.RegisterClaudeCodeAccountWithAuth(ctx, auth.ID, "interval@example.com", "", auth)
+	if err != nil {
+		t.Fatalf("RegisterClaudeCodeAccountWithAuth() error = %v", err)
+	}
+	refreshed, err := RefreshAccountQuota(ctx, &config.Config{}, store, account.ID, auth, nil)
+	if err != nil {
+		t.Fatalf("RefreshAccountQuota() error = %v", err)
+	}
+	if refreshed.NextHealthCheckAt == nil {
+		t.Fatal("NextHealthCheckAt is nil")
+	}
+	delta := refreshed.NextHealthCheckAt.Sub(fixedNow)
+	if delta < 32*time.Second || delta > 48*time.Second {
+		t.Fatalf("next check delta = %s, want configured 40s with jitter", delta)
+	}
+}
+
+func TestAccountQuotaRefreshDueUsesShortenedInterval(t *testing.T) {
+	observedAt := time.Date(2026, 7, 14, 3, 0, 0, 0, time.UTC)
+	oldNext := observedAt.Add(5 * time.Minute)
+	account := ClaudeCodeAccount{
+		ID:                "shortened-interval-account",
+		HealthStatus:      AccountHealthHealthy,
+		LastHealthCheckAt: &observedAt,
+		NextHealthCheckAt: &oldNext,
+	}
+	if !accountQuotaRefreshDue(account, observedAt.Add(time.Minute), 30*time.Second) {
+		t.Fatal("shortened interval should make the account due before the stored five-minute timestamp")
+	}
+	if accountQuotaRefreshDue(account, observedAt.Add(time.Minute), 10*time.Minute) {
+		t.Fatal("lengthened interval should not retain the old earlier timestamp")
+	}
+}
+
+func TestRefreshAccountQuotaSingleflightByAccount(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":10}}`))
+	}))
+	defer server.Close()
+	previousURL := claudeOAuthUsageURL
+	claudeOAuthUsageURL = server.URL
+	t.Cleanup(func() { claudeOAuthUsageURL = previousURL })
+	auth := quotaTestAuth("singleflight-auth")
+	account, err := store.RegisterClaudeCodeAccountWithAuth(ctx, auth.ID, "singleflight@example.com", "", auth)
+	if err != nil {
+		t.Fatalf("RegisterClaudeCodeAccountWithAuth() error = %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errRefresh := RefreshAccountQuota(ctx, &config.Config{}, store, account.ID, auth, nil)
+			errs <- errRefresh
+		}()
+	}
+	<-started
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("RefreshAccountQuota() error = %v", err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("usage request count = %d, want 1", got)
+	}
+}
+
+func TestRefreshAccountQuotaInvalidProxyDoesNotDialUpstream(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":10}}`))
+	}))
+	defer server.Close()
+	previousURL := claudeOAuthUsageURL
+	claudeOAuthUsageURL = server.URL
+	t.Cleanup(func() { claudeOAuthUsageURL = previousURL })
+	auth := quotaTestAuth("invalid-proxy-auth")
+	auth.ProxyURL = "ftp://invalid.example.com:21"
+	account, err := store.RegisterClaudeCodeAccountWithAuth(ctx, auth.ID, "invalid-proxy@example.com", "", auth)
+	if err != nil {
+		t.Fatalf("RegisterClaudeCodeAccountWithAuth() error = %v", err)
+	}
+	refreshed, err := RefreshAccountQuota(ctx, &config.Config{}, store, account.ID, auth, nil)
+	if err == nil || !strings.Contains(err.Error(), "configure claude code node proxy") {
+		t.Fatalf("RefreshAccountQuota() error = %v", err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("upstream direct calls = %d, want 0", got)
+	}
+	if refreshed == nil || refreshed.Quota == nil || refreshed.Quota.Probe == nil || refreshed.Quota.Probe.ProxyMode != "invalid" {
+		t.Fatalf("quota probe = %+v", refreshed)
+	}
+}
+
+func quotaTestAuth(id string) *coreauth.Auth {
+	return &coreauth.Auth{
+		ID:       id,
+		Provider: "claude",
+		Metadata: map[string]any{
+			"access_token":  "access-token",
+			"refresh_token": "refresh-token",
+			"expired":       time.Now().Add(time.Hour).Format(time.RFC3339),
+		},
+		Attributes: map[string]string{AttrClaudeOAuthPool: "true"},
 	}
 }
 

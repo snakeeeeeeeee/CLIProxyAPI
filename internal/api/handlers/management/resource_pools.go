@@ -429,6 +429,24 @@ func (h *Handler) GetClaudeCodePoolConfig(c *gin.Context) {
 	})
 }
 
+func (h *Handler) GetClaudeCodeAccountPoolDiagnostics(c *gin.Context) {
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	h.mu.Lock()
+	cfg := h.cfg
+	h.mu.Unlock()
+	diagnostics, err := store.Diagnostics(c.Request.Context(), cfg, time.Now())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "diagnostics_failed", "message": err.Error()})
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, diagnostics)
+}
+
 func (h *Handler) PutClaudeCodePoolConfig(c *gin.Context) {
 	var body resourcepool.ClaudeCodePoolConfig
 	if err := c.ShouldBindJSON(&body); err != nil {

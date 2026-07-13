@@ -424,12 +424,16 @@ func (s *Store) applyRuntimeHealthResult(ctx context.Context, account *ClaudeCod
 	}
 	now := time.Now()
 	if success {
+		interval, errInterval := s.accountQuotaInterval(ctx)
+		if errInterval != nil {
+			interval = quotaDefaultInterval
+		}
 		_, _ = s.db.ExecContext(ctx, `UPDATE claude_code_accounts SET consecutive_failures = 0 WHERE id = ?`, account.ID)
 		_, _ = s.UpdateAccountHealth(ctx, account.ID, AccountHealthUpdate{
 			Source:      "inference",
 			Status:      AccountHealthHealthy,
 			CheckedAt:   &now,
-			NextCheckAt: timePtr(nextAccountHealthCheck(account.ID, now, quotaDefaultInterval)),
+			NextCheckAt: timePtr(nextAccountHealthCheck(account.ID, now, interval)),
 		})
 		return
 	}

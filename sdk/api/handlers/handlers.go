@@ -69,6 +69,7 @@ type pinnedAuthContextKey struct{}
 type poolScopeContextKey struct{}
 type accountPoolIDContextKey struct{}
 type accountPoolAPIKeyIDContextKey struct{}
+type accountPoolSessionKeyIdentityContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
 type disallowFreeAuthContextKey struct{}
@@ -163,6 +164,18 @@ func WithAccountPoolIdentity(ctx context.Context, poolID, apiKeyID string) conte
 		ctx = context.WithValue(ctx, accountPoolAPIKeyIDContextKey{}, apiKeyID)
 	}
 	return ctx
+}
+
+// WithAccountPoolSessionKeyIdentity records a request-local identity used only to scope upstream Sessions.
+func WithAccountPoolSessionKeyIdentity(ctx context.Context, identity string) context.Context {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, accountPoolSessionKeyIdentityContextKey{}, identity)
 }
 
 // WithSelectedAuthIDCallback returns a child context that receives the selected auth ID.
@@ -417,6 +430,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if apiKeyID := accountPoolAPIKeyIDFromContext(ctx); apiKeyID != "" {
 		meta[coreexecutor.AccountPoolAPIKeyIDMetadataKey] = apiKeyID
 	}
+	if identity := accountPoolSessionKeyIdentityFromContext(ctx); identity != "" {
+		meta[coreexecutor.AccountPoolSessionKeyIdentityMetadataKey] = identity
+	}
 	if billing := coreusage.AccountPoolBillingFromContext(ctx); billing.PriceVersionID > 0 {
 		meta[coreexecutor.AccountPoolPriceVersionMetadataKey] = billing.PriceVersionID
 	}
@@ -539,6 +555,14 @@ func accountPoolAPIKeyIDFromContext(ctx context.Context) string {
 		return ""
 	}
 	value, _ := ctx.Value(accountPoolAPIKeyIDContextKey{}).(string)
+	return strings.TrimSpace(value)
+}
+
+func accountPoolSessionKeyIdentityFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx.Value(accountPoolSessionKeyIdentityContextKey{}).(string)
 	return strings.TrimSpace(value)
 }
 
@@ -815,6 +839,7 @@ func inheritRequestExecutionContext(parentCtx, requestCtx context.Context) conte
 		parentCtx = WithPoolScope(parentCtx, scope)
 	}
 	parentCtx = WithAccountPoolIdentity(parentCtx, accountPoolIDFromContext(requestCtx), accountPoolAPIKeyIDFromContext(requestCtx))
+	parentCtx = WithAccountPoolSessionKeyIdentity(parentCtx, accountPoolSessionKeyIdentityFromContext(requestCtx))
 	billing := coreusage.AccountPoolBillingFromContext(requestCtx)
 	parentCtx = coreusage.WithAccountPoolBilling(parentCtx, billing.PoolID, billing.APIKeyID, billing.PriceVersionID)
 	if callback := selectedAuthIDCallbackFromContext(requestCtx); callback != nil {

@@ -153,6 +153,20 @@ func TestGeneratedAccountPoolKeyRequiresSupportedHeader(t *testing.T) {
 	}
 }
 
+func TestAccountPoolLegacyKeyIdentityUsesDigest(t *testing.T) {
+	first := accountPoolLegacyKeyIdentity("legacy-key")
+	second := accountPoolLegacyKeyIdentity("legacy-key")
+	if first == "" || first != second {
+		t.Fatalf("legacy key identity = %q/%q, want deterministic digest", first, second)
+	}
+	if strings.Contains(first, "legacy-key") || !strings.HasPrefix(first, "sha256:") {
+		t.Fatalf("legacy key identity leaked raw key or lacked digest marker: %q", first)
+	}
+	if got := accountPoolLegacyKeyIdentity(" "); got != "" {
+		t.Fatalf("empty legacy key identity = %q", got)
+	}
+}
+
 func TestGeneratedPoolKeyCannotEscapeRouteOrLifecycle(t *testing.T) {
 	server, store, pool, credential := newAccountPoolAuthTestServer(t)
 

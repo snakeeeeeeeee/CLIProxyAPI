@@ -57,7 +57,7 @@ var claudeCodeNodeTransports = struct {
 
 const (
 	maxClaudeCodeNodeTransports      = 64
-	ClaudeCodeNodeProfileRevision    = "2.1.207-r2"
+	ClaudeCodeNodeProfileRevision    = "2.1.207-r3"
 	ClaudeCodeNodeTLSProfileName     = "node-macos-arm64-http1"
 	ClaudeCodeNodeTLSJA3             = "44f88fca027f27bab4bb08d4af15f23e"
 	ClaudeCodeNodeTLSJA4             = "t13d1714h1_5b57614c22b0_7baf387fc6ff"
@@ -68,22 +68,22 @@ const (
 
 var claudeCodeNodeDefaultHeaderOrder = []string{
 	"Accept",
+	"Authorization",
+	"x-api-key",
 	"Content-Type",
 	"User-Agent",
 	"X-Claude-Code-Session-Id",
-	"X-Stainless-Lang",
-	"X-Stainless-Package-Version",
-	"X-Stainless-Os",
 	"X-Stainless-Arch",
+	"X-Stainless-Lang",
+	"X-Stainless-Os",
+	"X-Stainless-Package-Version",
+	"X-Stainless-Retry-Count",
 	"X-Stainless-Runtime",
 	"X-Stainless-Runtime-Version",
-	"X-Stainless-Retry-Count",
 	"X-Stainless-Timeout",
+	"anthropic-beta",
 	"anthropic-dangerous-direct-browser-access",
 	"anthropic-version",
-	"anthropic-beta",
-	"Authorization",
-	"x-api-key",
 	"x-app",
 	"Connection",
 	"Host",
@@ -91,10 +91,23 @@ var claudeCodeNodeDefaultHeaderOrder = []string{
 	"Content-Length",
 }
 
+var claudeCodeNodeR2HeaderOrder = []string{
+	"Accept", "Content-Type", "User-Agent", "X-Claude-Code-Session-Id",
+	"X-Stainless-Lang", "X-Stainless-Package-Version", "X-Stainless-Os", "X-Stainless-Arch",
+	"X-Stainless-Runtime", "X-Stainless-Runtime-Version", "X-Stainless-Retry-Count", "X-Stainless-Timeout",
+	"anthropic-dangerous-direct-browser-access", "anthropic-version", "anthropic-beta", "Authorization",
+	"x-api-key", "x-app", "Connection", "Host", "Accept-Encoding", "Content-Length",
+}
+
 // ClaudeCodeNodeHeaderOrder returns the raw HTTP/1.1 order captured from the
 // built-in Claude Code profile. The returned slice can be modified safely.
 func ClaudeCodeNodeHeaderOrder() []string {
 	return append([]string(nil), claudeCodeNodeDefaultHeaderOrder...)
+}
+
+// ClaudeCodeNodeR2HeaderOrder returns the prior built-in order for exact migration matching.
+func ClaudeCodeNodeR2HeaderOrder() []string {
+	return append([]string(nil), claudeCodeNodeR2HeaderOrder...)
 }
 
 // ClaudeCodeNodeTLSJA3RawValue returns the captured JA3 source tuple used by
@@ -124,6 +137,7 @@ func newUtlsRoundTripper(proxyURL string, profile utlsProfile) *utlsRoundTripper
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
 		if errBuild != nil {
 			log.Errorf("utls: failed to configure proxy dialer for %q: %v", proxyutil.Redact(proxyURL), errBuild)
+			dialer = proxyErrorDialer{err: fmt.Errorf("configure outbound proxy: %w", errBuild)}
 		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
 			dialer = proxyDialer
 		}
@@ -134,6 +148,14 @@ func newUtlsRoundTripper(proxyURL string, profile utlsProfile) *utlsRoundTripper
 		dialer:      dialer,
 		profile:     profile,
 	}
+}
+
+type proxyErrorDialer struct {
+	err error
+}
+
+func (d proxyErrorDialer) Dial(string, string) (net.Conn, error) {
+	return nil, d.err
 }
 
 func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {

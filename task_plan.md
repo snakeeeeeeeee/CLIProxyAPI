@@ -1,5 +1,137 @@
 # Task Plan: Multi-Pool API Keys, Pricing, Usage, And Console
 
+## Current Implementation: Account-Pool Protocol Consistency And Ordinary Mode
+
+### Goal
+
+Align account-pool Session identity, ordinary-request profile behavior, quota maintenance, proxy failure handling, and deployment diagnostics while preserving strict real-Claude-Code passthrough and the existing downstream compatibility fixes.
+
+### Phases
+
+1. [completed] Preserve the current pure-mode, count-tokens, explicit-cache, and Anthropic-error fixes and record the implementation baseline.
+2. [completed] Unify account-pool Session extraction, explicit Session isolation, and one-hour no-Session reuse without scheduler affinity.
+3. [completed] Upgrade the built-in profile to `2.1.207-r3`, align ordered Headers, retain a tool-independent ordinary core, merge OAuth beta capabilities, and migrate only exact r2 baselines.
+4. [completed] Honor configured quota intervals, deduplicate quota probes, use account-compatible transport/proxy/profile metadata, and make configured proxy failures fail closed.
+5. [completed] Persist a database instance identity and safe quota-probe summaries, then expose an authenticated diagnostics API without secrets.
+6. [completed] Add a compact System Settings diagnostics surface with manual refresh and responsive behavior.
+7. [completed] Update development/audit documentation and run focused tests, full Go tests, backend build, frontend type-check/build, diff hygiene, and isolated browser checks.
+
+### Decisions
+
+- Real Claude Code system/tools/thinking/cache/beta remain passthrough; ordinary requests retain client capabilities and receive no fabricated built-in tools.
+- Explicit ordinary Sessions are stable UUIDs scoped by pool, pool-key identity, and conversation; no-Session fallback is scoped by pool key and selected account for one sliding hour and never creates scheduler affinity.
+- Account-pool code does not derive Session identity from OAuth access tokens or `X-Client-Request-Id`.
+- OAuth usage polling is a distinct non-inference transport category and emits no Session, billing prompt, or model body.
+- Empty proxy and explicit `direct` may dial directly; any malformed configured proxy must fail closed across login, refresh, quota, and inference.
+- Diagnostics expose only short hashes, IDs, timing, build/config summaries, and normalized issue codes.
+- Real Anthropic smoke remains pending until a valid, authorized account is available.
+
+### Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| Planning-with-files catch-up found a prior read-only Claude review not reflected in planning files | 1 | Reconciled it with the current diff and recorded this implementation phase before editing runtime code. |
+| A large audit-document refresh patch missed one changed paragraph and was rejected atomically | 1 | Split the audit update into exact per-section patches so historical findings remain intact. |
+| The isolated browser reused a stale management key and parallel startup queries triggered the in-memory IP ban | 1 | Entered the synthetic key, restarted only the temporary server to clear the ban, and continued against the same isolated database. |
+| The first 1024px diagnostics table gave the final issue column zero width and wrapped the status badge | 1 | Rebalanced all six columns with percentages, made status badges non-wrapping, rebuilt, and rechecked populated rows at every target viewport. |
+
+## Current Validation: Real Claude Code 2.1.207 Request Capture
+
+### Goal
+
+Use the user-authorized local first-party Claude Code session to capture a minimal, redacted baseline for real Messages, repeated-session, token-counting, and OAuth-usage traffic, then compare that evidence with the account-pool implementation and update the fidelity audit.
+
+### Phases
+
+1. [completed] Prepare an isolated temporary workspace and verify Claude Code/debug capabilities without exposing credentials.
+2. [completed] Send minimal real requests with Claude's own API debug logging and extract only redacted request structure.
+3. [completed] Capture repeated-session and usage behavior; use a redacting MITM only if first-party debug logs are insufficient.
+4. [completed] Compare captured behavior with inference, session, quota, proxy, TLS, and device-identity code.
+5. [completed] Update findings, progress, and the audit document with evidence, limits, and prioritized recommendations.
+
+### Boundaries
+
+- Use only the locally authenticated first-party Claude Code session explicitly authorized by the user.
+- Run from a temporary directory with no repository instructions, MCP configuration, or project secrets.
+- Never print or persist Authorization, refresh tokens, cookies, proxy credentials, full account identifiers, or raw Session IDs in repository files.
+- Prefer Claude's own debug log; a MITM capture must redact sensitive values before disk output and is evidence of HTTP shape, not native TLS behavior.
+- Do not claim that matching captured behavior prevents provider enforcement or makes third-party OAuth pooling compliant.
+
+### Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| The first temporary-directory orchestration script embedded shell parameter expansion inside a JavaScript template literal and failed to parse | 1 | Re-ran it with a plain JavaScript string and a simpler environment-name-only check. |
+| Safe mode still loaded user `settings.json` environment values and routed the first sample to a custom Base URL | 1 | Classified the result as a custom-base sample; empty setting sources proved that no direct OAuth login is available, so subsequent captures are explicitly scoped to the configured gateway path. |
+| A zsh preflight script assigned to the read-only special parameter `status` after Claude doctor completed | 1 | Read the already-created preflight files and used `rc` for the later auth-status check. |
+
+## Current Documentation: Claude Code Fidelity Audit Handoff
+
+### Goal
+
+Produce a self-contained review document for a second model that explains the account-pool request modes, the limits of full-prompt imitation, the recent token/cache/error failures, the upstream-fidelity audit, deployment risks, and the remaining corrective work.
+
+### Phases
+
+1. [completed] Reconcile the previous audit notes with the current request-rewrite, identity, session, quota-worker, proxy, and deployment code.
+2. [completed] Write the review document under `docs/` with code evidence, ranked findings, non-goals, and verification steps.
+3. [completed] Review the document for unsupported claims, secret leakage, current-worktree accuracy, and Markdown formatting.
+
+### Boundaries
+
+- Do not claim that request imitation can bypass Anthropic policy enforcement or prevent account restrictions.
+- Do not include tokens, API keys, account identifiers, proxy credentials, or raw database contents.
+- Separate upstream-visible behavior from downstream response cleanup and from deployment/version mismatches.
+
+### Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| The first completion patch expected a nonexistent `progress.md` subsection heading | 1 | The patch was rejected atomically; read the actual file header and applied smaller exact-context patches. |
+
+## Current Audit: Claude Code Upstream Fidelity And Account Enforcement Risk
+
+### Goal
+
+Audit whether account-pool traffic keeps stable per-account identity and Claude Code-compatible request behavior across local/server deployments, separate downstream cleanup guarantees from estimates, and identify likely account-enforcement causes using code evidence and current public Anthropic guidance.
+
+### Phases
+
+1. [completed] Trace persisted identity, session construction, request profile, TLS/header transport, proxy use, OAuth refresh, usage polling, and deployment storage paths.
+2. [completed] Compare the implementation with current Claude Code package behavior, Anthropic terms/documentation, and representative open-source pool approaches.
+3. [completed] Rank likely enforcement causes, identify observable deployment checks, and recommend compliant reliability changes without anti-detection claims.
+
+### Boundaries
+
+- Do not send live requests through invalid or potentially restricted accounts.
+- Do not expose credentials, proxy secrets, account IDs, or stored tokens.
+- Do not propose bypassing Anthropic enforcement; distinguish protocol correctness from provider policy compliance.
+
+### Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| One planning-file patch targeted an outdated heading form | 1 | Located the exact top-level audit sections and applied independent exact hunks. |
+
+## Current Follow-up: Prompt Cache And Anthropic Error Compatibility
+
+### Goal
+
+Preserve client-declared prompt-cache breakpoints through account-pool API mimic rewriting and return an Anthropic-compatible error envelope with a matching request ID.
+
+### Phases
+
+1. [completed] Trace the failed probes through system-prompt rewriting, cache TTL normalization, and Claude error serialization.
+2. [completed] Add regressions for migrated system cache controls and body/header request-ID consistency, then implement the smallest compatible fixes.
+3. [completed] Update secondary-development docs and run focused tests, full Go tests, formatting, and the required backend build.
+
+### Decisions
+
+- Preserve cache metadata only when the client explicitly supplied it; ordinary uncached system prompts keep their existing mimic behavior.
+- Move cached system text into ordered user content blocks so each original cache boundary survives, then reuse the existing 1h policy and four-breakpoint limit.
+- Use one request ID for the Anthropic error body and response headers, preferring an upstream-provided response ID when present.
+- Do not send live Anthropic requests while the available OAuth accounts are invalid.
+
 ## Current Implementation: Pool Config Inheritance, Model Capacity, And Health
 
 ### Goal

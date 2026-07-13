@@ -372,7 +372,9 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			}
 			c.Status(status)
 
-			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+			response := h.toClaudeError(errMsg)
+			response.RequestID = ensureClaudeRequestIDHeader(c)
+			errorBytes, _ := json.Marshal(response)
 			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 		},
 	})
@@ -384,8 +386,9 @@ type claudeErrorDetail struct {
 }
 
 type claudeErrorResponse struct {
-	Type  string            `json:"type"`
-	Error claudeErrorDetail `json:"error"`
+	Type      string            `json:"type"`
+	Error     claudeErrorDetail `json:"error"`
+	RequestID string            `json:"request_id,omitempty"`
 }
 
 func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claudeErrorResponse {
@@ -429,11 +432,12 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 		}
 	}
 
-	body, err := json.Marshal(h.toClaudeError(msg))
+	response := h.toClaudeError(msg)
+	response.RequestID = ensureClaudeRequestIDHeader(c)
+	body, err := json.Marshal(response)
 	if err != nil {
 		body = []byte(`{"type":"error","error":{"type":"api_error","message":"Internal Server Error"}}`)
 	}
-	ensureClaudeRequestIDHeader(c)
 	appendClaudeAPIResponse(c, body)
 	if !c.Writer.Written() {
 		c.Writer.Header().Set("Content-Type", "application/json")
@@ -496,12 +500,15 @@ func normalizeClaudeErrorType(status int, errType string, message string) string
 	return errType
 }
 
-func ensureClaudeRequestIDHeader(c *gin.Context) {
+func ensureClaudeRequestIDHeader(c *gin.Context) string {
 	if c == nil {
-		return
+		return ""
 	}
-	if c.Writer.Header().Get("request-id") != "" || c.Writer.Header().Get("x-request-id") != "" {
-		return
+	if requestID := strings.TrimSpace(c.Writer.Header().Get("request-id")); requestID != "" {
+		return requestID
+	}
+	if requestID := strings.TrimSpace(c.Writer.Header().Get("x-request-id")); requestID != "" {
+		return requestID
 	}
 	requestID := logging.GetGinRequestID(c)
 	if requestID == "" && c.Request != nil {
@@ -511,6 +518,7 @@ func ensureClaudeRequestIDHeader(c *gin.Context) {
 		requestID = logging.GenerateRequestID()
 	}
 	c.Writer.Header().Set("request-id", requestID)
+	return requestID
 }
 
 func claudeErrorTypeFromStatus(status int) string {

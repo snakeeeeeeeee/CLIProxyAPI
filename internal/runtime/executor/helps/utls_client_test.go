@@ -49,6 +49,13 @@ func TestClaudeCodeNodeTransportDisablesHTTP2(t *testing.T) {
 	}
 }
 
+func TestUtlsTransportInvalidProxyFailsClosed(t *testing.T) {
+	transport := newUtlsRoundTripper("ftp://invalid.example.com:21", utlsProfileChrome)
+	if _, err := transport.dialer.Dial("tcp", "127.0.0.1:1"); err == nil || !strings.Contains(err.Error(), "configure outbound proxy") {
+		t.Fatalf("Dial() error = %v", err)
+	}
+}
+
 func TestClaudeCodeNodeTLSFingerprintFixture(t *testing.T) {
 	sum := md5.Sum([]byte(ClaudeCodeNodeTLSJA3RawValue()))
 	if got := fmt.Sprintf("%x", sum); got != ClaudeCodeNodeTLSJA3 {
@@ -157,10 +164,10 @@ func TestClaudeCodeNodeTransportWritesCapturedHTTP11HeaderOrder(t *testing.T) {
 			values[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
 		}
 		want := []string{
-			"Accept", "Content-Type", "User-Agent", "X-Claude-Code-Session-Id",
-			"X-Stainless-Lang", "X-Stainless-Package-Version", "X-Stainless-OS", "X-Stainless-Arch",
-			"X-Stainless-Runtime", "X-Stainless-Runtime-Version", "X-Stainless-Retry-Count", "X-Stainless-Timeout",
-			"anthropic-dangerous-direct-browser-access", "anthropic-version", "anthropic-beta", "Authorization",
+			"Accept", "Authorization", "Content-Type", "User-Agent", "X-Claude-Code-Session-Id",
+			"X-Stainless-Arch", "X-Stainless-Lang", "X-Stainless-OS", "X-Stainless-Package-Version",
+			"X-Stainless-Retry-Count", "X-Stainless-Runtime", "X-Stainless-Runtime-Version", "X-Stainless-Timeout",
+			"anthropic-beta", "anthropic-dangerous-direct-browser-access", "anthropic-version",
 			"x-app", "Connection", "Host", "Accept-Encoding", "Content-Length",
 		}
 		if strings.Join(got, "\n") != strings.Join(want, "\n") {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1087,7 +1088,7 @@ func TestStoreMigratesLegacyBuiltinClaudeCodeProfileWithoutDroppingData(t *testi
 	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_profile_json'`, string(raw)); err != nil {
 		t.Fatalf("write legacy profile: %v", err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_207_r2'`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_207_r3'`); err != nil {
 		t.Fatalf("delete migration marker: %v", err)
 	}
 	if err := store.migrateClaudeCodeProfileRevision(ctx); err != nil {
@@ -1110,14 +1111,14 @@ func TestStoreMigratesLegacyBuiltinClaudeCodeProfileWithoutDroppingData(t *testi
 	}
 }
 
-func TestBuiltinClaudeCodeProfileR2MigrationBoundary(t *testing.T) {
+func TestBuiltinClaudeCodeProfileR3MigrationBoundary(t *testing.T) {
 	tests := []struct {
 		name    string
 		profile ClaudeCodeProfile
 		want    bool
 	}{
 		{name: "legacy r1", profile: ClaudeCodeProfile{Revision: "2.1.207-r1", Version: "2.1.207", UpdatedFrom: "builtin-trace-baseline:2.1.207", Locked: true}, want: true},
-		{name: "current r2", profile: defaultClaudeCodeProfile(), want: false},
+		{name: "current r3", profile: defaultClaudeCodeProfile(), want: false},
 		{name: "external profile", profile: ClaudeCodeProfile{Revision: "2.1.207-r1", Version: "2.1.207", UpdatedFrom: "manual", Locked: true}, want: false},
 	}
 	for _, tt := range tests {
@@ -1129,11 +1130,96 @@ func TestBuiltinClaudeCodeProfileR2MigrationBoundary(t *testing.T) {
 	}
 
 	profile := EffectiveClaudeCodeProfile(ClaudeCodeProfile{})
-	if profile.Revision != "2.1.207-r2" || profile.Headers["X-Stainless-Os"] != "MacOS" || profile.Headers["X-Stainless-Arch"] != "arm64" {
+	if profile.Revision != "2.1.207-r3" || profile.Headers["X-Stainless-Os"] != "MacOS" || profile.Headers["X-Stainless-Arch"] != "arm64" {
 		t.Fatalf("effective profile identity = revision %q platform %q/%q", profile.Revision, profile.Headers["X-Stainless-Os"], profile.Headers["X-Stainless-Arch"])
 	}
 	if len(profile.HeaderOrder) == 0 || profile.TLSJA3 == "" || profile.TLSJA4 == "" || profile.TLSALPN != "http/1.1" {
 		t.Fatalf("effective transport profile = %+v", profile)
+	}
+	if !isExactBuiltinClaudeCodeProfileR2(builtinClaudeCodeProfileR2()) {
+		t.Fatal("exact r2 built-in profile was not recognized")
+	}
+	customHeader := builtinClaudeCodeProfileR2()
+	customHeader.Headers["X-Stainless-Timeout"] = "900"
+	if isExactBuiltinClaudeCodeProfileR2(customHeader) {
+		t.Fatal("custom r2 Header was treated as the built-in baseline")
+	}
+	customPrompt := builtinClaudeCodeProfileR2()
+	customPrompt.SystemPrompt = "custom prompt"
+	if isExactBuiltinClaudeCodeProfileR2(customPrompt) {
+		t.Fatal("custom r2 prompt was treated as the built-in baseline")
+	}
+}
+
+func TestClaudeCodeProfileR3MigrationUpgradesExactR2AndStalesCalibration(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	r2 := builtinClaudeCodeProfileR2()
+	raw, _ := json.Marshal(r2)
+	oldEffective := EffectiveClaudeCodeProfile(r2)
+	oldFingerprint := ClaudeCodeProfileFingerprint(oldEffective)
+	oldOverhead := ClaudeCodeProfileInjectedOverheadTokens(oldEffective)
+	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_profile_json'`, string(raw)); err != nil {
+		t.Fatalf("write r2 profile: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_pool_json'`, fmt.Sprintf(`{"pure_mode":true,"usage":{"system_prompt_overhead_tokens":%d}}`, oldOverhead)); err != nil {
+		t.Fatalf("write r2 usage config: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_207_r3'`); err != nil {
+		t.Fatalf("delete r3 marker: %v", err)
+	}
+	if _, err := store.UpsertUsageCalibration(ctx, UsageCalibration{
+		Model:              "claude-opus-4-8",
+		ProfileFingerprint: oldFingerprint,
+		OverheadTokens:     oldOverhead,
+		Status:             UsageCalibrationCalibrated,
+	}); err != nil {
+		t.Fatalf("seed r2 calibration: %v", err)
+	}
+
+	if err := store.migrateClaudeCodeProfileRevision(ctx); err != nil {
+		t.Fatalf("migrate exact r2 profile: %v", err)
+	}
+	doc, err := store.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig() error = %v", err)
+	}
+	if doc.Profile.Revision != DefaultClaudeCodeProfileRevision {
+		t.Fatalf("profile revision = %q, want %q", doc.Profile.Revision, DefaultClaudeCodeProfileRevision)
+	}
+	if doc.ClaudeCode.Usage.SystemPromptOverheadTokens != DefaultCleanInputOverheadTokens {
+		t.Fatalf("overhead = %d, want recomputed %d", doc.ClaudeCode.Usage.SystemPromptOverheadTokens, DefaultCleanInputOverheadTokens)
+	}
+	calibration, err := store.GetUsageCalibration(ctx, "claude-opus-4-8", oldFingerprint)
+	if err != nil || calibration.Status != UsageCalibrationStale {
+		t.Fatalf("old calibration = %+v, err=%v, want stale", calibration, err)
+	}
+	if err := store.migrateClaudeCodeProfileRevision(ctx); err != nil {
+		t.Fatalf("repeat r3 migration: %v", err)
+	}
+}
+
+func TestClaudeCodeProfileR3MigrationPreservesCustomR2(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	custom := builtinClaudeCodeProfileR2()
+	custom.Headers["X-Stainless-Timeout"] = "900"
+	raw, _ := json.Marshal(custom)
+	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_profile_json'`, string(raw)); err != nil {
+		t.Fatalf("write custom r2 profile: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_207_r3'`); err != nil {
+		t.Fatalf("delete r3 marker: %v", err)
+	}
+	if err := store.migrateClaudeCodeProfileRevision(ctx); err != nil {
+		t.Fatalf("migrate custom r2 profile: %v", err)
+	}
+	doc, err := store.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig() error = %v", err)
+	}
+	if doc.Profile.Revision != "2.1.207-r2" || doc.Profile.Headers["X-Stainless-Timeout"] != "900" {
+		t.Fatalf("custom r2 profile was overwritten: %+v", doc.Profile)
 	}
 }
 

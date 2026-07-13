@@ -21,7 +21,7 @@ const (
 var DefaultCleanInputOverheadTokens = ClaudeCodeProfileInjectedOverheadTokens(EffectiveClaudeCodeProfileConfig{
 	Revision:     DefaultClaudeCodeProfileRevision,
 	Version:      DefaultClaudeCodeProfileVersion,
-	SystemPrompt: helps.ClaudeCodeStaticPrompt(),
+	SystemPrompt: helps.ClaudeCodeOrdinaryStablePrompt(),
 })
 
 // ClaudeCodeProfileInjectedOverheadTokens estimates only the blocks added by
@@ -33,7 +33,7 @@ func ClaudeCodeProfileInjectedOverheadTokens(profile EffectiveClaudeCodeProfileC
 	}
 	staticPrompt := strings.TrimSpace(profile.SystemPrompt)
 	if staticPrompt == "" {
-		staticPrompt = helps.ClaudeCodeStaticPrompt()
+		staticPrompt = helps.ClaudeCodeOrdinaryStablePrompt()
 	}
 	text := strings.Join([]string{
 		"x-anthropic-billing-header: cc_version=" + version + ".000; cc_entrypoint=sdk-cli;",
@@ -91,7 +91,7 @@ func ClaudeCodeProfileFingerprint(profile EffectiveClaudeCodeProfileConfig) stri
 		HeaderOrder:         append([]string(nil), profile.HeaderOrder...),
 		Betas:               betas,
 		SystemPrompt:        strings.TrimSpace(profile.SystemPrompt),
-		StaticPrompt:        helps.ClaudeCodeStaticPrompt(),
+		StaticPrompt:        helps.ClaudeCodeOrdinaryStablePrompt(),
 		BillingBlockEnabled: profile.BillingBlockEnabled,
 		BillingTemplate:     "x-anthropic-billing-header: cc_version=<version>.<fp>; cc_entrypoint=sdk-cli;",
 		MetadataUserIDMode:  strings.TrimSpace(profile.MetadataUserIDMode),

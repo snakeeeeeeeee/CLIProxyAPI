@@ -3,6 +3,8 @@
 package claude
 
 import (
+	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -35,6 +37,7 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(cfg.ProxyURL)
 		if errBuild != nil {
 			log.Errorf("failed to configure proxy dialer for %q: %v", proxyutil.Redact(cfg.ProxyURL), errBuild)
+			dialer = proxyErrorDialer{err: fmt.Errorf("configure Anthropic proxy: %w", errBuild)}
 		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
 			dialer = proxyDialer
 		}
@@ -45,6 +48,14 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 		pending:     make(map[string]*sync.Cond),
 		dialer:      dialer,
 	}
+}
+
+type proxyErrorDialer struct {
+	err error
+}
+
+func (d proxyErrorDialer) Dial(string, string) (net.Conn, error) {
+	return nil, d.err
 }
 
 // getOrCreateConnection gets an existing connection or creates a new one.

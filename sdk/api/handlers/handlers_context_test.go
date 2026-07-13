@@ -26,6 +26,7 @@ func TestGetContextWithCancelPreservesRequestRoutingValues(t *testing.T) {
 	requestCtx := WithPoolScope(request.Context(), coreexecutor.PoolScopeClaudeAccountPool)
 	requestCtx = WithPinnedAuthID(requestCtx, "account-auth")
 	requestCtx = WithExecutionSessionID(requestCtx, "execution-session")
+	requestCtx = WithAccountPoolSessionKeyIdentity(requestCtx, "id:pool-key")
 	requestCtx = WithSelectedAuthIDCallback(requestCtx, func(id string) { selectedID = id })
 	requestCtx = WithDisallowFreeAuth(requestCtx)
 	ginCtx.Request = request.WithContext(requestCtx)
@@ -57,5 +58,8 @@ func TestGetContextWithCancelPreservesRequestRoutingValues(t *testing.T) {
 	metadata := requestExecutionMetadata(got)
 	if metadata[coreexecutor.PoolScopeMetadataKey] != coreexecutor.PoolScopeClaudeAccountPool {
 		t.Fatalf("execution metadata = %#v", metadata)
+	}
+	if metadata[coreexecutor.AccountPoolSessionKeyIdentityMetadataKey] != "id:pool-key" {
+		t.Fatalf("Session key identity was not preserved: %#v", metadata)
 	}
 }

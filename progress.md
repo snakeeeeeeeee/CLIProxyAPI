@@ -1,5 +1,53 @@
 # Progress: Multi-Pool API Keys, Pricing, Usage, And Console
 
+## 2026-07-14 Account-Pool Protocol Consistency Implementation
+
+- Recovered the prior read-only review and confirmed the current approved dirty changes are the implementation baseline.
+- Read the repository secondary-development notes and revalidated the locked Session, Profile, quota, proxy, diagnostics, UI, and rollout decisions.
+- Started phase 1 with no runtime edits yet; `git diff --check` passes.
+- Completed Session extraction and scoping: real passthrough preserves the inbound Session, ordinary explicit Sessions remain stable across account switches, and no-Session requests reuse a one-hour sliding Session scoped by pool Key and selected account.
+- Removed `X-Client-Request-Id` from account-pool Session sources while leaving generic PI/Codex extraction unchanged.
+- Added generated-key ID and legacy-key in-memory digest propagation, skipped generic OAuth-token Session caching on account-pool requests, and covered source precedence, Key/pool/account isolation, TTL expiry, detached context propagation, and legacy digest handling.
+- Focused tests pass for `sdk/cliproxy/auth`, `sdk/api/handlers`, `internal/api`, `internal/runtime/executor/helps`, and `internal/runtime/executor`.
+- Upgraded the built-in profile to `2.1.207-r3`, aligned the captured HTTP/1.1 Header order, retained the existing TLS fixture, and introduced a tool-independent ordinary-mode core.
+- Changed account-pool beta handling to preserve supported client/body capabilities and add only credential-required OAuth beta; real passthrough preserves inbound order.
+- Added exact-r2 migration matching, custom-profile preservation, default overhead recomputation, old-calibration staleness, idempotency, and deterministic billing fixtures.
+- Focused resourcepool, transport-helper, executor, handler, and API tests pass after the r3 changes; `git diff --check` passes.
+- Made `account-quota.interval` authoritative for successful probes, passive Header observations, and inference-success postponement while retaining a 15-second due-account scanner.
+- Added per-account quota singleflight, account-profiled OAuth usage transport, bound-proxy routing, OAuth beta, and safe probe summaries without Session, billing prompt, model body, Token, or proxy URL data.
+- Changed malformed configured proxies to fail closed in Claude OAuth and protected uTLS paths; empty or explicit `direct` remains the only direct-routing case.
+- Added a persistent database instance ID with a short diagnostics fingerprint, an authenticated no-store diagnostics endpoint, secret-redaction tests, and a responsive System Settings diagnostics panel with manual/SSE refresh only.
+- Focused resourcepool and management-handler tests plus the resource-console TypeScript check pass after the diagnostics UI integration.
+- `gofmt -w .`, `go test ./...`, the required backend build, frontend type-check/build, and `git diff --check` all pass on the final worktree.
+- Isolated browser QA used a fresh database with external account/proxy workers disabled and one synthetic redacted account. Manual diagnostics refresh worked; 375/768 rendered account cards, 1024/1440 rendered all six table columns, every viewport had zero page-level horizontal overflow, and browser logs had no warnings/errors.
+- Fixed two issues found by visual QA: the 1024px issue column collapsing to zero width and the status badge wrapping inside its cell. The temporary port, key, account, database, and files were removed after the check.
+- A real Anthropic smoke was not run because no valid authorized account is available; it remains an explicit pre-release gate.
+
+## 2026-07-14 Real Claude Code Live Capture
+
+- Verified local Claude Code `2.1.207`, OAuth authentication, first-party provider classification, and the available safe/debug/session controls.
+- Created an isolated `/tmp` workspace and sent one user-authorized minimal Opus request with safe mode, no tools, no MCP servers, no session persistence, and API debug logging.
+- Detected that user settings redirected the sample to a non-Anthropic custom Base URL; marked the sample as custom-base evidence rather than a direct Anthropic baseline.
+- Read only a broadly redacted debug view. No Authorization value, OAuth token, cookie, account identifier, or proxy credential was printed or copied into the repository.
+- Next: exclude user setting sources, confirm the target host in debug output, then capture direct first-party request/session/usage structure.
+- Confirmed empty setting sources report no logged-in auth, so a direct first-party capture is not available from the current machine state.
+- Added and ran an in-memory redacting MITM path through the existing local proxy. Two repeated Opus turns produced stable device/Session metadata and stable source-specific billing fingerprints; all persisted capture records contain only hashes, lengths, allowlisted protocol values, cache locations, numeric usage, and event types.
+- Tried interactive `/usage`; it remained local-only in `API Usage Billing` mode and emitted no OAuth usage endpoint request.
+- Measured the current ordinary-mimic static prompt at 5,128 characters versus 3,168 characters for the real tool-disabled main request.
+- Captured one safe-mode request with the 26 built-in tools enabled; the real main body was about 86.5 KB and retained stable device/Session identity.
+- Stopped the Claude interactive session and redacting MITM process after capture.
+- Updated `docs/claude-code-account-pool-fidelity-audit.md` with the live custom-base evidence, explicit direct-OAuth limitations, Header-order drift, prompt/tool measurements, credential-beta ambiguity, comparative open-source patterns, and revised remediation order.
+- Scanned the repository-facing capture notes for tokens, Authorization values, custom hostnames, server addresses, and raw identifiers; no matches were found. All temporary logs, sanitized flow records, the MITM add-on, and the temporary directory were removed.
+- Verified all cited official/open-source links returned HTTP 200, `git diff --check` passed, focused executor/Claude handler tests passed, `go test ./...` passed, and the required backend build succeeded.
+
+## 2026-07-14 Claude Code Fidelity Audit Handoff
+
+- Reconciled the current ordinary API mimic, real Claude Code passthrough, persisted identity, Session construction, quota worker, proxy transport, and deployment behavior with the previous audit notes.
+- Added `docs/claude-code-account-pool-fidelity-audit.md` as a self-contained independent-review handoff covering prompt boundaries, recent token/cache/error probes, ranked upstream mismatches, deployment risks, policy constraints, remaining work, and a no-live-account verification plan.
+- Confirmed the document contains no credential, proxy, account, Session, or server-address material; `git diff --check` passed and all six cited public references returned HTTP 200.
+- Added a narrow `.gitignore` exception so this audit document can be committed without exposing other locally ignored documentation.
+- No runtime behavior changed, and no request was sent to Anthropic.
+
 ## 2026-07-13 Pool Config/Insights Resume
 
 - Recovered the existing pool-config implementation and confirmed the approved design remains the active task.
@@ -327,3 +375,25 @@
 - Verified server-side event pagination against 28 copied events: page 1 renders 20 rows, page 2 renders rows 21-28, and previous/next controls enable and disable correctly.
 - Confirmed the resource-console browser log contains no errors, reset the temporary viewport, closed the isolated browser tabs, and stopped the isolated `28319` service.
 - Final focused/full Go tests, frontend type-check/build, required backend build, and `git diff --check` pass.
+# Claude Code Upstream Fidelity Audit (2026-07-13)
+
+- Started a code-and-public-source audit without sending upstream requests.
+- Confirmed the documented session behavior is request-random when clients omit an explicit session identifier; this is the first concrete Claude Code behavior mismatch to investigate.
+- Confirmed the persisted account identity, pinned software/TLS profile, proxy selection, and Docker migration behavior from source.
+- Compared the implementation with Anthropic's current legal/compliance guidance and public sub2api/oh-my-pi session and identity fixes.
+- Separated downstream response cleanup from upstream account-risk signals; the former cannot influence Anthropic-side detection.
+- Rechecked the local 2.1.207 real traces: four requests share one Session ID and each header matches the body metadata, while the project regression currently requires random per-request Sessions when the downstream caller omits one.
+- Confirmed npm latest and local Claude Code are both 2.1.207 and summarized the low-volume local ledger without exposing account or credential data.
+- Found a background-traffic identity mismatch: the five-minute OAuth usage refresher advertises `CLIProxyAPI Resource Pool` and uses generic Go HTTP while inference advertises the pinned Claude Code profile. The configured quota interval is currently ignored when scheduling the next successful check.
+- Finished the audit with ranked causes, deployment identity/proxy diagnostics, and a compliant-path recommendation; no runtime code or live Anthropic request was added for this audit.
+- Preserved the existing uncommitted cache, error-envelope, pure-usage, and count-token fixes.
+
+# Prompt Cache And Error Envelope Follow-up (2026-07-13)
+
+- Read the failed probe payloads and mapped both failures to local code paths.
+- Confirmed account-pool mimic drops the explicit system-block cache control before the existing 1h TTL policy runs.
+- Confirmed bad-request error type normalization exists locally, while the serialized body still omits `request_id`.
+- Live upstream verification is unavailable because the current OAuth accounts are invalid; verification will use deterministic local HTTP servers plus full regression/build checks.
+- Added failing regressions that reproduced both probes, then preserved ordered system cache controls in migrated user blocks and added one shared error request ID for body and headers.
+- Focused executor and Claude handler package tests pass, including the existing pure-mode and count-token regressions.
+- Completed `gofmt -w .`, `go test ./...`, the required `go build -o test-output ./cmd/server`, and `git diff --check`; all passed and the temporary binary was removed.

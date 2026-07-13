@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -196,6 +197,46 @@ func defaultClaudeCodeProfile() ClaudeCodeProfile {
 			"context-management-2025-06-27",
 			"prompt-caching-scope-2026-01-05",
 		},
+		SystemPrompt:        helps.ClaudeCodeOrdinaryStablePrompt(),
+		BillingBlockEnabled: &billingBlockEnabled,
+		MetadataUserIDMode:  "account",
+		UpdatedFrom:         "builtin-trace-baseline:2.1.207",
+		Locked:              true,
+		SystemPromptMode:    "builtin_ordinary_2.1.207_r3",
+		TLSProfile:          helps.ClaudeCodeNodeTLSProfileName,
+		TLSJA3:              helps.ClaudeCodeNodeTLSJA3,
+		TLSJA4:              helps.ClaudeCodeNodeTLSJA4,
+		TLSALPN:             helps.ClaudeCodeNodeTLSALPN,
+	}
+}
+
+func builtinClaudeCodeProfileR2() ClaudeCodeProfile {
+	billingBlockEnabled := true
+	return ClaudeCodeProfile{
+		Revision:  "2.1.207-r2",
+		Version:   "2.1.207",
+		UserAgent: "claude-cli/2.1.207 (external, sdk-cli)",
+		Headers: map[string]string{
+			"Anthropic-Version":                         "2023-06-01",
+			"Anthropic-Dangerous-Direct-Browser-Access": "true",
+			"X-App":                       "cli",
+			"X-Stainless-Retry-Count":     "0",
+			"X-Stainless-Runtime":         "node",
+			"X-Stainless-Runtime-Version": "v26.3.0",
+			"X-Stainless-Package-Version": "0.94.0",
+			"X-Stainless-Os":              "MacOS",
+			"X-Stainless-Arch":            "arm64",
+			"X-Stainless-Lang":            "js",
+			"X-Stainless-Timeout":         "600",
+		},
+		HeaderOrder: helps.ClaudeCodeNodeR2HeaderOrder(),
+		Betas: []string{
+			"claude-code-20250219",
+			"interleaved-thinking-2025-05-14",
+			"thinking-token-count-2026-05-13",
+			"context-management-2025-06-27",
+			"prompt-caching-scope-2026-01-05",
+		},
 		SystemPrompt:        helps.ClaudeCodeStaticPrompt(),
 		BillingBlockEnabled: &billingBlockEnabled,
 		MetadataUserIDMode:  "account",
@@ -207,6 +248,13 @@ func defaultClaudeCodeProfile() ClaudeCodeProfile {
 		TLSJA4:              helps.ClaudeCodeNodeTLSJA4,
 		TLSALPN:             helps.ClaudeCodeNodeTLSALPN,
 	}
+}
+
+func isExactBuiltinClaudeCodeProfileR2(profile ClaudeCodeProfile) bool {
+	profile.UpdatedAt = nil
+	expected := builtinClaudeCodeProfileR2()
+	expected.UpdatedAt = nil
+	return reflect.DeepEqual(profile, expected)
 }
 
 func normalizeConfigFile(doc *ConfigFile) {

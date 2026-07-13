@@ -15,7 +15,7 @@ const (
 	DefaultDBFileName                = "resource-pools.db"
 	DefaultAccountPoolID             = "default"
 	DefaultClaudeCodeProfileVersion  = "2.1.207"
-	DefaultClaudeCodeProfileRevision = "2.1.207-r2"
+	DefaultClaudeCodeProfileRevision = "2.1.207-r3"
 
 	HealthUnknown   = "unknown"
 	HealthHealthy   = "healthy"
@@ -860,13 +860,25 @@ type ClaudeCodeAccount struct {
 
 // AccountQuota is the latest Claude OAuth usage snapshot for one account.
 type AccountQuota struct {
-	AccountID string        `json:"account_id,omitempty"`
-	Status    string        `json:"status"`
-	Windows   []QuotaWindow `json:"windows"`
-	CheckedAt *time.Time    `json:"checked_at,omitempty"`
-	LastError string        `json:"last_error,omitempty"`
-	RawJSON   string        `json:"raw_json,omitempty"`
-	Source    string        `json:"source,omitempty"`
+	AccountID string             `json:"account_id,omitempty"`
+	Status    string             `json:"status"`
+	Windows   []QuotaWindow      `json:"windows"`
+	CheckedAt *time.Time         `json:"checked_at,omitempty"`
+	LastError string             `json:"last_error,omitempty"`
+	RawJSON   string             `json:"raw_json,omitempty"`
+	Source    string             `json:"source,omitempty"`
+	Probe     *AccountQuotaProbe `json:"probe,omitempty"`
+}
+
+// AccountQuotaProbe is a safe summary of the latest OAuth usage transport.
+// It intentionally excludes credentials, request identity, proxy URLs, and response bodies.
+type AccountQuotaProbe struct {
+	RequestedAt      time.Time `json:"requested_at"`
+	ProfileRevision  string    `json:"profile_revision"`
+	TransportProfile string    `json:"transport_profile"`
+	ProxyMode        string    `json:"proxy_mode"`
+	ProxyResourceID  string    `json:"proxy_resource_id,omitempty"`
+	StatusCode       int       `json:"status_code"`
 }
 
 // QuotaWindow is one usage window returned by Anthropic's OAuth usage endpoint.

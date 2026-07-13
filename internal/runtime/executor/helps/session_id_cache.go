@@ -34,6 +34,8 @@ var currentClaudeIDKVClient = func() (claudeIDKVClient, bool, error) {
 	return homekv.CurrentKVClient()
 }
 
+var sessionIDNow = time.Now
+
 const (
 	sessionIDTTL                = time.Hour
 	sessionIDCacheCleanupPeriod = 15 * time.Minute
@@ -50,7 +52,7 @@ func startSessionIDCacheCleanup() {
 }
 
 func purgeExpiredSessionIDs() {
-	now := time.Now()
+	now := sessionIDNow()
 	sessionIDCacheMu.Lock()
 	for key, entry := range sessionIDCache {
 		if !entry.expire.After(now) {
@@ -60,23 +62,23 @@ func purgeExpiredSessionIDs() {
 	sessionIDCacheMu.Unlock()
 }
 
-func sessionIDCacheKey(apiKey string) string {
-	sum := sha256.Sum256([]byte(apiKey))
+func sessionIDCacheKey(scope string) string {
+	sum := sha256.Sum256([]byte(scope))
 	return hex.EncodeToString(sum[:])
 }
 
-// CachedSessionID returns a stable session UUID per apiKey, refreshing the TTL on each access.
-func CachedSessionID(apiKey string) string {
-	value, errValue := CachedSessionIDRequired(context.Background(), apiKey)
+// CachedSessionID returns a stable session UUID per scope, refreshing the TTL on each access.
+func CachedSessionID(scope string) string {
+	value, errValue := CachedSessionIDRequired(context.Background(), scope)
 	if errValue == nil && value != "" {
 		return value
 	}
 	return uuid.New().String()
 }
 
-// CachedSessionIDRequired returns a stable session UUID per apiKey for request-time paths.
-func CachedSessionIDRequired(ctx context.Context, apiKey string) (string, error) {
-	if apiKey == "" {
+// CachedSessionIDRequired returns a stable session UUID per scope for request-time paths.
+func CachedSessionIDRequired(ctx context.Context, scope string) (string, error) {
+	if scope == "" {
 		return uuid.New().String(), nil
 	}
 	client, homeMode, errClient := currentClaudeIDKVClient()
@@ -84,7 +86,7 @@ func CachedSessionIDRequired(ctx context.Context, apiKey string) (string, error)
 		if errClient != nil {
 			return "", errClient
 		}
-		key := claudeSessionIDKVKey(apiKey)
+		key := claudeSessionIDKVKey(scope)
 		raw, found, errGet := client.KVGet(ctx, key)
 		if errGet != nil {
 			return "", errGet
@@ -111,8 +113,8 @@ func CachedSessionIDRequired(ctx context.Context, apiKey string) (string, error)
 
 	sessionIDCacheCleanupOnce.Do(startSessionIDCacheCleanup)
 
-	key := sessionIDCacheKey(apiKey)
-	now := time.Now()
+	key := sessionIDCacheKey(scope)
+	now := sessionIDNow()
 
 	sessionIDCacheMu.RLock()
 	entry, ok := sessionIDCache[key]
@@ -143,6 +145,6 @@ func CachedSessionIDRequired(ctx context.Context, apiKey string) (string, error)
 	return entry.value, nil
 }
 
-func claudeSessionIDKVKey(apiKey string) string {
-	return "cpa:claude:session-id:" + homekv.HashKeyPart(apiKey)
+func claudeSessionIDKVKey(scope string) string {
+	return "cpa:claude:session-id:" + homekv.HashKeyPart(scope)
 }

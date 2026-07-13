@@ -39,6 +39,8 @@ const (
 	AccountPoolIDMetadataKey = "account_pool_id"
 	// AccountPoolAPIKeyIDMetadataKey stores the generated pool-key ID without its secret.
 	AccountPoolAPIKeyIDMetadataKey = "account_pool_api_key_id"
+	// AccountPoolSessionKeyIdentityMetadataKey stores a request-local, non-secret key identity for Session scoping.
+	AccountPoolSessionKeyIdentityMetadataKey = "account_pool_session_key_identity"
 	// AccountPoolPriceVersionMetadataKey pins the request-start model price revision.
 	AccountPoolPriceVersionMetadataKey = "account_pool_price_version_id"
 	// AccountPoolIDAttributeKey stores account membership on runtime auth records.

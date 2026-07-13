@@ -16,7 +16,7 @@ func (s *Store) MergeAccountRateLimitHeaders(ctx context.Context, accountID stri
 	if len(headers) == 0 {
 		return s.GetAccount(ctx, accountID)
 	}
-	now := time.Now()
+	now := accountQuotaNow()
 	parsed := parseUnifiedRateLimitWindows(headers, now)
 	if len(parsed) == 0 {
 		return s.GetAccount(ctx, accountID)
@@ -49,13 +49,26 @@ func (s *Store) MergeAccountRateLimitHeaders(ctx context.Context, accountID stri
 		CheckedAt: &now,
 		RawJSON:   rawJSON,
 		Source:    "response_headers",
+		Probe:     accountQuotaProbe(account.Quota),
 	})
 	if err != nil {
 		return nil, err
 	}
-	next := nextAccountHealthCheck(account.ID, now, quotaDefaultInterval)
+	interval, errInterval := s.accountQuotaInterval(ctx)
+	if errInterval != nil {
+		interval = quotaDefaultInterval
+	}
+	next := nextAccountHealthCheck(account.ID, now, interval)
 	_, _ = s.db.ExecContext(ctx, `UPDATE claude_code_accounts SET next_health_check_at = ? WHERE id = ?`, dbTime(next), account.ID)
 	return saved, nil
+}
+
+func accountQuotaProbe(quota *AccountQuota) *AccountQuotaProbe {
+	if quota == nil || quota.Probe == nil {
+		return nil
+	}
+	copy := *quota.Probe
+	return &copy
 }
 
 func parseUnifiedRateLimitWindows(headers http.Header, now time.Time) []QuotaWindow {

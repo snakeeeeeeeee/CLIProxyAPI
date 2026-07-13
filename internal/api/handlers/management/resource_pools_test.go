@@ -100,6 +100,39 @@ func TestClaudeCodeAccountPoolConfigHandlersExposeInheritance(t *testing.T) {
 	}
 }
 
+func TestGetClaudeCodeAccountPoolDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(filepath.Join(dir, "resource-pools.yaml"), []byte("database-path: resource-pools.db\n"), 0o600); err != nil {
+		t.Fatalf("write resource pool config: %v", err)
+	}
+	cfg := &config.Config{ResourcePools: config.ResourcePoolsConfig{Enabled: true, ConfigFile: "resource-pools.yaml"}}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/claude-code-account-pool/diagnostics", nil)
+	handler := &Handler{cfg: cfg, configFilePath: configPath}
+	handler.GetClaudeCodeAccountPoolDiagnostics(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	var diagnostics resourcepool.AccountPoolDiagnostics
+	if err := json.Unmarshal(recorder.Body.Bytes(), &diagnostics); err != nil {
+		t.Fatalf("decode diagnostics response: %v", err)
+	}
+	if got := len(diagnostics.Database.InstanceFingerprint); got != 12 {
+		t.Fatalf("database instance fingerprint length = %d, want 12", got)
+	}
+	if diagnostics.Profile.Revision == "" || diagnostics.Quota.SchedulerTick == "" {
+		t.Fatalf("diagnostics missing runtime summaries: %+v", diagnostics)
+	}
+}
+
 func TestGetClaudeCodePoolAPIKeySecret(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")

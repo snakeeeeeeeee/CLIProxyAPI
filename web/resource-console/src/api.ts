@@ -803,6 +803,78 @@ export interface UsageCalibrationResponse {
   items: UsageCalibration[];
 }
 
+export type AccountPoolDiagnosticStatus = "healthy" | "attention" | "critical" | string;
+
+export interface AccountPoolQuotaProbeDiagnostic {
+  requested_at: string;
+  profile_revision: string;
+  transport_profile: string;
+  proxy_mode: string;
+  proxy_resource_id?: string;
+  status_code: number;
+}
+
+export interface AccountPoolAccountDiagnostic {
+  account_fingerprint: string;
+  device_fingerprint?: string;
+  pool_id: string;
+  status: AccountPoolDiagnosticStatus;
+  issues: string[];
+  proxy_resource_id?: string;
+  last_observed_exit_ip?: string;
+  token_expires_at?: string;
+  last_quota_at?: string;
+  next_quota_at?: string;
+  quota_transport?: string;
+  probe?: AccountPoolQuotaProbeDiagnostic;
+}
+
+export interface AccountPoolDiagnostics {
+  status: AccountPoolDiagnosticStatus;
+  issues: string[];
+  as_of: string;
+  build: {
+    version: string;
+    commit: string;
+    build_date: string;
+    go_version: string;
+    goos: string;
+    goarch: string;
+  };
+  database: {
+    path: string;
+    instance_fingerprint: string;
+  };
+  profile: {
+    version: string;
+    revision: string;
+    fingerprint: string;
+    user_agent: string;
+    header_count: number;
+    header_order_count: number;
+    header_config_hash: string;
+    tls_profile: string;
+    tls_ja3: string;
+    tls_ja4: string;
+    tls_alpn: string;
+    allow_client_cache_ttl: boolean;
+  };
+  quota: {
+    enabled: boolean;
+    interval: string;
+    concurrency: number;
+    scheduler_tick: string;
+    global_proxy_mode: string;
+  };
+  summary: {
+    total: number;
+    healthy: number;
+    attention: number;
+    critical: number;
+  };
+  accounts: AccountPoolAccountDiagnostic[];
+}
+
 export interface ProxyPayload {
   name?: string;
   proxy_url?: string;
@@ -1018,6 +1090,7 @@ export const api = {
   rotatePoolAPIKey: (id: string) =>
     request<PoolAPIKeyCredential>(`/claude-code-account-pool/api-keys/${encodeURIComponent(id)}/rotate`, { method: "POST" }),
   poolConfig: () => request<ClaudeCodePoolConfigResponse>("/claude-code-account-pool/config"),
+  diagnostics: () => request<AccountPoolDiagnostics>("/claude-code-account-pool/diagnostics"),
   poolProfile: () => request<ClaudeCodeProfileResponse>("/claude-code-account-pool/profile"),
   profileSnapshots: () => request<{ items: ClaudeCodeProfileSnapshot[] }>("/claude-code-account-pool/profile-snapshots"),
   profileSnapshot: (id: string) => request<{ item: ClaudeCodeProfileSnapshot }>(`/claude-code-account-pool/profile-snapshots/${id}`),

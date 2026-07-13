@@ -86,14 +86,15 @@ func runOneAccountQuotaSweep(ctx context.Context, configFilePath string, cfg *co
 	}
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
-	now := time.Now()
+	now := accountQuotaNow()
+	interval := quotaInterval(quotaCfg)
 	for _, account := range accounts {
 		account := account
 		ApplyAccountLifecycleRouting(&account)
 		if !account.HasAuthData || strings.TrimSpace(account.ID) == "" || account.HealthStatus == AccountHealthManualRecovery {
 			continue
 		}
-		if account.NextHealthCheckAt != nil && account.NextHealthCheckAt.After(now) {
+		if !accountQuotaRefreshDue(account, now, interval) {
 			continue
 		}
 		select {
@@ -115,7 +116,7 @@ func runOneAccountQuotaSweep(ctx context.Context, configFilePath string, cfg *co
 					log.WithError(errClose).Warn("close resource pool store after account quota refresh failed")
 				}
 			}()
-			if _, err := refreshStoredAccountQuota(ctx, configFilePath, cfg, accountStore, account.ID, false, syncAuth); err != nil {
+			if _, err := refreshStoredAccountQuotaWithInterval(ctx, configFilePath, cfg, accountStore, account.ID, false, syncAuth, interval); err != nil {
 				log.WithError(err).WithField("account_id", account.ID).Debug("refresh claude code account quota failed")
 			}
 			PublishAccountChanged(account.ID, "quota")
@@ -123,6 +124,20 @@ func runOneAccountQuotaSweep(ctx context.Context, configFilePath string, cfg *co
 		}()
 	}
 	wg.Wait()
+}
+
+func accountQuotaRefreshDue(account ClaudeCodeAccount, now time.Time, interval time.Duration) bool {
+	if account.HealthStatus == AccountHealthTemporarilyBlocked && account.BlockedUntil != nil && account.BlockedUntil.After(now) {
+		return false
+	}
+	reference := account.LastHealthCheckAt
+	if account.Quota != nil && account.Quota.CheckedAt != nil && (reference == nil || account.Quota.CheckedAt.After(*reference)) {
+		reference = account.Quota.CheckedAt
+	}
+	if reference != nil {
+		return !nextAccountHealthCheck(account.ID, *reference, interval).After(now)
+	}
+	return account.NextHealthCheckAt == nil || !account.NextHealthCheckAt.After(now)
 }
 
 func quotaInterval(quotaCfg AccountQuotaConfig) time.Duration {

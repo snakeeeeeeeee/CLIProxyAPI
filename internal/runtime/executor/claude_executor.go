@@ -915,8 +915,15 @@ func rewriteClaudeCleanInputTokenCount(auth *cliproxyauth.Auth, model string, pa
 		return payload
 	}
 	inputTokens := inputNode.Int()
-	cleaned := resourcepool.CleanInputTokens(inputTokens, cleanInputUsageOverhead(auth, model))
-	cleaned = clampClaudeCleanInputTokens(inputTokens, cleaned, policy.VisibleInputFloor)
+	cleaned := int64(0)
+	if inputTokens > 0 && !policy.PreserveClientCache && policy.VisibleInputFloor > 0 {
+		// count_tokens has no cache buckets that can separate the injected
+		// profile from client input, so use the original request estimate.
+		cleaned = min(inputTokens, policy.VisibleInputFloor)
+	} else {
+		cleaned = resourcepool.CleanInputTokens(inputTokens, cleanInputUsageOverhead(auth, model))
+		cleaned = clampClaudeCleanInputTokens(inputTokens, cleaned, policy.VisibleInputFloor)
+	}
 	if cleaned == inputTokens {
 		return payload
 	}
@@ -1028,6 +1035,13 @@ func cleanClaudeUsageBuckets(inputTokens, cacheCreationTokens, cacheReadTokens, 
 	}
 	if !policy.PreserveClientCache {
 		gatewayCacheTokens := cacheCreationTokens + cacheReadTokens
+		if gatewayCacheTokens > max(overheadTokens, 0) && policy.VisibleInputFloor > 0 {
+			// A cache bucket larger than the total profile calibration means the
+			// calibration cannot also identify the profile's uncached remainder.
+			// Fall back to the original request estimate instead of exposing that
+			// gateway-owned remainder as downstream input usage.
+			return min(inputTokens, policy.VisibleInputFloor), 0, 0
+		}
 		uncachedOverhead := max(overheadTokens-gatewayCacheTokens, 0)
 		cleanInput := resourcepool.CleanInputTokens(inputTokens, uncachedOverhead)
 		cleanInput = clampClaudeCleanInputTokens(inputTokens, cleanInput, policy.VisibleInputFloor)
@@ -1807,12 +1821,15 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
-	// Session ID: stable per auth/apiKey, matches Claude Code's X-Claude-Code-Session-Id header.
-	sessionID, errSessionID := helps.CachedSessionIDRequired(r.Context(), apiKey)
-	if errSessionID != nil {
-		return errSessionID
+	// Account-pool Sessions are scoped after auth selection and must never use
+	// the rotating OAuth access token as their cache key.
+	if !isAccountPool {
+		sessionID, errSessionID := helps.CachedSessionIDRequired(r.Context(), apiKey)
+		if errSessionID != nil {
+			return errSessionID
+		}
+		misc.EnsureHeader(r.Header, ginHeaders, "X-Claude-Code-Session-Id", sessionID)
 	}
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Claude-Code-Session-Id", sessionID)
 	// Per-request UUID, matches Claude Code's x-client-request-id for first-party API.
 	if isAnthropicBase && !isAccountPool {
 		misc.EnsureHeader(r.Header, ginHeaders, "x-client-request-id", uuid.New().String())
@@ -1857,6 +1874,10 @@ func applyClaudeCodeAccountPoolProfileHeaders(r *http.Request, auth *cliproxyaut
 	}
 	if claudeAccountPoolRequestModeFromContext(r.Context()) == claudeAccountPoolModePassthrough {
 		applyClaudeCodePassthroughHeaders(r)
+		if auth != nil && auth.AuthKind() == cliproxyauth.AuthKindOAuth {
+			betas := insertClaudeBetaAfter(parseClaudeBetaHeader(r.Header.Get("Anthropic-Beta")), "oauth-2025-04-20", "claude-code-20250219")
+			r.Header.Set("Anthropic-Beta", strings.Join(betas, ","))
+		}
 		return
 	}
 	profile := claudeCodeAccountPoolProfileFromAuth(auth)
@@ -1882,6 +1903,8 @@ func applyClaudeCodeAccountPoolProfileHeaders(r *http.Request, auth *cliproxyaut
 	betas := claudeCodeAccountPoolFinalBetasForAuth(auth, model, body, clientBetas)
 	if len(betas) > 0 {
 		r.Header.Set("Anthropic-Beta", strings.Join(normalizeClaudeBetaList(betas), ","))
+	} else {
+		r.Header.Del("Anthropic-Beta")
 	}
 	r.Header.Set("Accept", "application/json")
 	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
@@ -1952,12 +1975,14 @@ func claudeCodeAccountPoolBetasForModel(model string, body []byte) []string {
 }
 
 func claudeCodeAccountPoolFinalBetas(model string, body []byte, clientBetas []string) []string {
-	betas := claudeCodeAccountPoolBetasForModel(model, body)
+	_ = model
+	betas := make([]string, 0, len(clientBetas)+4)
 	for _, beta := range clientBetas {
 		if claudeCodeAccountPoolBodySupportsBeta(body, beta) {
 			betas = append(betas, beta)
 		}
 	}
+	betas = append(betas, claudeCodeAccountPoolBodyBetas(body)...)
 	return normalizeClaudeBetaList(betas)
 }
 
@@ -2095,6 +2120,7 @@ func applyClaudeCodeAccountPoolProfile(ctx context.Context, auth *cliproxyauth.A
 	if mode == "" {
 		mode = claudeCodeAccountPoolRequestMode(ctx, body)
 	}
+	ctx = withClaudeAccountPoolRequestMode(ctx, mode)
 	metadataVersion := profile.Version
 	if mode == claudeAccountPoolModePassthrough {
 		if inboundVersion := claudeCodeVersionFromUserAgent(ginRequestHeaders(ctx).Get("User-Agent")); inboundVersion != "" {
@@ -2358,14 +2384,25 @@ func removeUntrustedClaudeCodeBillingPrefix(body []byte) []byte {
 func applyClaudeCodeAccountPoolMimicSystem(body []byte, profile claudeCodeAccountPoolProfile) []byte {
 	systemParts := claudeSystemTextParts(gjson.GetBytes(body, "system"))
 	if len(systemParts) > 0 {
-		texts := make([]string, 0, len(systemParts))
+		hasCacheControl := false
 		for _, raw := range systemParts {
-			if text := strings.TrimSpace(gjson.Get(raw, "text").String()); text != "" {
-				texts = append(texts, text)
+			if gjson.Get(raw, "cache_control").Exists() {
+				hasCacheControl = true
+				break
 			}
 		}
-		if len(texts) > 0 {
-			body = prependToFirstUserMessage(body, strings.Join(texts, "\n\n"))
+		if hasCacheControl {
+			body = prependSystemPartsToFirstUserMessage(body, systemParts)
+		} else {
+			texts := make([]string, 0, len(systemParts))
+			for _, raw := range systemParts {
+				if text := strings.TrimSpace(gjson.Get(raw, "text").String()); text != "" {
+					texts = append(texts, text)
+				}
+			}
+			if len(texts) > 0 {
+				body = prependToFirstUserMessage(body, strings.Join(texts, "\n\n"))
+			}
 		}
 	}
 
@@ -2378,7 +2415,7 @@ func applyClaudeCodeAccountPoolMimicSystem(body []byte, profile claudeCodeAccoun
 	billingText := fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=sdk-cli;", version, fingerprint)
 	staticPrompt := strings.TrimSpace(profile.SystemPrompt)
 	if staticPrompt == "" {
-		staticPrompt = helps.ClaudeCodeStaticPrompt()
+		staticPrompt = helps.ClaudeCodeOrdinaryStablePrompt()
 	}
 	blocks := []string{
 		buildTextBlock(billingText, nil),
@@ -2432,67 +2469,68 @@ func claudeCodeAccountPoolIdentity(auth *cliproxyauth.Auth) (deviceID string, ac
 }
 
 func claudeCodeAccountPoolSessionID(ctx context.Context, auth *cliproxyauth.Auth, body []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
-	if existing := gjson.GetBytes(body, "metadata.user_id").String(); existing != "" {
-		if parsed, ok := helps.ParseClaudeCodeMetadataUserID(existing); ok && parsed.SessionID != "" {
-			return strings.ToLower(parsed.SessionID)
+	mode := claudeAccountPoolRequestModeFromContext(ctx)
+	if mode == claudeAccountPoolModePassthrough {
+		if explicit, _ := claudeCodeAccountPoolExplicitSession(ctx, body, req, opts); explicit != "" {
+			return explicit
 		}
 	}
-	if explicit := claudeCodeAccountPoolExplicitSession(ctx, req, opts); explicit != "" {
-		return helps.StableUUIDFromSeed(claudeCodeAccountPoolSessionSeed(auth, "explicit:"+explicit, ""))
+	if explicit, _ := claudeCodeAccountPoolExplicitSession(ctx, body, req, opts); explicit != "" {
+		return helps.StableUUIDFromSeed(strings.Join([]string{
+			"account-pool-explicit",
+			claudeCodeAccountPoolID(auth, opts),
+			claudeCodeAccountPoolKeyIdentity(opts),
+			explicit,
+		}, "::"))
 	}
-	return uuid.NewString()
+	scope := strings.Join([]string{
+		"account-pool-temporary",
+		claudeCodeAccountPoolID(auth, opts),
+		claudeCodeAccountPoolKeyIdentity(opts),
+		claudeCodeAccountPoolAccountIdentity(auth),
+	}, "::")
+	return helps.CachedSessionID(scope)
 }
 
-func claudeCodeAccountPoolExplicitSession(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
-	if value := metadataValueString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
-		return value
-	}
-	if value := metadataValueString(req.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
-		return value
-	}
-	for _, headers := range []http.Header{opts.Headers, ginRequestHeaders(ctx)} {
-		if headers == nil {
-			continue
-		}
-		for _, key := range []string{"X-Session-ID", "Session-Id", "Session_id", "X-Amp-Thread-Id", "X-Client-Request-Id"} {
-			if value := strings.TrimSpace(headers.Get(key)); value != "" {
-				return value
-			}
-		}
+func claudeCodeAccountPoolExplicitSession(ctx context.Context, body []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (string, string) {
+	metadata := opts.Metadata
+	if len(metadata) == 0 {
+		metadata = req.Metadata
 	}
 	for _, payload := range [][]byte{req.Payload, opts.OriginalRequest} {
-		if len(payload) == 0 {
-			continue
-		}
-		if value := strings.TrimSpace(gjson.GetBytes(payload, "conversation_id").String()); value != "" {
-			return value
-		}
-		if value := strings.TrimSpace(gjson.GetBytes(payload, "session_id").String()); value != "" {
-			return value
+		if sessionID, source := cliproxyauth.ExtractAccountPoolSessionID(opts.Headers, payload, metadata); sessionID != "" {
+			return sessionID, source
 		}
 	}
-	return ""
+	if sessionID, source := cliproxyauth.ExtractAccountPoolSessionID(ginRequestHeaders(ctx), body, metadata); sessionID != "" {
+		return sessionID, source
+	}
+	return "", ""
 }
 
-func claudeCodeAccountPoolClientDiscriminator(ctx context.Context, opts cliproxyexecutor.Options) string {
-	values := make([]string, 0, 4)
-	if headers := ginRequestHeaders(ctx); headers != nil {
-		if ua := strings.TrimSpace(headers.Get("User-Agent")); ua != "" {
-			values = append(values, "ua:"+ua)
-		}
-		if forwarded := strings.TrimSpace(headers.Get("X-Forwarded-For")); forwarded != "" {
-			values = append(values, "xff:"+forwarded)
+func claudeCodeAccountPoolID(auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) string {
+	if value := metadataValueString(opts.Metadata, cliproxyexecutor.AccountPoolIDMetadataKey); value != "" {
+		return value
+	}
+	if auth != nil && auth.Attributes != nil {
+		if value := strings.TrimSpace(auth.Attributes[resourcepool.AttrAccountPoolID]); value != "" {
+			return value
 		}
 	}
-	if opts.Headers != nil {
-		if ua := strings.TrimSpace(opts.Headers.Get("User-Agent")); ua != "" {
-			values = append(values, "optua:"+ua)
-		}
-	}
-	return strings.Join(values, "|")
+	return resourcepool.DefaultAccountPoolID
 }
 
-func claudeCodeAccountPoolSessionSeed(auth *cliproxyauth.Auth, discriminator string, firstUserText string) string {
+func claudeCodeAccountPoolKeyIdentity(opts cliproxyexecutor.Options) string {
+	if value := metadataValueString(opts.Metadata, cliproxyexecutor.AccountPoolSessionKeyIdentityMetadataKey); value != "" {
+		return value
+	}
+	if value := metadataValueString(opts.Metadata, cliproxyexecutor.AccountPoolAPIKeyIDMetadataKey); value != "" {
+		return "id:" + value
+	}
+	return "internal"
+}
+
+func claudeCodeAccountPoolAccountIdentity(auth *cliproxyauth.Auth) string {
 	accountID := ""
 	authID := ""
 	if auth != nil {
@@ -2501,7 +2539,7 @@ func claudeCodeAccountPoolSessionSeed(auth *cliproxyauth.Auth, discriminator str
 			accountID = strings.TrimSpace(auth.Attributes[resourcepool.AttrAccountID])
 		}
 	}
-	return strings.Join([]string{accountID, authID, strings.TrimSpace(discriminator), firstUserText}, "::")
+	return strings.Join([]string{accountID, authID}, ":")
 }
 
 func ginRequestHeaders(ctx context.Context) http.Header {
@@ -3492,6 +3530,75 @@ func buildTextBlock(text string, cacheControl map[string]string) string {
 	return string(block)
 }
 
+func prependSystemPartsToFirstUserMessage(payload []byte, systemParts []string) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload
+	}
+
+	firstUserIdx := -1
+	messages.ForEach(func(idx, msg gjson.Result) bool {
+		if msg.Get("role").String() == "user" {
+			firstUserIdx = int(idx.Int())
+			return false
+		}
+		return true
+	})
+	if firstUserIdx < 0 {
+		return payload
+	}
+
+	reminders := make([]string, 0, len(systemParts)+1)
+	for _, raw := range systemParts {
+		part := gjson.Parse(raw)
+		text := strings.TrimSpace(part.Get("text").String())
+		if text == "" {
+			continue
+		}
+		block := []byte(buildTextBlock(claudeSystemReminderText(text), nil))
+		if cacheControl := part.Get("cache_control"); cacheControl.IsObject() {
+			if updated, errSet := sjson.SetRawBytes(block, "cache_control", []byte(cacheControl.Raw)); errSet == nil {
+				block = updated
+			}
+		}
+		reminders = append(reminders, string(block))
+	}
+	if len(reminders) == 0 {
+		return payload
+	}
+
+	contentPath := fmt.Sprintf("messages.%d.content", firstUserIdx)
+	content := gjson.GetBytes(payload, contentPath)
+	if content.IsArray() {
+		content.ForEach(func(_, block gjson.Result) bool {
+			if raw := strings.TrimSpace(block.Raw); raw != "" {
+				reminders = append(reminders, raw)
+			}
+			return true
+		})
+	} else if content.Type == gjson.String {
+		reminders = append(reminders, buildTextBlock(content.String(), nil))
+	} else {
+		return payload
+	}
+
+	updated, errSet := sjson.SetRawBytes(payload, contentPath, rawJSONArray(reminders))
+	if errSet != nil {
+		return payload
+	}
+	return updated
+}
+
+func claudeSystemReminderText(text string) string {
+	return fmt.Sprintf(`<system-reminder>
+As you answer the user's questions, you can use the following context from the system:
+%s
+
+IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.
+</system-reminder>
+`, text)
+}
+
 // prependToFirstUserMessage prepends text content to the first user message.
 // This avoids putting non-Claude-Code system instructions in system[] which
 // triggers Anthropic's extra usage billing for OAuth-proxied requests.
@@ -3515,13 +3622,7 @@ func prependToFirstUserMessage(payload []byte, text string) []byte {
 		return payload
 	}
 
-	prefixBlock := fmt.Sprintf(`<system-reminder>
-As you answer the user's questions, you can use the following context from the system:
-%s
-
-IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.
-</system-reminder>
-`, text)
+	prefixBlock := claudeSystemReminderText(text)
 
 	contentPath := fmt.Sprintf("messages.%d.content", firstUserIdx)
 	content := gjson.GetBytes(payload, contentPath)

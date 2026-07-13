@@ -3,6 +3,7 @@ package resourcepool
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -184,6 +185,7 @@ CREATE TABLE IF NOT EXISTS claude_code_account_model_status (
 		status TEXT NOT NULL DEFAULT 'unknown',
 		windows_json TEXT NOT NULL DEFAULT '[]',
 		raw_json TEXT NOT NULL DEFAULT '',
+		probe_json TEXT NOT NULL DEFAULT '{}',
 		last_error TEXT NOT NULL DEFAULT '',
 		checked_at TEXT,
 		updated_at TEXT NOT NULL,
@@ -314,6 +316,8 @@ type Store struct {
 	initPath string
 }
 
+const databaseInstanceIDConfigKey = "database_instance_id"
+
 var storeInitializationMu sync.Mutex
 
 // Open opens the SQLite resource pool store and performs first-run YAML import.
@@ -377,7 +381,51 @@ func Open(configFilePath string, cfg *config.Config) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.ensureDatabaseInstanceID(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return store, nil
+}
+
+func (s *Store) ensureDatabaseInstanceID(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("resource pool store is nil")
+	}
+	var existing string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, databaseInstanceIDConfigKey).Scan(&existing)
+	if err == nil && strings.TrimSpace(existing) != "" {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read database instance id: %w", err)
+	}
+	random := make([]byte, 32)
+	if _, err := rand.Read(random); err != nil {
+		return fmt.Errorf("generate database instance id: %w", err)
+	}
+	now := dbTime(time.Now())
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO pool_config(key, value, created_at, updated_at)
+VALUES(?, ?, ?, ?)
+ON CONFLICT(key) DO NOTHING
+`, databaseInstanceIDConfigKey, hex.EncodeToString(random), now, now); err != nil {
+		return fmt.Errorf("persist database instance id: %w", err)
+	}
+	return nil
+}
+
+// DatabaseInstanceFingerprint returns a short non-reversible identity for this SQLite instance.
+func (s *Store) DatabaseInstanceFingerprint(ctx context.Context) (string, error) {
+	if err := s.ensureDatabaseInstanceID(ctx); err != nil {
+		return "", err
+	}
+	var instanceID string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, databaseInstanceIDConfigKey).Scan(&instanceID); err != nil {
+		return "", fmt.Errorf("read database instance fingerprint source: %w", err)
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(instanceID)))
+	return hex.EncodeToString(sum[:6]), nil
 }
 
 func (s *Store) migrateMultiPoolV6(ctx context.Context) error {
@@ -530,7 +578,7 @@ func (s *Store) migrateClaudeCodeProfileRevision(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	const marker = "claude_code_profile_2_1_207_r2"
+	const marker = "claude_code_profile_2_1_207_r3"
 	var markerValue string
 	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, marker).Scan(&markerValue); err == nil {
 		return nil
@@ -545,14 +593,18 @@ func (s *Store) migrateClaudeCodeProfileRevision(ctx context.Context) error {
 	if err := json.Unmarshal([]byte(rawProfile), &storedProfile); err != nil {
 		return fmt.Errorf("decode claude code profile for migration: %w", err)
 	}
-	requiresUpgrade := shouldMigrateBuiltinClaudeCodeProfile(storedProfile)
+	isR2Baseline := isExactBuiltinClaudeCodeProfileR2(storedProfile)
+	requiresUpgrade := shouldMigrateBuiltinClaudeCodeProfile(storedProfile) || isR2Baseline
+	oldProfile := EffectiveClaudeCodeProfile(builtinClaudeCodeProfileR2())
+	oldFingerprint := ClaudeCodeProfileFingerprint(oldProfile)
+	oldDefaultOverhead := ClaudeCodeProfileInjectedOverheadTokens(oldProfile)
 	doc, err := s.GetConfig(ctx)
 	if err != nil {
 		return err
 	}
 	if requiresUpgrade {
 		doc.Profile = defaultClaudeCodeProfile()
-		if doc.ClaudeCode.Usage.SystemPromptOverheadTokens == 1909 {
+		if doc.ClaudeCode.Usage.SystemPromptOverheadTokens == 1909 || doc.ClaudeCode.Usage.SystemPromptOverheadTokens == oldDefaultOverhead {
 			doc.ClaudeCode.Usage.SystemPromptOverheadTokens = DefaultCleanInputOverheadTokens
 		}
 	}
@@ -564,6 +616,9 @@ func (s *Store) migrateClaudeCodeProfileRevision(ctx context.Context) error {
 	if requiresUpgrade {
 		if err := savePoolConfigTx(ctx, tx, doc); err != nil {
 			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE claude_code_usage_calibrations SET status = ?, updated_at = ? WHERE profile_fingerprint = ? AND status = ?`, UsageCalibrationStale, dbTime(time.Now()), oldFingerprint, UsageCalibrationCalibrated); err != nil {
+			return fmt.Errorf("mark old Claude Code usage calibrations stale: %w", err)
 		}
 	}
 	now := dbTime(time.Now())
@@ -727,6 +782,9 @@ func migrateSQLiteStore(db *sql.DB) error {
 		return err
 	}
 	if err := ensureColumn(db, "claude_code_accounts", "next_health_check_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "claude_code_account_quota", "probe_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
 		return err
 	}
 	if err := ensureColumn(db, "claude_code_accounts", "pool_id", "TEXT NOT NULL DEFAULT 'default'"); err != nil {
@@ -1839,7 +1897,7 @@ SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) 
        a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
-       q.status, q.windows_json, q.raw_json, q.last_error, q.checked_at,
+	       q.status, q.windows_json, q.raw_json, q.probe_json, q.last_error, q.checked_at,
        p.id, p.name, p.proxy_url, p.exit_ip, p.enabled, p.health_status, p.latency_ms,
        p.consecutive_failures, p.last_checked_at, p.last_error, p.tags_json, p.note,
        p.created_at, p.updated_at
@@ -1887,7 +1945,7 @@ SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) 
        a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
-       q.status, q.windows_json, q.raw_json, q.last_error, q.checked_at,
+	       q.status, q.windows_json, q.raw_json, q.probe_json, q.last_error, q.checked_at,
        p.id, p.name, p.proxy_url, p.exit_ip, p.enabled, p.health_status, p.latency_ms,
        p.consecutive_failures, p.last_checked_at, p.last_error, p.tags_json, p.note,
        p.created_at, p.updated_at
@@ -1931,7 +1989,7 @@ SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) 
        a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
-       q.status, q.windows_json, q.raw_json, q.last_error, q.checked_at,
+	       q.status, q.windows_json, q.raw_json, q.probe_json, q.last_error, q.checked_at,
        p.id, p.name, p.proxy_url, p.exit_ip, p.enabled, p.health_status, p.latency_ms,
        p.consecutive_failures, p.last_checked_at, p.last_error, p.tags_json, p.note,
        p.created_at, p.updated_at
@@ -2114,16 +2172,17 @@ func (s *Store) SaveAccountQuota(ctx context.Context, quota AccountQuota) (*Clau
 	}
 	nowText := dbTime(time.Now())
 	if _, err := s.db.ExecContext(ctx, `
-INSERT INTO claude_code_account_quota(account_id, status, windows_json, raw_json, last_error, checked_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(account_id) DO UPDATE SET
-  status = excluded.status,
-  windows_json = excluded.windows_json,
-  raw_json = excluded.raw_json,
-  last_error = excluded.last_error,
-  checked_at = excluded.checked_at,
-  updated_at = excluded.updated_at
-	`, accountID, status, windowsJSON, strings.TrimSpace(quota.RawJSON), strings.TrimSpace(quota.LastError), dbTime(*checkedAt), nowText); err != nil {
+	INSERT INTO claude_code_account_quota(account_id, status, windows_json, raw_json, probe_json, last_error, checked_at, updated_at)
+	VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(account_id) DO UPDATE SET
+	  status = excluded.status,
+	  windows_json = excluded.windows_json,
+	  raw_json = excluded.raw_json,
+	  probe_json = excluded.probe_json,
+	  last_error = excluded.last_error,
+	  checked_at = excluded.checked_at,
+	  updated_at = excluded.updated_at
+		`, accountID, status, windowsJSON, strings.TrimSpace(quota.RawJSON), encodeAccountQuotaProbe(quota.Probe), strings.TrimSpace(quota.LastError), dbTime(*checkedAt), nowText); err != nil {
 		return nil, fmt.Errorf("save claude code account quota: %w", err)
 	}
 	return s.GetAccount(ctx, accountID)
@@ -2367,7 +2426,7 @@ SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) 
 	       a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
        a.last_test_at, a.last_error, a.created_at, a.updated_at,
-       q.status, q.windows_json, q.raw_json, q.last_error, q.checked_at,
+	       q.status, q.windows_json, q.raw_json, q.probe_json, q.last_error, q.checked_at,
        p.id, p.name, p.proxy_url, p.exit_ip, p.enabled, p.health_status, p.latency_ms,
        p.consecutive_failures, p.last_checked_at, p.last_error, p.tags_json, p.note,
        p.created_at, p.updated_at
@@ -2526,7 +2585,7 @@ func scanAccountWithProxy(rows interface {
 	var authJSON, excludedJSON string
 	var accountCreatedRaw, accountUpdatedRaw string
 	var accountLastTestRaw, blockedUntilRaw, lastHealthCheckRaw, nextHealthCheckRaw sql.NullString
-	var quotaStatus, quotaWindowsJSON, quotaRawJSON, quotaLastError, quotaCheckedRaw sql.NullString
+	var quotaStatus, quotaWindowsJSON, quotaRawJSON, quotaProbeJSON, quotaLastError, quotaCheckedRaw sql.NullString
 	var proxyID sql.NullString
 	var proxyName, proxyURL, proxyExitIP, proxyHealth, proxyLastError, proxyTagsJSON, proxyNote sql.NullString
 	var proxyEnabled, proxyLatencyMS, proxyFailures sql.NullInt64
@@ -2558,6 +2617,7 @@ func scanAccountWithProxy(rows interface {
 		&quotaStatus,
 		&quotaWindowsJSON,
 		&quotaRawJSON,
+		&quotaProbeJSON,
 		&quotaLastError,
 		&quotaCheckedRaw,
 		&proxyID,
@@ -2598,6 +2658,7 @@ func scanAccountWithProxy(rows interface {
 			CheckedAt: parseNullTime(quotaCheckedRaw),
 			LastError: nullString(quotaLastError),
 			RawJSON:   nullString(quotaRawJSON),
+			Probe:     decodeAccountQuotaProbe(nullString(quotaProbeJSON)),
 		}
 		account.Quota = quota
 	}
@@ -2747,6 +2808,33 @@ func decodeQuotaWindows(raw string) []QuotaWindow {
 		return []QuotaWindow{}
 	}
 	return values
+}
+
+func encodeAccountQuotaProbe(probe *AccountQuotaProbe) string {
+	if probe == nil {
+		return "{}"
+	}
+	raw, err := json.Marshal(probe)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func decodeAccountQuotaProbe(raw string) *AccountQuotaProbe {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" {
+		return nil
+	}
+	var probe AccountQuotaProbe
+	if err := json.Unmarshal([]byte(raw), &probe); err != nil || probe.RequestedAt.IsZero() {
+		return nil
+	}
+	probe.ProfileRevision = strings.TrimSpace(probe.ProfileRevision)
+	probe.TransportProfile = strings.TrimSpace(probe.TransportProfile)
+	probe.ProxyMode = strings.TrimSpace(probe.ProxyMode)
+	probe.ProxyResourceID = strings.TrimSpace(probe.ProxyResourceID)
+	return &probe
 }
 
 func normalizeQuotaStatus(status string) string {

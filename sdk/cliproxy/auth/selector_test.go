@@ -572,6 +572,26 @@ func TestExtractAccountPoolSessionKeyUsesExplicitIdentifiersOnly(t *testing.T) {
 	if got := ExtractAccountPoolSessionKey(nil, claudePayload, nil); got != "claude:session-2" {
 		t.Fatalf("Claude metadata session key = %q", got)
 	}
+	for _, test := range []struct {
+		name     string
+		headers  http.Header
+		payload  []byte
+		metadata map[string]any
+		want     string
+	}{
+		{name: "execution metadata", metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "execution-1"}, want: "execution:execution-1"},
+		{name: "session id header", headers: http.Header{"Session-Id": []string{"session-3"}}, want: "session:session-3"},
+		{name: "amp thread", headers: http.Header{"X-Amp-Thread-Id": []string{"thread-1"}}, want: "amp:thread-1"},
+		{name: "Claude header", headers: http.Header{"X-Claude-Code-Session-Id": []string{"session-4"}}, want: "claude-header:session-4"},
+		{name: "conversation", payload: []byte(`{"conversation_id":"conversation-1"}`), want: "conversation:conversation-1"},
+		{name: "payload session", payload: []byte(`{"session_id":"session-5"}`), want: "payload:session-5"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ExtractAccountPoolSessionKey(test.headers, test.payload, test.metadata); got != test.want {
+				t.Fatalf("session key = %q, want %q", got, test.want)
+			}
+		})
+	}
 }
 
 func TestSessionAffinitySelector_NoSessionFallback(t *testing.T) {

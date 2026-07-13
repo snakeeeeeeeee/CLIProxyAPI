@@ -79,6 +79,13 @@ func useFakeClaudeIDKVClient(t *testing.T, client *fakeClaudeIDKVClient, homeMod
 	})
 }
 
+func useSessionIDClock(t *testing.T, now *time.Time) {
+	t.Helper()
+	previous := sessionIDNow
+	sessionIDNow = func() time.Time { return *now }
+	t.Cleanup(func() { sessionIDNow = previous })
+}
+
 func TestCachedSessionIDRequiredHomeReusesKVAcrossLocalCacheReset(t *testing.T) {
 	resetSessionIDCache()
 	client := newFakeClaudeIDKVClient()
@@ -174,5 +181,36 @@ func TestCachedSessionIDRequiredNonHomeModeUsesLocalMap(t *testing.T) {
 	}
 	if client.getCount != 0 || client.setCount != 0 || client.expireCount != 0 {
 		t.Fatalf("KV calls = get %d set %d expire %d, want all zero", client.getCount, client.setCount, client.expireCount)
+	}
+}
+
+func TestCachedSessionIDRequiredLocalSlidingTTL(t *testing.T) {
+	resetSessionIDCache()
+	client := newFakeClaudeIDKVClient()
+	useFakeClaudeIDKVClient(t, client, false, nil)
+	now := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	useSessionIDClock(t, &now)
+
+	first, errFirst := CachedSessionIDRequired(context.Background(), "temporary-scope")
+	if errFirst != nil {
+		t.Fatalf("first Session error: %v", errFirst)
+	}
+	now = now.Add(59 * time.Minute)
+	second, errSecond := CachedSessionIDRequired(context.Background(), "temporary-scope")
+	if errSecond != nil || second != first {
+		t.Fatalf("Session before sliding expiry = %q/%v, want %q", second, errSecond, first)
+	}
+	now = now.Add(59 * time.Minute)
+	third, errThird := CachedSessionIDRequired(context.Background(), "temporary-scope")
+	if errThird != nil || third != first {
+		t.Fatalf("Session after sliding refresh = %q/%v, want %q", third, errThird, first)
+	}
+	now = now.Add(time.Hour + time.Nanosecond)
+	fourth, errFourth := CachedSessionIDRequired(context.Background(), "temporary-scope")
+	if errFourth != nil {
+		t.Fatalf("Session after expiry error: %v", errFourth)
+	}
+	if fourth == first {
+		t.Fatalf("Session did not rotate after TTL expiry: %q", fourth)
 	}
 }

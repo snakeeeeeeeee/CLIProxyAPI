@@ -9,6 +9,7 @@ import (
 
 func TestRequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey(t *testing.T) {
 	ctx := WithExecutionSessionID(context.Background(), "session-1")
+	ctx = WithAccountPoolSessionKeyIdentity(ctx, "sha256:test")
 
 	meta := requestExecutionMetadata(ctx)
 	if got := meta[coreexecutor.ExecutionSessionMetadataKey]; got != "session-1" {
@@ -16,6 +17,9 @@ func TestRequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey(t
 	}
 	if _, ok := meta[idempotencyKeyMetadataKey]; ok {
 		t.Fatalf("unexpected idempotency key in metadata: %v", meta[idempotencyKeyMetadataKey])
+	}
+	if got := meta[coreexecutor.AccountPoolSessionKeyIdentityMetadataKey]; got != "sha256:test" {
+		t.Fatalf("account-pool Session key identity = %v", got)
 	}
 }
 

@@ -72,6 +72,7 @@ import {
   AccountPoolLogEffectiveConfig,
   AccountPoolLogLine,
   AccountPoolLogRawConfig,
+  AccountPoolDiagnostics,
   ProxyBatchAction,
   ProxyPayload,
   ProxyResource,
@@ -259,6 +260,11 @@ function App() {
     queryFn: api.usageCalibrations,
     enabled: dataEnabled && view === "settings"
   });
+  const diagnosticsQuery = useQuery({
+    queryKey: ["account-pool-diagnostics"],
+    queryFn: api.diagnostics,
+    enabled: dataEnabled && view === "settings"
+  });
   const authError = [
     configQuery.error,
     poolsQuery.error,
@@ -277,7 +283,8 @@ function App() {
     routingEventsQuery.error,
     logConfigQuery.error,
     poolLogsQuery.error,
-    usageCalibrationsQuery.error
+    usageCalibrationsQuery.error,
+    diagnosticsQuery.error
   ].some(isManagementAuthError);
 
   useEffect(() => {
@@ -311,7 +318,8 @@ function App() {
       queryClient.invalidateQueries({ queryKey: ["account-pool-usage"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-routing-events"] }),
       queryClient.invalidateQueries({ queryKey: ["account-pool-log-config"] }),
-      queryClient.invalidateQueries({ queryKey: ["account-pool-logs"] })
+      queryClient.invalidateQueries({ queryKey: ["account-pool-logs"] }),
+      queryClient.invalidateQueries({ queryKey: ["account-pool-diagnostics"] })
     ]);
   };
 
@@ -325,14 +333,14 @@ function App() {
         void queryClient.invalidateQueries({ queryKey: [key] });
       });
     };
-    const onProxyChanged = () => invalidate(["resource-config", "proxies", "available-proxies", "accounts"]);
+    const onProxyChanged = () => invalidate(["resource-config", "proxies", "available-proxies", "accounts", "account-pool-diagnostics"]);
     const onAccountChanged = () =>
-      invalidate(["resource-config", "accounts", "proxies", "available-proxies", "account-pool-stats", "account-pool-usage", "account-pool-routing-events", "account-pool-logs"]);
+      invalidate(["resource-config", "accounts", "proxies", "available-proxies", "account-pool-stats", "account-pool-usage", "account-pool-routing-events", "account-pool-logs", "account-pool-diagnostics"]);
     const onConfigChanged = () =>
-      invalidate(["resource-config", "account-pool-config", "account-pool-profile", "account-pool-profile-snapshots", "account-pool-stats", "account-pool-log-config"]);
+      invalidate(["resource-config", "account-pool-config", "account-pool-profile", "account-pool-profile-snapshots", "account-pool-stats", "account-pool-log-config", "account-pool-diagnostics"]);
     const onStatsChanged = () => invalidate(["account-pool-stats", "account-pool-usage", "account-pool-routing-events", "account-pool-logs", "accounts"]);
     const onModelChanged = () => invalidate(["account-pool-models"]);
-    const onPoolChanged = () => invalidate(["account-pools", "accounts", "pool-api-keys", "account-pool-stats", "account-pool-usage", "account-pool-strategy"]);
+    const onPoolChanged = () => invalidate(["account-pools", "accounts", "pool-api-keys", "account-pool-stats", "account-pool-usage", "account-pool-strategy", "account-pool-diagnostics"]);
     const onAPIKeyChanged = () => invalidate(["account-pools", "pool-api-keys", "account-pool-usage"]);
     const onPricingChanged = () => invalidate(["model-prices", "account-pool-models", "account-pools", "accounts", "account-pool-stats", "account-pool-usage"]);
     const onSessionKeyJobChanged = () =>
@@ -389,6 +397,7 @@ function App() {
   const logConfig = logConfigQuery.data;
   const poolLogs = poolLogsQuery.data?.items || [];
   const usageCalibrations = usageCalibrationsQuery.data;
+  const diagnostics = diagnosticsQuery.data;
 
   useEffect(() => {
     if (routingEventsQuery.data && routingEventsPage > routingEventsPageCount) {
@@ -475,11 +484,22 @@ function App() {
       logConfig={logConfig}
       logs={poolLogs}
       calibrations={usageCalibrations}
+      diagnostics={diagnostics}
+      diagnosticsLoading={diagnosticsQuery.isLoading || diagnosticsQuery.isFetching}
+      diagnosticsError={diagnosticsQuery.error}
       forcedTab={forcedTab}
       onBind={(account) => setModal({ type: "bind", account })}
       onTest={(account) => setModal({ type: "test-account", account, models: poolModels })}
       onToast={showToast}
       onDone={invalidateAll}
+      onRefreshDiagnostics={async () => {
+        const result = await diagnosticsQuery.refetch();
+        if (result.error) {
+          showToast(`诊断刷新失败：${errorMessage(result.error)}`, "danger");
+          return;
+        }
+        showToast("运行诊断已刷新");
+      }}
     />
   );
   const headerActions = view === "pool" && activeLocation.poolTab === "accounts" ? (
@@ -810,11 +830,15 @@ function AccountsView({
   logConfig,
   logs,
   calibrations,
+  diagnostics,
+  diagnosticsLoading,
+  diagnosticsError,
   forcedTab,
   onBind,
   onTest,
   onToast,
-  onDone
+  onDone,
+  onRefreshDiagnostics
 }: {
   accounts: AccountRow[];
   pools: ClaudeCodeAccountPool[];
@@ -830,11 +854,15 @@ function AccountsView({
   logConfig?: { raw: AccountPoolLogRawConfig; effective: AccountPoolLogEffectiveConfig };
   logs: AccountPoolLogLine[];
   calibrations?: UsageCalibrationResponse;
+  diagnostics?: AccountPoolDiagnostics;
+  diagnosticsLoading: boolean;
+  diagnosticsError: unknown;
   forcedTab?: "accounts" | "metrics" | "usage" | "events" | "config";
   onBind: (account: ClaudeCodeAccount) => void;
   onTest: (account: ClaudeCodeAccount) => void;
   onToast: (message: string, tone?: ToastState["tone"]) => void;
   onDone: () => Promise<void>;
+  onRefreshDiagnostics: () => Promise<void>;
 }) {
   const effectiveConfig = config?.effective || defaultPoolEffectiveConfig();
   const [selectedTab, setSelectedTab] = useState<"accounts" | "metrics" | "usage" | "events" | "config">("accounts");
@@ -1098,6 +1126,12 @@ function AccountsView({
         </div>
       ) : (
         <div className="grid gap-5">
+          <RuntimeDiagnosticsPanel
+            diagnostics={diagnostics}
+            loading={diagnosticsLoading}
+            error={diagnosticsError}
+            onRefresh={onRefreshDiagnostics}
+          />
           <PublicAPIPanel modelsCount={models.filter((model) => model.enabled).length} />
           <ClaudeCodeProfilePanel profile={profile} />
           <ClaudeCodeProfileSnapshotsPanel snapshots={profileSnapshots} profile={profile} onDone={onDone} onToast={onToast} />
@@ -1146,6 +1180,278 @@ function AccountsView({
   );
 }
 
+function RuntimeDiagnosticsPanel({
+  diagnostics,
+  loading,
+  error,
+  onRefresh
+}: {
+  diagnostics?: AccountPoolDiagnostics;
+  loading: boolean;
+  error: unknown;
+  onRefresh: () => Promise<void>;
+}) {
+  const status = diagnostics?.status || "attention";
+  const buildCommit = diagnostics?.build.commit && diagnostics.build.commit !== "none"
+    ? shortText(diagnostics.build.commit, 10)
+    : "未注入";
+
+  return (
+    <Card>
+      <CardHeader className="gap-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <CardTitle>运行一致性诊断</CardTitle>
+            <CardDescription>本机构建、数据库、Profile、额度调度与账号采集状态。</CardDescription>
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {diagnostics ? <DiagnosticStatusBadge status={status} /> : null}
+            <Button variant="outline" size="sm" disabled={loading} onClick={() => void onRefresh()}>
+              <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} />
+              刷新诊断
+            </Button>
+          </div>
+        </div>
+        {diagnostics ? (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+            <span>采集于 {formatTime(diagnostics.as_of)}</span>
+            <span>账号 {diagnostics.summary.total}</span>
+            <span className="text-emerald-700">正常 {diagnostics.summary.healthy}</span>
+            <span className="text-amber-700">关注 {diagnostics.summary.attention}</span>
+            <span className="text-red-700">异常 {diagnostics.summary.critical}</span>
+          </div>
+        ) : null}
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        {error && !diagnostics ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-3 text-sm text-red-800" role="alert">
+            <span>诊断读取失败：{errorMessage(error)}</span>
+            <Button variant="outline" size="sm" onClick={() => void onRefresh()}>重试</Button>
+          </div>
+        ) : null}
+
+        {!diagnostics && loading ? (
+          <div className="flex min-h-28 items-center justify-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            正在读取本机诊断
+          </div>
+        ) : null}
+
+        {diagnostics ? (
+          <>
+            <div className="grid grid-cols-4 gap-3 max-[1180px]:grid-cols-2 max-[620px]:grid-cols-1">
+              <DiagnosticSummaryTile
+                icon={<FileCode2 className="h-4 w-4" />}
+                label="构建"
+                value={`${diagnostics.build.version || "dev"} · ${buildCommit}`}
+                detail={`${diagnostics.build.goos}/${diagnostics.build.goarch} · ${diagnostics.build.go_version}`}
+                foot={diagnostics.build.build_date || "构建时间未知"}
+              />
+              <DiagnosticSummaryTile
+                icon={<Database className="h-4 w-4" />}
+                label="数据库实例"
+                value={diagnostics.database.instance_fingerprint || "-"}
+                detail={diagnostics.database.path || "-"}
+              />
+              <DiagnosticSummaryTile
+                icon={<Network className="h-4 w-4" />}
+                label="Profile / 传输"
+                value={`${diagnostics.profile.revision || "-"} · ${diagnostics.profile.tls_alpn || "-"}`}
+                detail={`${shortText(diagnostics.profile.fingerprint, 12)} · Headers ${diagnostics.profile.header_order_count}/${diagnostics.profile.header_count}`}
+                foot={diagnostics.profile.tls_profile || "-"}
+              />
+              <DiagnosticSummaryTile
+                icon={<Activity className="h-4 w-4" />}
+                label="额度调度"
+                value={diagnostics.quota.enabled ? `每 ${diagnostics.quota.interval}` : "已停用"}
+                detail={`扫描 ${diagnostics.quota.scheduler_tick} · 并发 ${diagnostics.quota.concurrency}`}
+                foot={`全局出口 ${diagnosticProxyModeText(diagnostics.quota.global_proxy_mode)}`}
+              />
+            </div>
+
+            {diagnostics.issues.length > 0 ? (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+                <ShieldAlert className="h-4 w-4 shrink-0 text-amber-700" />
+                {diagnostics.issues.map((issue) => (
+                  <Badge key={issue} tone={diagnosticIssueTone(issue)}>{diagnosticIssueText(issue)}</Badge>
+                ))}
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+                <CheckCircle2 className="h-4 w-4" />
+                本机运行摘要未发现一致性问题
+              </div>
+            )}
+
+            <div className="hidden overflow-hidden rounded-lg border min-[901px]:block">
+              <table className="w-full table-fixed text-sm">
+                <thead className="bg-muted/50 text-left text-xs text-muted-foreground">
+                  <tr>
+                    <th className="w-[13%] px-3 py-2 font-medium">状态</th>
+                    <th className="w-[16%] px-3 py-2 font-medium">账号指纹</th>
+                    <th className="w-[18%] px-3 py-2 font-medium">池与出口</th>
+                    <th className="w-[14%] px-3 py-2 font-medium">Token</th>
+                    <th className="w-[20%] px-3 py-2 font-medium">额度采集</th>
+                    <th className="w-[19%] px-3 py-2 font-medium">问题</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {diagnostics.accounts.length > 0 ? diagnostics.accounts.map((account) => (
+                    <tr key={`${account.pool_id}:${account.account_fingerprint}`} className="border-t align-top">
+                      <td className="px-3 py-3"><DiagnosticStatusBadge status={account.status} /></td>
+                      <td className="px-3 py-3">
+                        <div className="break-all font-mono text-xs">{account.account_fingerprint}</div>
+                        <div className="mt-1 break-all text-xs text-muted-foreground">设备 {account.device_fingerprint || "未知"}</div>
+                      </td>
+                      <td className="px-3 py-3">
+                        <div className="break-words font-medium">{account.pool_id}</div>
+                        <div className="mt-1 break-all text-xs text-muted-foreground">{diagnosticAccountProxyText(account)}</div>
+                      </td>
+                      <td className="px-3 py-3 text-xs">
+                        <div>{formatTime(account.token_expires_at)}</div>
+                      </td>
+                      <td className="px-3 py-3 text-xs">
+                        <div>{account.quota_transport || "未采集"}{account.probe?.status_code ? ` · HTTP ${account.probe.status_code}` : ""}</div>
+                        <div className="mt-1 text-muted-foreground">上次 {formatTime(account.last_quota_at)}</div>
+                        <div className="mt-1 text-muted-foreground">下次 {formatTime(account.next_quota_at)}</div>
+                      </td>
+                      <td className="px-3 py-3">
+                        <DiagnosticIssueList issues={account.issues} />
+                      </td>
+                    </tr>
+                  )) : (
+                    <tr><td colSpan={6} className="px-3 py-8 text-center text-muted-foreground">暂无账号诊断</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="grid gap-2 min-[901px]:hidden">
+              {diagnostics.accounts.length > 0 ? diagnostics.accounts.map((account) => (
+                <div key={`${account.pool_id}:${account.account_fingerprint}`} className="grid gap-3 rounded-lg border px-3 py-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="break-all font-mono text-xs font-semibold">{account.account_fingerprint}</div>
+                      <div className="mt-1 break-all text-xs text-muted-foreground">设备 {account.device_fingerprint || "未知"}</div>
+                    </div>
+                    <DiagnosticStatusBadge status={account.status} />
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs max-[520px]:grid-cols-1">
+                    <DiagnosticField label="账号池" value={account.pool_id} />
+                    <DiagnosticField label="出口" value={diagnosticAccountProxyText(account)} />
+                    <DiagnosticField label="Token 到期" value={formatTime(account.token_expires_at)} />
+                    <DiagnosticField label="额度传输" value={`${account.quota_transport || "未采集"}${account.probe?.status_code ? ` · HTTP ${account.probe.status_code}` : ""}`} />
+                    <DiagnosticField label="上次额度" value={formatTime(account.last_quota_at)} />
+                    <DiagnosticField label="下次额度" value={formatTime(account.next_quota_at)} />
+                  </div>
+                  <DiagnosticIssueList issues={account.issues} />
+                </div>
+              )) : <EmptyState title="暂无账号诊断" description="数据库中还没有 Claude Code 账号。" />}
+            </div>
+          </>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+function DiagnosticSummaryTile({
+  icon,
+  label,
+  value,
+  detail,
+  foot
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+  detail: string;
+  foot?: string;
+}) {
+  return (
+    <div className="min-w-0 rounded-lg border bg-muted/25 p-3">
+      <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">{icon}{label}</div>
+      <div className="mt-2 break-all text-sm font-semibold">{value}</div>
+      <div className="mt-1 break-all text-xs text-muted-foreground" title={detail}>{detail}</div>
+      {foot ? <div className="mt-1 break-all text-xs text-muted-foreground" title={foot}>{foot}</div> : null}
+    </div>
+  );
+}
+
+function DiagnosticStatusBadge({ status }: { status?: string }) {
+  const normalized = (status || "attention").toLowerCase();
+  const tone = normalized === "healthy" ? "success" : normalized === "critical" ? "danger" : "warning";
+  const label = normalized === "healthy" ? "正常" : normalized === "critical" ? "异常" : "需关注";
+  return <Badge tone={tone} className="whitespace-nowrap">{label}</Badge>;
+}
+
+function DiagnosticIssueList({ issues }: { issues: string[] }) {
+  if (issues.length === 0) {
+    return <span className="text-xs text-muted-foreground">无</span>;
+  }
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {issues.map((issue) => <Badge key={issue} tone={diagnosticIssueTone(issue)}>{diagnosticIssueText(issue)}</Badge>)}
+    </div>
+  );
+}
+
+function DiagnosticField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-muted-foreground">{label}</div>
+      <div className="mt-0.5 break-all font-medium">{value}</div>
+    </div>
+  );
+}
+
+function diagnosticAccountProxyText(account: AccountPoolDiagnostics["accounts"][number]) {
+  if (account.proxy_resource_id) {
+    return `${account.proxy_resource_id}${account.last_observed_exit_ip ? ` · ${account.last_observed_exit_ip}` : ""}`;
+  }
+  return account.last_observed_exit_ip || "未绑定";
+}
+
+function diagnosticProxyModeText(mode?: string) {
+  switch ((mode || "").toLowerCase()) {
+    case "proxy": return "代理";
+    case "direct": return "直连";
+    case "invalid": return "配置无效";
+    default: return "继承";
+  }
+}
+
+function diagnosticIssueTone(issue: string): "neutral" | "success" | "warning" | "danger" | "info" {
+  return ["profile_transport_mismatch", "accounts_critical", "auth_missing", "token_expired", "manual_recovery", "proxy_binding_missing", "proxy_unhealthy", "quota_proxy_invalid"].includes(issue)
+    ? "danger"
+    : "warning";
+}
+
+function diagnosticIssueText(issue: string) {
+  const labels: Record<string, string> = {
+    build_commit_unknown: "构建 Commit 未注入",
+    profile_revision_custom: "使用自定义 Profile",
+    profile_transport_mismatch: "Profile 传输不匹配",
+    no_accounts: "暂无账号",
+    accounts_critical: "存在异常账号",
+    accounts_attention: "存在待关注账号",
+    auth_missing: "认证数据缺失",
+    token_expired: "Token 已过期",
+    token_expiring: "Token 即将过期",
+    manual_recovery: "需要人工恢复",
+    temporarily_blocked: "账号临时阻断",
+    proxy_binding_missing: "代理绑定缺失",
+    proxy_unhealthy: "代理异常",
+    quota_never_observed: "尚未采集额度",
+    quota_stale: "额度数据过期",
+    quota_schedule_overdue: "额度采集逾期",
+    quota_profile_mismatch: "采集 Profile 已变化",
+    quota_proxy_invalid: "额度代理无效",
+    quota_probe_failed: "额度采集失败"
+  };
+  return labels[issue] || issue;
+}
+
 function PublicAPIPanel({ modelsCount }: { modelsCount: number }) {
   return (
     <Card>
@@ -1192,7 +1498,7 @@ function ClaudeCodeProfilePanel({
       <CardContent className="grid gap-4">
         <div className="grid grid-cols-6 gap-3 max-[1280px]:grid-cols-3 max-[760px]:grid-cols-2 max-[560px]:grid-cols-1">
           <ReadOnlyTile label="Claude Code 版本" value={effective?.version || "2.1.207"} />
-          <ReadOnlyTile label="Profile Revision" value={effective?.revision || "2.1.207-r2"} />
+          <ReadOnlyTile label="Profile Revision" value={effective?.revision || "2.1.207-r3"} />
           <ReadOnlyTile label="平台" value={`${effective?.headers?.["X-Stainless-Os"] || "MacOS"} · ${effective?.headers?.["X-Stainless-Arch"] || "arm64"}`} />
           <ReadOnlyTile label="Billing" value={effective?.billing_block_enabled === false ? "关闭" : "sdk-cli · 无 CCH"} />
           <ReadOnlyTile label="Prompt" value="稳定工具无关" />

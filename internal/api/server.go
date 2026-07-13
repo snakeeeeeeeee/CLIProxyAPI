@@ -7,8 +7,10 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -690,6 +692,7 @@ func (s *Server) claudeAccountPoolAuthMiddleware() gin.HandlerFunc {
 			c.Set("accessProvider", "account-pool-key")
 			c.Set("accessMetadata", metadata)
 			requestContext := handlers.WithAccountPoolIdentity(c.Request.Context(), pool.ID, item.ID)
+			requestContext = handlers.WithAccountPoolSessionKeyIdentity(requestContext, "id:"+item.ID)
 			requestContext = coreusage.WithAccountPoolBilling(requestContext, pool.ID, item.ID, resourcepool.ActiveModelPriceVersionID())
 			c.Request = c.Request.WithContext(requestContext)
 			c.Next()
@@ -724,10 +727,22 @@ func (s *Server) claudeAccountPoolAuthMiddleware() gin.HandlerFunc {
 			c.Set("accessMetadata", metadata)
 		}
 		requestContext := handlers.WithAccountPoolIdentity(c.Request.Context(), resourcepool.DefaultAccountPoolID, "")
+		if result != nil {
+			requestContext = handlers.WithAccountPoolSessionKeyIdentity(requestContext, accountPoolLegacyKeyIdentity(result.Principal))
+		}
 		requestContext = coreusage.WithAccountPoolBilling(requestContext, resourcepool.DefaultAccountPoolID, "", resourcepool.ActiveModelPriceVersionID())
 		c.Request = c.Request.WithContext(requestContext)
 		c.Next()
 	}
+}
+
+func accountPoolLegacyKeyIdentity(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func generatedAccountPoolKeyFromRequest(req *http.Request) string {
@@ -1052,6 +1067,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/claude-code-account-pool/api-keys/:id", s.mgmt.DeleteClaudeCodePoolAPIKey)
 		mgmt.POST("/claude-code-account-pool/api-keys/:id/rotate", s.mgmt.RotateClaudeCodePoolAPIKey)
 		mgmt.GET("/claude-code-account-pool/config", s.mgmt.GetClaudeCodePoolConfig)
+		mgmt.GET("/claude-code-account-pool/diagnostics", s.mgmt.GetClaudeCodeAccountPoolDiagnostics)
 		mgmt.PUT("/claude-code-account-pool/config", s.mgmt.PutClaudeCodePoolConfig)
 		mgmt.PATCH("/claude-code-account-pool/config", s.mgmt.PutClaudeCodePoolConfig)
 		mgmt.GET("/claude-code-account-pool/profile", s.mgmt.GetClaudeCodeProfile)
