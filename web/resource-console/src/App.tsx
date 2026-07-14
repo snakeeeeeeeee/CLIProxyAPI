@@ -815,6 +815,8 @@ function ToastView({ toast }: { toast: ToastState }) {
   );
 }
 
+const ACCOUNT_PAGE_SIZE = 20;
+
 function AccountsView({
   accounts,
   pools,
@@ -872,11 +874,11 @@ function AccountsView({
   const [viewMode, setViewMode] = useState<"cards" | "table">("cards");
   const [selectedIDs, setSelectedIDs] = useState<string[]>([]);
   const [page, setPage] = useState(1);
+  const [visibleCardCount, setVisibleCardCount] = useState(ACCOUNT_PAGE_SIZE);
   const [detailRow, setDetailRow] = useState<AccountRow | null>(null);
   const [moveRow, setMoveRow] = useState<AccountRow | null>(null);
   const selectedSet = useMemo(() => new Set(selectedIDs), [selectedIDs]);
   const selectedCount = selectedIDs.length;
-  const pageSize = 10;
   const filteredAccounts = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
     return accounts.filter((row) => {
@@ -905,13 +907,18 @@ function AccountsView({
       return true;
     });
   }, [accounts, searchQuery, statusFilter]);
-  const pageCount = Math.max(1, Math.ceil(filteredAccounts.length / pageSize));
+  const pageCount = Math.max(1, Math.ceil(filteredAccounts.length / ACCOUNT_PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
   const pageRows = useMemo(
-    () => filteredAccounts.slice((currentPage - 1) * pageSize, currentPage * pageSize),
+    () => filteredAccounts.slice((currentPage - 1) * ACCOUNT_PAGE_SIZE, currentPage * ACCOUNT_PAGE_SIZE),
     [filteredAccounts, currentPage]
   );
-  const pageIDs = pageRows.map((row) => row.account.id);
+  const cardRows = useMemo(
+    () => filteredAccounts.slice(0, visibleCardCount),
+    [filteredAccounts, visibleCardCount]
+  );
+  const visibleRows = viewMode === "cards" ? cardRows : pageRows;
+  const pageIDs = visibleRows.map((row) => row.account.id);
   const pageSelected = pageIDs.length > 0 && pageIDs.every((id) => selectedSet.has(id));
   const pagePartiallySelected = pageIDs.some((id) => selectedSet.has(id)) && !pageSelected;
   useEffect(() => {
@@ -919,9 +926,14 @@ function AccountsView({
   }, [accounts]);
   useEffect(() => {
     setPage(1);
+    setVisibleCardCount(ACCOUNT_PAGE_SIZE);
   }, [searchQuery, statusFilter]);
   useEffect(() => {
-    setPage((current) => Math.min(current, Math.max(1, Math.ceil(filteredAccounts.length / pageSize))));
+    setPage(1);
+    setVisibleCardCount(ACCOUNT_PAGE_SIZE);
+  }, [viewMode]);
+  useEffect(() => {
+    setPage((current) => Math.min(current, Math.max(1, Math.ceil(filteredAccounts.length / ACCOUNT_PAGE_SIZE))));
   }, [filteredAccounts.length]);
 
   const setAccountSelected = (id: string, selected: boolean) => {
@@ -1068,7 +1080,10 @@ function AccountsView({
       /> : null}
 
       {activeTab === "accounts" ? (
-        <div className="grid gap-3">
+        <div className={cn(
+          "grid gap-3",
+          forcedTab === "accounts" && "lg:min-h-[calc(100dvh-15rem)] lg:grid-rows-[auto_minmax(0,1fr)]"
+        )}>
           <AccountWorkspaceToolbar
             query={searchQuery}
             status={statusFilter}
@@ -1080,10 +1095,11 @@ function AccountsView({
             onViewModeChange={setViewMode}
           />
           <AccountCardsPanel
-            rows={pageRows}
+            rows={visibleRows}
             total={filteredAccounts.length}
             page={currentPage}
             pageCount={pageCount}
+            hasMoreCards={viewMode === "cards" && cardRows.length < filteredAccounts.length}
             pageSelected={pageSelected}
             pagePartiallySelected={pagePartiallySelected}
             selectedSet={selectedSet}
@@ -1092,6 +1108,7 @@ function AccountsView({
             availableCount={available.length}
             viewMode={viewMode}
             onPageChange={setPage}
+            onLoadMoreCards={() => setVisibleCardCount((current) => Math.min(current + ACCOUNT_PAGE_SIZE, filteredAccounts.length))}
             onSelectPage={(selected) => setAllSelected(pageIDs, selected)}
             onSelectAccount={setAccountSelected}
             onRunBatch={runBatch}
@@ -2786,6 +2803,7 @@ function AccountCardsPanel({
   total,
   page,
   pageCount,
+  hasMoreCards,
   pageSelected,
   pagePartiallySelected,
   selectedSet,
@@ -2794,6 +2812,7 @@ function AccountCardsPanel({
   availableCount,
   viewMode,
   onPageChange,
+  onLoadMoreCards,
   onSelectPage,
   onSelectAccount,
   onRunBatch,
@@ -2813,6 +2832,7 @@ function AccountCardsPanel({
   total: number;
   page: number;
   pageCount: number;
+  hasMoreCards: boolean;
   pageSelected: boolean;
   pagePartiallySelected: boolean;
   selectedSet: Set<string>;
@@ -2821,6 +2841,7 @@ function AccountCardsPanel({
   availableCount: number;
   viewMode: "cards" | "table";
   onPageChange: (page: number) => void;
+  onLoadMoreCards: () => void;
   onSelectPage: (selected: boolean) => void;
   onSelectAccount: (id: string, selected: boolean) => void;
   onRunBatch: (action: AccountBatchAction) => void;
@@ -2836,11 +2857,28 @@ function AccountCardsPanel({
   onToggle: (account: ClaudeCodeAccount) => void;
   onDelete: (account: ClaudeCodeAccount) => void;
 }) {
-  const start = total === 0 ? 0 : (page - 1) * 10 + 1;
+  const loadMoreRef = useRef<HTMLDivElement>(null);
+  const start = total === 0 ? 0 : viewMode === "cards" ? 1 : (page - 1) * ACCOUNT_PAGE_SIZE + 1;
   const end = total === 0 ? 0 : start + rows.length - 1;
 
+  useEffect(() => {
+    const target = loadMoreRef.current;
+    if (viewMode !== "cards" || !hasMoreCards || !target) {
+      return;
+    }
+    let requested = false;
+    const observer = new IntersectionObserver((entries) => {
+      if (!requested && entries.some((entry) => entry.isIntersecting)) {
+        requested = true;
+        onLoadMoreCards();
+      }
+    }, { rootMargin: "0px" });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [hasMoreCards, onLoadMoreCards, rows.length, viewMode]);
+
   return (
-    <section className="grid gap-3">
+    <section className="flex min-h-0 flex-col gap-3">
         {selectedCount > 0 ? <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-primary/25 bg-primary/5 px-3 py-2">
           <label className="flex min-h-10 items-center gap-2 text-sm">
             <input
@@ -2854,7 +2892,7 @@ function AccountCardsPanel({
               }}
               onChange={(event) => onSelectPage(event.target.checked)}
             />
-            <span>选择本页</span>
+            <span>{viewMode === "cards" ? "选择已显示" : "选择本页"}</span>
             <span className="text-muted-foreground">已选 {selectedCount}</span>
           </label>
           <div className="flex flex-wrap gap-2">
@@ -2892,7 +2930,7 @@ function AccountCardsPanel({
 
         {total > 0 ? (
           viewMode === "cards" ? (
-          <div className="account-grid grid grid-cols-[repeat(auto-fill,minmax(min(100%,300px),1fr))] gap-3">
+          <div className="account-grid grid min-h-0 flex-1 auto-rows-max content-start grid-cols-1 gap-3 min-[640px]:grid-cols-2 min-[1180px]:grid-cols-3 min-[1500px]:grid-cols-4 min-[1840px]:grid-cols-5">
               {rows.map((row) => (
                 <AccountPoolCard
                   key={row.account.id}
@@ -2933,7 +2971,13 @@ function AccountCardsPanel({
           <EmptyState title="没有匹配的账号" description="调整搜索或筛选条件，或点击顶部新增账号。" />
         )}
 
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card px-3 py-2 text-sm text-muted-foreground">
+        {viewMode === "cards" ? (
+          <div ref={loadMoreRef} className="mt-auto flex min-h-11 flex-wrap items-center justify-between gap-3 rounded-lg border bg-card px-3 py-2 text-sm text-muted-foreground">
+            <div>已显示 {rows.length} / 共 {total} 个 · 空闲代理 {availableCount}</div>
+            {hasMoreCards ? <Loader2 className="h-4 w-4 animate-spin" aria-label="正在加载更多账号" /> : <span>已全部显示</span>}
+          </div>
+        ) : (
+        <div className="mt-auto flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card px-3 py-2 text-sm text-muted-foreground">
           <div>
             第 {start}-{end} 个 / 共 {total} 个 · 空闲代理 {availableCount}
           </div>
@@ -2949,6 +2993,7 @@ function AccountCardsPanel({
             </Button>
           </div>
         </div>
+        )}
     </section>
   );
 }
@@ -3216,7 +3261,7 @@ function AccountPoolCard({
       role="button"
       tabIndex={0}
       className={cn(
-        "grid min-w-0 cursor-pointer gap-2 overflow-visible rounded-lg border bg-card p-3 transition-colors hover:border-primary/45 hover:bg-muted/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        "flex h-full min-w-0 cursor-pointer flex-col gap-1.5 overflow-visible rounded-lg border bg-card p-2.5 transition-colors hover:border-primary/45 hover:bg-muted/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
         selected && "border-primary bg-primary/5"
       )}
       onClick={onDetails}
@@ -3245,33 +3290,47 @@ function AccountPoolCard({
 
       <CompactQuotaGrid account={account} />
       <AccountMetricGrid account={account} />
-      <BoundProxyIndicator account={account} />
 
-      <div className="flex items-center justify-between gap-2 border-t pt-2.5" onClick={(event) => event.stopPropagation()}>
-        <Button variant="outline" size="sm" onClick={onTest}>
-          <Play className="h-3.5 w-3.5" />
-          测试
-        </Button>
-        <OverflowMenu label="账号操作">
-          <button type="button" onClick={onDetails}>查看详情</button>
-          <button type="button" onClick={bound ? onUnbind : onBind}>{bound ? "解绑代理" : "绑定代理"}</button>
-          <button type="button" onClick={onRefreshQuota} disabled={quotaPending}>刷新额度</button>
-          <button type="button" onClick={onReset}>清除冷却</button>
-          <button type="button" onClick={onMove}>移动账号池</button>
-          <button type="button" onClick={onToggle}>{account.schedulable ? "暂停调度" : "参与调度"}</button>
-          <button type="button" className="danger" onClick={onDelete}>删除账号</button>
-        </OverflowMenu>
+      <div className="mt-auto flex min-w-0 items-center justify-between gap-2 border-t pt-1.5" onClick={(event) => event.stopPropagation()}>
+        <div className="min-w-0 flex-1"><BoundProxyIndicator account={account} /></div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Button variant="outline" size="sm" className="h-8 px-2" onClick={onTest}>
+            <Play className="h-3.5 w-3.5" />
+            测试
+          </Button>
+          <OverflowMenu label="账号操作">
+            <button type="button" onClick={onDetails}>查看详情</button>
+            <button type="button" onClick={bound ? onUnbind : onBind}>{bound ? "解绑代理" : "绑定代理"}</button>
+            <button type="button" onClick={onRefreshQuota} disabled={quotaPending}>刷新额度</button>
+            <button type="button" onClick={onReset}>清除冷却</button>
+            <button type="button" onClick={onMove}>移动账号池</button>
+            <button type="button" onClick={onToggle}>{account.schedulable ? "暂停调度" : "参与调度"}</button>
+            <button type="button" className="danger" onClick={onDelete}>删除账号</button>
+          </OverflowMenu>
+        </div>
       </div>
     </article>
   );
 }
 
 function CompactQuotaGrid({ account }: { account: ClaudeCodeAccount }) {
+  const windows = [
+    { label: "5h", state: findQuotaWindowState(account, "five_hour") },
+    { label: "7天", state: findQuotaWindowState(account, "seven_day") },
+    { label: "S", state: findQuotaWindowState(account, "seven_day_sonnet") },
+    { label: "O", state: findQuotaWindowState(account, "seven_day_opus") },
+    { label: "F", state: findQuotaWindowState(account, "seven_day_fable") }
+  ];
   return (
-    <div className="grid min-w-0 grid-cols-2 gap-x-4 gap-y-1.5 border-y py-2">
-      <CompactQuotaWindow label="5h" state={findQuotaWindowState(account, "five_hour")} />
-      <CompactQuotaWindow label="7天" state={findQuotaWindowState(account, "seven_day")} />
-      <div className="col-span-2"><CompactModelQuotaSummary account={account} /></div>
+    <div className="grid min-w-0 grid-cols-5 divide-x border-y py-1">
+      {windows.map(({ label, state }) => (
+        <div key={label} className="grid min-w-0 justify-items-center px-1 text-center" title={quotaWindowStateTitle(state)}>
+          <span className="text-[10px] leading-3 text-muted-foreground">{label}</span>
+          <span className={cn("max-w-full truncate text-xs font-semibold leading-4 tabular-nums", quotaWindowStateTextTone(state))}>
+            {state && state.confidence !== "unknown" ? quotaWindowStateCompactValue(state) : "未知"}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -3294,30 +3353,6 @@ function CompactModelQuotaSummary({ account }: { account: ClaudeCodeAccount }) {
   );
 }
 
-function CompactQuotaWindow({ label, state }: { label: string; state?: QuotaWindowState }) {
-  if (!state || state.confidence === "unknown") {
-    return (
-      <div className="grid min-w-0 gap-1 text-xs">
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-muted-foreground">{label}</span>
-          <span className="font-medium text-muted-foreground">未知</span>
-        </div>
-        <div className="h-2 rounded-full bg-muted" />
-      </div>
-    );
-  }
-  const progressValue = quotaWindowStateProgress(state);
-  return (
-    <div className="grid min-w-0 gap-1 text-xs">
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-muted-foreground">{label}</span>
-        <span className={cn("font-semibold tabular-nums", quotaWindowStateTextTone(state))} title={quotaWindowStateTitle(state)}>{quotaWindowStateCompactValue(state)}</span>
-      </div>
-      {typeof progressValue === "number" ? <Progress value={progressValue} /> : <div className="h-2 rounded-full bg-muted" />}
-    </div>
-  );
-}
-
 function AccountMetricGrid({ account }: { account: ClaudeCodeAccount }) {
   const runtime = account.runtime_capacity;
   const configured = account.capacity;
@@ -3333,8 +3368,8 @@ function AccountMetricGrid({ account }: { account: ClaudeCodeAccount }) {
   return (
     <div className="grid grid-cols-5 divide-x overflow-hidden rounded-md border bg-muted/25" title="请求、Tokens 和金额为最近 30 天原始上游用量">
       {metrics.map((metric) => (
-        <div key={metric.label} className="min-w-0 px-1.5 py-1.5 text-center">
-          <div className="truncate text-[10px] leading-4 text-muted-foreground">{metric.label}</div>
+        <div key={metric.label} className="min-w-0 px-1 py-1 text-center">
+          <div className="truncate text-[10px] leading-3 text-muted-foreground">{metric.label}</div>
           <div className="truncate text-xs font-semibold leading-4 tabular-nums" title={metric.value}>{metric.value}</div>
         </div>
       ))}
@@ -3366,10 +3401,13 @@ function AvailabilityPanel({
   const value = hasData ? formatPercent(summary.success_rate) : "暂无请求";
   if (compact) {
     return (
-      <div className="grid min-w-0 grid-cols-[2rem_minmax(0,1fr)_auto] items-center gap-2">
+      <div className={cn(
+        "grid min-w-0 items-center gap-2",
+        hasData ? "grid-cols-[2rem_minmax(0,1fr)_auto]" : "grid-cols-[2rem_minmax(0,1fr)]"
+      )}>
         <span className="text-xs font-medium text-muted-foreground">1h</span>
         <AvailabilityStrip availability={availability} compact />
-        <span className={cn("min-w-14 text-right text-xs font-semibold tabular-nums", tone.textClass)}>{value}</span>
+        {hasData ? <span className={cn("min-w-12 text-right text-xs font-semibold tabular-nums", tone.textClass)}>{value}</span> : null}
       </div>
     );
   }
