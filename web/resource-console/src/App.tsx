@@ -5104,6 +5104,7 @@ function SessionKeyBatchForm({
   const previousJobStatus = useRef<string | undefined>(undefined);
   const [input, setInput] = useState("");
   const [concurrency, setConcurrency] = useState(2);
+  const [bindProxy, setBindProxy] = useState(true);
   const jobQuery = useQuery({
     queryKey: ["session-key-job"],
     queryFn: api.currentSessionKeyJob,
@@ -5114,11 +5115,12 @@ function SessionKeyBatchForm({
   });
   const job = jobQuery.data?.job || null;
   const active = job?.status === "queued" || job?.status === "running" || job?.status === "cancelling";
+  const jobBindsProxy = job?.bind_proxy !== false;
   const healthyAvailable = available.filter((proxy) => proxy.enabled && proxy.health_status === "healthy" && !proxy.reserved).length;
   const parsedKeys = input.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
   const startMutation = useMutation({
-    mutationFn: () => api.createSessionKeyJob(parsedKeys, concurrency, poolID),
+    mutationFn: () => api.createSessionKeyJob(parsedKeys, concurrency, poolID, bindProxy),
     onSuccess: async (data) => {
       setInput("");
       queryClient.setQueryData(["session-key-job"], data);
@@ -5157,7 +5159,7 @@ function SessionKeyBatchForm({
 
   return (
     <div className="grid min-w-0 gap-5">
-      <div className="grid grid-cols-[minmax(0,1fr)_10rem] gap-4 max-[640px]:grid-cols-1">
+      <div className="grid grid-cols-[minmax(0,1fr)_15rem] gap-4 max-[640px]:grid-cols-1">
         <Field label="SessionKey（一行一个）">
           <Textarea
             value={input}
@@ -5182,9 +5184,27 @@ function SessionKeyBatchForm({
               disabled={active}
             />
           </Field>
+          <label className="flex cursor-pointer items-start gap-2 rounded-lg border bg-muted/30 px-3 py-3 text-sm">
+            <input
+              type="checkbox"
+              aria-label="绑定独立代理 IP"
+              className="mt-0.5 h-4 w-4 shrink-0"
+              checked={bindProxy}
+              onChange={(event) => setBindProxy(event.target.checked)}
+              disabled={active || startMutation.isPending}
+            />
+            <span className="min-w-0">
+              <span className="block font-medium">绑定独立代理 IP</span>
+              <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                {bindProxy ? "每个账号预留并绑定一个健康代理。" : "新账号不绑定，已有账号保留原绑定；使用全局代理，未配置时直连。"}
+              </span>
+            </span>
+          </label>
           <div className="rounded-lg border bg-muted/30 px-3 py-3">
-            <div className="text-xs text-muted-foreground">健康空闲代理</div>
-            <div className="mt-1 text-2xl font-semibold">{healthyAvailable}</div>
+            <div className="text-xs text-muted-foreground">{bindProxy ? "健康空闲代理" : "账号代理"}</div>
+            <div className={cn("mt-1 font-semibold", bindProxy ? "text-2xl" : "text-base")}>
+              {bindProxy ? healthyAvailable : "不绑定"}
+            </div>
           </div>
         </div>
       </div>
@@ -5218,6 +5238,7 @@ function SessionKeyBatchForm({
                 {active ? <Loader2 className="h-4 w-4 animate-spin text-primary" /> : <CheckCircle2 className="h-4 w-4 text-emerald-600" />}
                 批量任务
                 <SessionKeyJobBadge status={job.status} />
+                <Badge tone="neutral">{jobBindsProxy ? "绑定代理" : "未绑定代理"}</Badge>
               </div>
               <div className="mt-1 font-mono text-xs text-muted-foreground">{job.id}</div>
             </div>
@@ -5228,7 +5249,11 @@ function SessionKeyBatchForm({
             <JobMetric label="新增" value={job.succeeded} tone="text-emerald-700" />
             <JobMetric label="更新" value={job.updated} tone="text-blue-700" />
             <JobMetric label="失败" value={job.failed} tone="text-red-700" />
-            <JobMetric label="无代理" value={job.no_proxy} tone="text-amber-700" />
+            <JobMetric
+              label={jobBindsProxy ? "无代理" : "未绑定"}
+              value={jobBindsProxy ? job.no_proxy : job.succeeded + job.updated}
+              tone={jobBindsProxy ? "text-amber-700" : "text-muted-foreground"}
+            />
             <JobMetric label="运行中" value={job.running + job.queued} tone="text-foreground" />
           </div>
           <div className="max-h-72 overflow-auto rounded-lg border">
@@ -5248,7 +5273,7 @@ function SessionKeyBatchForm({
                   <tr key={`${job.id}-${item.index}`} className="border-t align-top">
                     <td className="px-3 py-2 tabular-nums">{item.index}</td>
                     <td className="px-3 py-2 font-mono text-xs">{item.fingerprint}</td>
-                    <td className="max-w-44 break-words px-3 py-2">{item.proxy_name || item.proxy_exit_ip || "-"}</td>
+                    <td className="max-w-44 break-words px-3 py-2">{jobBindsProxy ? item.proxy_name || item.proxy_exit_ip || "-" : "未绑定"}</td>
                     <td className="max-w-52 break-all px-3 py-2">{item.account_email || "-"}</td>
                     <td className="px-3 py-2"><SessionKeyJobBadge status={item.status} /></td>
                     <td className="max-w-64 break-words px-3 py-2 text-xs text-muted-foreground">{item.error_message || "-"}</td>

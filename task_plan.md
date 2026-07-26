@@ -1,5 +1,25 @@
 # Task Plan: Multi-Pool API Keys, Pricing, Usage, And Console
 
+## Current Implementation: Optional SessionKey Proxy Binding
+
+### Goal
+
+Allow a SessionKey batch-login job to explicitly skip proxy reservation and binding while preserving the current proxy-bound behavior for existing API clients.
+
+### Phases
+
+1. [completed] Trace SessionKey job creation, proxy reservation, authentication, account persistence, and console controls.
+2. [completed] Add a backward-compatible `bind_proxy` job option and unbound-login execution path.
+3. [completed] Add the console toggle and make job mode/results explicit.
+4. [completed] Add regressions, update secondary-development notes, and run Go/frontend/build verification.
+
+### Decisions
+
+- Omitted `bind_proxy` remains `true`; existing clients continue reserving and binding one healthy proxy per valid SessionKey.
+- `bind_proxy=false` skips account-proxy reservation and passes no account proxy to the authenticator; the existing transport then uses the global proxy when configured, otherwise direct networking.
+- A newly registered direct-login account has no proxy binding; updating an existing account does not remove its existing binding.
+- The option applies to one batch job only and is not a global account-pool policy.
+
 ## Current Implementation: Account-Pool Protocol Consistency And Ordinary Mode
 
 ### Goal

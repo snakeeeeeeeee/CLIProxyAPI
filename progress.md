@@ -1,5 +1,15 @@
 # Progress: Multi-Pool API Keys, Pricing, Usage, And Console
 
+## 2026-07-26 Optional SessionKey Proxy Binding
+
+- Read the secondary-development notes and traced the complete SessionKey job, reservation, direct/proxy authenticator, persistence, API client, and batch-form flow.
+- Confirmed the requested behavior requires backend support; a UI-only switch would not bypass current reservation and binding requirements.
+- Chose a job-scoped `bind_proxy` option that defaults to the existing bound-proxy behavior when omitted.
+- Corrected the initial transport assumption after reading `newSessionKeyBrowserHTTPClient`: unbound login inherits the global proxy and falls back to direct only when the global proxy is empty.
+- Added the backend job mode, conditional reservation/renewal/release path, unbound authentication/persistence path, UI toggle, mode-aware job summary, and focused regression coverage.
+- Focused SessionKey tests and frontend type-check pass. Browser QA confirmed the default-on toggle, stable accessibility name, correct unbound copy/state, no 375px horizontal overflow, scrollable mobile dialog, and no console warnings/errors.
+- Completed `gofmt -w .`, `go test ./...`, the required backend compile, frontend type-check/build, and `git diff --check`; the embedded resource console was rebuilt and all temporary test services/files were removed.
+
 ## 2026-07-14 Account-Pool Protocol Consistency Implementation
 
 - Recovered the prior read-only review and confirmed the current approved dirty changes are the implementation baseline.

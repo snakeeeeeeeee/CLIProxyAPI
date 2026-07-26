@@ -53,6 +53,7 @@ type sessionKeyJob struct {
 	PoolID      string
 	Status      string
 	Concurrency int
+	BindProxy   bool
 	Items       []*sessionKeyJobItem
 	CreatedAt   time.Time
 	StartedAt   *time.Time
@@ -84,6 +85,7 @@ type sessionKeyJobView struct {
 	PoolID      string                  `json:"pool_id"`
 	Status      string                  `json:"status"`
 	Concurrency int                     `json:"concurrency"`
+	BindProxy   bool                    `json:"bind_proxy"`
 	Total       int                     `json:"total"`
 	Queued      int                     `json:"queued"`
 	Running     int                     `json:"running"`
@@ -215,7 +217,7 @@ func (m *sessionKeyJobManager) recomputeLatestLocked() {
 
 func buildSessionKeyJobView(job *sessionKeyJob) sessionKeyJobView {
 	view := sessionKeyJobView{
-		ID: job.ID, PoolID: job.PoolID, Status: job.Status, Concurrency: job.Concurrency, Total: len(job.Items),
+		ID: job.ID, PoolID: job.PoolID, Status: job.Status, Concurrency: job.Concurrency, BindProxy: job.BindProxy, Total: len(job.Items),
 		Items: make([]sessionKeyJobItemView, 0, len(job.Items)), CreatedAt: job.CreatedAt,
 		StartedAt: job.StartedAt, CompletedAt: job.CompletedAt,
 	}
@@ -253,6 +255,7 @@ func (h *Handler) CreateSessionKeyJob(c *gin.Context) {
 		SessionKeys []string `json:"session_keys"`
 		Concurrency int      `json:"concurrency"`
 		PoolID      string   `json:"pool_id"`
+		BindProxy   *bool    `json:"bind_proxy"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "请求格式无效"})
@@ -268,6 +271,10 @@ func (h *Handler) CreateSessionKeyJob(c *gin.Context) {
 	if body.Concurrency < 1 || body.Concurrency > 5 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_concurrency", "message": "并发范围为 1-5"})
 		return
+	}
+	bindProxy := true
+	if body.BindProxy != nil {
+		bindProxy = *body.BindProxy
 	}
 	body.PoolID = strings.TrimSpace(body.PoolID)
 	if body.PoolID == "" {
@@ -287,7 +294,8 @@ func (h *Handler) CreateSessionKeyJob(c *gin.Context) {
 	jobCtx, cancel := context.WithCancel(context.Background())
 	job := &sessionKeyJob{
 		ID: uuid.NewString(), PoolID: body.PoolID, Status: "queued", Concurrency: body.Concurrency,
-		Items: make([]*sessionKeyJobItem, 0, len(body.SessionKeys)), CreatedAt: time.Now().UTC(),
+		BindProxy: bindProxy,
+		Items:     make([]*sessionKeyJobItem, 0, len(body.SessionKeys)), CreatedAt: time.Now().UTC(),
 		Cancel: cancel, ctx: jobCtx, claimed: make(map[string]string),
 	}
 	seen := make(map[string]struct{}, len(body.SessionKeys))
@@ -314,29 +322,37 @@ func (h *Handler) CreateSessionKeyJob(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "job_running", "message": "已有 SessionKey 批量任务正在运行"})
 		return
 	}
-	store, err := h.openResourcePoolStoreForJob()
-	if err != nil {
-		h.sessionKeyJobs.releaseClaim(job)
-		cancel()
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "open_failed", "message": err.Error()})
-		return
-	}
-	reservations, err := store.ReserveHealthyProxies(c.Request.Context(), job.ID, "session-key-login", itemIDs, sessionKeyReservationTTL)
-	if err != nil {
-		closeResourcePoolStore(store)
-		h.sessionKeyJobs.releaseClaim(job)
-		cancel()
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "reserve_failed", "message": "代理预留失败"})
-		return
-	}
-	reservationByItem := make(map[string]resourcepool.ProxyReservation, len(reservations))
-	for _, reservation := range reservations {
-		reservationByItem[reservation.ItemID] = reservation
+	var store *resourcepool.Store
+	reservationByItem := make(map[string]resourcepool.ProxyReservation)
+	if job.BindProxy {
+		storeJob, errStore := h.openResourcePoolStoreForJob()
+		if errStore != nil {
+			h.sessionKeyJobs.releaseClaim(job)
+			cancel()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "open_failed", "message": errStore.Error()})
+			return
+		}
+		store = storeJob
+		reservations, errReserve := store.ReserveHealthyProxies(c.Request.Context(), job.ID, "session-key-login", itemIDs, sessionKeyReservationTTL)
+		if errReserve != nil {
+			closeResourcePoolStore(store)
+			h.sessionKeyJobs.releaseClaim(job)
+			cancel()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "reserve_failed", "message": "代理预留失败"})
+			return
+		}
+		reservationByItem = make(map[string]resourcepool.ProxyReservation, len(reservations))
+		for _, reservation := range reservations {
+			reservationByItem[reservation.ItemID] = reservation
+		}
 	}
 	h.sessionKeyJobs.mu.Lock()
 	for _, item := range job.Items {
 		if item.Status != "queued" {
 			item.SessionKey = ""
+			continue
+		}
+		if !job.BindProxy {
 			continue
 		}
 		reservation, ok := reservationByItem[item.ID]
@@ -353,7 +369,9 @@ func (h *Handler) CreateSessionKeyJob(c *gin.Context) {
 	}
 	view := buildSessionKeyJobView(job)
 	h.sessionKeyJobs.mu.Unlock()
-	closeResourcePoolStore(store)
+	if store != nil {
+		closeResourcePoolStore(store)
+	}
 	h.writeSessionKeyJobLog(job, nil, "info", "session_key_job_created", "")
 	resourcepool.PublishSessionKeyJobChanged(job.ID, "created")
 	go h.runSessionKeyJob(job)
@@ -396,10 +414,12 @@ func (h *Handler) CancelSessionKeyJob(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
 		return
 	}
-	for _, itemID := range cancelledItems {
-		h.releaseSessionKeyReservation(view.ID, itemID)
+	if view.BindProxy {
+		for _, itemID := range cancelledItems {
+			h.releaseSessionKeyReservation(view.ID, itemID)
+		}
 	}
-	h.writeSessionKeyJobLog(&sessionKeyJob{ID: view.ID, Status: view.Status}, nil, "warn", "session_key_job_cancelling", "cancelled")
+	h.writeSessionKeyJobLog(&sessionKeyJob{ID: view.ID, Status: view.Status, BindProxy: view.BindProxy}, nil, "warn", "session_key_job_cancelling", "cancelled")
 	resourcepool.PublishSessionKeyJobChanged(view.ID, "cancel")
 	c.JSON(http.StatusOK, gin.H{"job": view})
 }
@@ -418,8 +438,11 @@ func (h *Handler) runSessionKeyJob(job *sessionKeyJob) {
 	h.sessionKeyJobs.mu.Unlock()
 	resourcepool.PublishSessionKeyJobChanged(job.ID, "running")
 
-	renewDone := make(chan struct{})
-	go h.renewSessionKeyReservations(job, renewDone)
+	var renewDone chan struct{}
+	if job.BindProxy {
+		renewDone = make(chan struct{})
+		go h.renewSessionKeyReservations(job, renewDone)
+	}
 	queue := make(chan int)
 	var workers sync.WaitGroup
 	for worker := 0; worker < job.Concurrency; worker++ {
@@ -447,17 +470,21 @@ func (h *Handler) runSessionKeyJob(job *sessionKeyJob) {
 	}
 	close(queue)
 	workers.Wait()
-	close(renewDone)
-
-	h.sessionKeyJobs.storageMu.Lock()
-	store, err := h.openResourcePoolStoreForJob()
-	if err == nil {
-		if errRelease := store.ReleaseProxyReservations(context.Background(), job.ID); errRelease != nil {
-			log.WithFields(log.Fields{"job_id": job.ID, "error": errRelease}).Warn("failed to release SessionKey job reservations")
-		}
-		closeResourcePoolStore(store)
+	if renewDone != nil {
+		close(renewDone)
 	}
-	h.sessionKeyJobs.storageMu.Unlock()
+
+	if job.BindProxy {
+		h.sessionKeyJobs.storageMu.Lock()
+		store, err := h.openResourcePoolStoreForJob()
+		if err == nil {
+			if errRelease := store.ReleaseProxyReservations(context.Background(), job.ID); errRelease != nil {
+				log.WithFields(log.Fields{"job_id": job.ID, "error": errRelease}).Warn("failed to release SessionKey job reservations")
+			}
+			closeResourcePoolStore(store)
+		}
+		h.sessionKeyJobs.storageMu.Unlock()
+	}
 	completedAt := time.Now().UTC()
 	h.sessionKeyJobs.mu.Lock()
 	for _, item := range job.Items {
@@ -499,19 +526,23 @@ func (h *Handler) processSessionKeyJobItem(job *sessionKeyJob, index int) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), sessionKeyItemTimeout)
 	defer cancel()
-	h.sessionKeyJobs.storageMu.Lock()
-	store, err := h.openResourcePoolStoreForJob()
-	if err != nil {
+	proxyURL := ""
+	if job.BindProxy {
+		h.sessionKeyJobs.storageMu.Lock()
+		store, err := h.openResourcePoolStoreForJob()
+		if err != nil {
+			h.sessionKeyJobs.storageMu.Unlock()
+			h.failSessionKeyItem(job, item, "persistence_failed", "账号池存储不可用")
+			return
+		}
+		proxy, errProxy := store.GetProxy(ctx, proxyID)
+		closeResourcePoolStore(store)
 		h.sessionKeyJobs.storageMu.Unlock()
-		h.failSessionKeyItem(job, item, "persistence_failed", "账号池存储不可用")
-		return
-	}
-	proxy, err := store.GetProxy(ctx, proxyID)
-	closeResourcePoolStore(store)
-	h.sessionKeyJobs.storageMu.Unlock()
-	if err != nil || proxy == nil {
-		h.failSessionKeyItem(job, item, "proxy_error", "登录代理不可用")
-		return
+		if errProxy != nil || proxy == nil {
+			h.failSessionKeyItem(job, item, "proxy_error", "登录代理不可用")
+			return
+		}
+		proxyURL = proxy.ProxyURL
 	}
 	h.mu.Lock()
 	cfg := h.cfg
@@ -520,7 +551,7 @@ func (h *Handler) processSessionKeyJobItem(job *sessionKeyJob, index int) {
 	if factory == nil {
 		factory = defaultSessionKeyAuthenticatorFactory
 	}
-	bundle, err := factory(cfg, proxy.ProxyURL).Authenticate(ctx, sessionKey)
+	bundle, err := factory(cfg, proxyURL).Authenticate(ctx, sessionKey)
 	sessionKey = ""
 	if err != nil {
 		code := classifySessionKeyAuthError(err)
@@ -538,7 +569,9 @@ func (h *Handler) processSessionKeyJobItem(job *sessionKeyJob, index int) {
 		completeSessionKeyItem(item, "duplicate_account", "duplicate_account", "批次内账号重复")
 		item.SessionKey = ""
 		h.sessionKeyJobs.mu.Unlock()
-		h.releaseSessionKeyReservation(job.ID, item.ID)
+		if job.BindProxy {
+			h.releaseSessionKeyReservation(job.ID, item.ID)
+		}
 		resourcepool.PublishSessionKeyJobChanged(job.ID, "item_completed")
 		return
 	}
@@ -569,7 +602,9 @@ func (h *Handler) processSessionKeyJobItem(job *sessionKeyJob, index int) {
 	item.SessionKey = ""
 	h.sessionKeyJobs.mu.Unlock()
 	resourcepool.PublishAccountChanged(account.ID, status)
-	resourcepool.PublishProxyChanged(proxyID, "bind")
+	if proxyID != "" {
+		resourcepool.PublishProxyChanged(proxyID, "bind")
+	}
 	h.writeSessionKeyJobLog(job, item, "info", "session_key_login_succeeded", "")
 	resourcepool.PublishSessionKeyJobChanged(job.ID, "item_completed")
 }
@@ -645,7 +680,9 @@ func (h *Handler) failSessionKeyItem(job *sessionKeyJob, item *sessionKeyJobItem
 	completeSessionKeyItem(item, "failed", code, message)
 	item.SessionKey = ""
 	h.sessionKeyJobs.mu.Unlock()
-	h.releaseSessionKeyReservation(job.ID, item.ID)
+	if job.BindProxy {
+		h.releaseSessionKeyReservation(job.ID, item.ID)
+	}
 	log.WithFields(log.Fields{"job_id": job.ID, "item_index": item.Index, "fingerprint": item.Fingerprint, "proxy_id": item.ProxyID, "error_code": code}).Warn("SessionKey login item failed")
 	h.writeSessionKeyJobLog(job, item, "warn", "session_key_login_failed", code)
 	resourcepool.PublishSessionKeyJobChanged(job.ID, "item_completed")
@@ -690,6 +727,7 @@ func (h *Handler) writeSessionKeyJobLog(job *sessionKeyJob, item *sessionKeyJobI
 	jobID := job.ID
 	entry.Details["job_id"] = jobID
 	entry.Details["status"] = job.Status
+	entry.Details["bind_proxy"] = job.BindProxy
 	if code != "" {
 		entry.Details["error_code"] = code
 	}

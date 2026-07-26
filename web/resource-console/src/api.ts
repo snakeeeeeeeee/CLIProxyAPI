@@ -925,8 +925,10 @@ export interface SessionKeyJobItem {
 
 export interface SessionKeyJob {
   id: string;
+  pool_id: string;
   status: SessionKeyJobStatus;
   concurrency: number;
+  bind_proxy?: boolean;
   total: number;
   queued: number;
   running: number;
@@ -1192,10 +1194,10 @@ export const api = {
       })
     }),
   authStatus: (state: string) => request<OAuthStatusResponse>(`/get-auth-status?state=${encodeURIComponent(state)}`),
-  createSessionKeyJob: (sessionKeys: string[], concurrency: number, poolID = "default") =>
+  createSessionKeyJob: (sessionKeys: string[], concurrency: number, poolID = "default", bindProxy = true) =>
     request<{ job: SessionKeyJob }>("/claude-code-account-pool/session-key-jobs", {
       method: "POST",
-      body: JSON.stringify({ session_keys: sessionKeys, concurrency, pool_id: poolID })
+      body: JSON.stringify({ session_keys: sessionKeys, concurrency, pool_id: poolID, bind_proxy: bindProxy })
     }),
   currentSessionKeyJob: async () => {
     try {

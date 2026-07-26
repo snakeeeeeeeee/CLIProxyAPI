@@ -1,5 +1,14 @@
 # Findings: Multi-Pool API Keys, Pricing, Usage, And Console
 
+## Optional SessionKey Proxy Binding (2026-07-26)
+
+- SessionKey jobs currently reserve a healthy free proxy for every valid input before workers start. Missing reservations become `no_proxy`.
+- Each worker requires that reserved proxy, passes its URL to `SessionKeyAuthenticator`, and persists the resulting account with the same proxy binding.
+- The account store already supports an empty proxy ID. New accounts remain unbound; updates with an empty proxy ID preserve the existing binding.
+- `NewSessionKeyAuthenticator(cfg, "")` inherits `cfg.ProxyURL`; it is direct only when no global proxy is configured. This is appropriate for “no account-bound proxy” but must not be described as unconditional direct networking.
+- Backward compatibility requires a pointer/optional request field because a plain Go boolean cannot distinguish an omitted field from explicit `false`.
+- Focused and full regressions confirm that omitted mode still requires/reserves proxies, while explicit unbound mode succeeds with an empty proxy pool, passes no account proxy URL, creates an unbound account, and preserves an existing account binding on credential update.
+
 ## Account-Pool Protocol Consistency Implementation Baseline (2026-07-14)
 
 - The approved work starts from a cleanly formatted dirty worktree containing four intentional downstream fixes: pure-mode visible usage, `count_tokens` visible-input correction, explicit prompt-cache preservation, and Anthropic-compatible error envelopes.

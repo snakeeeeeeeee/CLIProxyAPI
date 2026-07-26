@@ -92,6 +92,9 @@ func TestSessionKeyJobLimitsConcurrencyAndDoesNotExposeSecrets(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
+	if !response.Job.BindProxy {
+		t.Fatal("omitted bind_proxy should default to true")
+	}
 	job := waitForSessionKeyJob(t, h, response.Job.ID)
 	if job.Succeeded != 2 || job.NoProxy != 1 || job.Failed != 1 {
 		t.Fatalf("job summary = %+v, want success=2 no_proxy=1 duplicate failure=1", job)
@@ -123,6 +126,99 @@ func TestSessionKeyJobLimitsConcurrencyAndDoesNotExposeSecrets(t *testing.T) {
 		if bytes.Contains(logBody, []byte(key)) {
 			t.Fatalf("account pool log contains SessionKey %q", key)
 		}
+	}
+}
+
+func TestSessionKeyJobCanSkipProxyBinding(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h, store := newSessionKeyJobTestHandler(t, 0)
+	tracker := &sessionKeyConcurrencyTracker{}
+	var proxyMu sync.Mutex
+	proxyURL := "not-called"
+	h.sessionKeyAuthFactory = func(_ *config.Config, gotProxyURL string) sessionKeyAuthenticator {
+		proxyMu.Lock()
+		proxyURL = gotProxyURL
+		proxyMu.Unlock()
+		return fakeSessionKeyAuthenticator{tracker: tracker}
+	}
+	body, _ := json.Marshal(map[string]any{
+		"session_keys": []string{"sk-ant-sid-unbound-a"},
+		"concurrency":  1,
+		"bind_proxy":   false,
+	})
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.CreateSessionKeyJob(c)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("CreateSessionKeyJob status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Job sessionKeyJobView `json:"job"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Job.BindProxy {
+		t.Fatal("bind_proxy = true, want false")
+	}
+	job := waitForSessionKeyJob(t, h, response.Job.ID)
+	if job.Succeeded != 1 || job.NoProxy != 0 || job.Failed != 0 {
+		t.Fatalf("job summary = %+v, want success=1 without proxy failures", job)
+	}
+	proxyMu.Lock()
+	gotProxyURL := proxyURL
+	proxyMu.Unlock()
+	if gotProxyURL != "" {
+		t.Fatalf("authenticator proxy URL = %q, want empty account proxy", gotProxyURL)
+	}
+	accounts, err := store.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatalf("ListAccounts() error = %v", err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("account count = %d, want 1", len(accounts))
+	}
+	if accounts[0].ProxyResourceID != "" {
+		t.Fatalf("account proxy = %q, want unbound", accounts[0].ProxyResourceID)
+	}
+	proxy, err := store.CreateProxy(context.Background(), resourcepool.ProxyResourceSeed{ProxyURL: "http://127.0.0.1:19999"})
+	if err != nil {
+		t.Fatalf("CreateProxy() error = %v", err)
+	}
+	if _, err = store.BindAccountProxy(context.Background(), accounts[0].ID, proxy.ID); err != nil {
+		t.Fatalf("BindAccountProxy() error = %v", err)
+	}
+	refreshBody, _ := json.Marshal(map[string]any{
+		"session_keys": []string{"sk-ant-sid-unbound-refresh-a"},
+		"concurrency":  1,
+		"bind_proxy":   false,
+	})
+	refreshRecorder := httptest.NewRecorder()
+	refreshContext, _ := gin.CreateTestContext(refreshRecorder)
+	refreshContext.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(refreshBody))
+	refreshContext.Request.Header.Set("Content-Type", "application/json")
+	h.CreateSessionKeyJob(refreshContext)
+	if refreshRecorder.Code != http.StatusAccepted {
+		t.Fatalf("refresh CreateSessionKeyJob status = %d body=%s", refreshRecorder.Code, refreshRecorder.Body.String())
+	}
+	var refreshResponse struct {
+		Job sessionKeyJobView `json:"job"`
+	}
+	if err = json.Unmarshal(refreshRecorder.Body.Bytes(), &refreshResponse); err != nil {
+		t.Fatalf("decode refresh response: %v", err)
+	}
+	refreshJob := waitForSessionKeyJob(t, h, refreshResponse.Job.ID)
+	if refreshJob.Updated != 1 {
+		t.Fatalf("refresh job summary = %+v, want updated=1", refreshJob)
+	}
+	updatedAccount, err := store.GetAccount(context.Background(), accounts[0].ID)
+	if err != nil {
+		t.Fatalf("GetAccount() error = %v", err)
+	}
+	if updatedAccount.ProxyResourceID != proxy.ID {
+		t.Fatalf("updated account proxy = %q, want preserved %q", updatedAccount.ProxyResourceID, proxy.ID)
 	}
 }
 
