@@ -827,6 +827,8 @@ type ClaudeCodeAccount struct {
 	CloakUserID          string                      `json:"cloak_user_id,omitempty"`
 	Email                string                      `json:"email"`
 	HasAuthData          bool                        `json:"has_auth_data"`
+	LoginSource          string                      `json:"login_source"`
+	HasSessionKey        bool                        `json:"has_session_key"`
 	TokenExpiresAt       *time.Time                  `json:"token_expires_at,omitempty"`
 	Enabled              bool                        `json:"enabled"`
 	Schedulable          bool                        `json:"schedulable"`

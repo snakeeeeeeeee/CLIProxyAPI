@@ -1,5 +1,14 @@
 # Findings: Multi-Pool API Keys, Pricing, Usage, And Console
 
+## Account Migration Compatibility Implementation (2026-07-26)
+
+- sub2api `0.1.165` accepts both an omitted header and the explicit `type=sub2api-data, version=1` header emitted here; its account import consumes the same proxy and account field names used by this implementation.
+- sub2api account-level `expires_at` is an administrator-defined account expiration, while `credentials.expires_at` is the OAuth access-token expiration used by the Claude token refresher. Exporting one as the other could auto-pause a refreshable account, so only the credential field is mapped.
+- A sub2api re-import may not contain this project's `cliproxy_auth_id`. Matching an existing account by email before registration avoids duplicate rows and allows a retained SessionKey to survive an OAuth credential update.
+- Cross-pool identity conflicts must be rejected before calling the pre-persistence auth hook. Proxy records are also not created until the target pool is verified as present and active.
+- sub2api normalizes imported proxy status `expired` to inactive. The compatible importer now does the same for `inactive`, `disabled`, and `expired`.
+- Focused resource-pool and management tests cover direct OAuth/proxy round trips, Token/account expiry separation, same-email update, SessionKey preservation, cross-pool hook isolation, no-store responses, and plaintext text export.
+
 ## Claude Code 2.1.220 Fixed Baseline Implementation (2026-07-26)
 
 - The recorded 2.1.220 HTTP/1.1 Header order matches the current r3 ordered transport; the version tuple and request-category timeout behavior are the Profile changes required here.
@@ -452,3 +461,11 @@
 - The routing-events endpoint currently caps results at 80 but returns no total or offset support; the page renders all 80 rows at once, which creates an increasingly tall page and prevents access to older history.
 - The existing `UsageQuery` and SQL filter builder can support pagination additively by adding a normalized offset plus a matching count query. Other usage aggregation callers ignore the offset.
 - The pool header range control filters event occurrence time (`created_at`); labeling it `事件范围` and the table column `发生时间` removes the current ambiguity.
+# Account Migration Compatibility Findings (2026-07-26)
+
+- The current account pool has no account export API or UI. `accounts/import-auth` only attaches an auth already loaded by AuthManager and is not a batch file import.
+- SessionKey jobs currently retain raw keys only in in-memory work items, then clear them immediately after authentication. Persisted account auth JSON contains OAuth access/refresh tokens but no SessionKey or login-source marker.
+- Existing SessionKey-origin accounts can be exported as OAuth because the token exchange result is persisted, but their original SessionKeys cannot be recovered.
+- sub2api account backups use a `sub2api-data` version 1 envelope with `exported_at`, `proxies`, and `accounts`. Anthropic OAuth accounts use `platform=anthropic`, `type=oauth`, and raw credential maps.
+- A compatible export must include bound proxy records and account `proxy_key` references together; otherwise direct sub2api import cannot preserve account network binding.
+- Secret-bearing export/import must remain Management-only and must not reuse normal account DTOs, SSE events, diagnostics, or logs.

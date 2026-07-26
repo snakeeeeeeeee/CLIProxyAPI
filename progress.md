@@ -1,5 +1,16 @@
 # Progress: Multi-Pool API Keys, Pricing, Usage, And Console
 
+## 2026-07-26 sub2api-Compatible Account Import And Export
+
+- Added an idempotent SQLite credential-origin table and atomic plaintext SessionKey retention for successful SessionKey account registration.
+- Added Management-only batch OAuth import/export using the sub2api version 1 account/proxy contract and separate newline SessionKey export.
+- Added explicit target-pool validation, cross-pool failure isolation, existing-account email matching, proxy reuse, capacity/priority/note mapping, and strict one-account-per-proxy behavior.
+- Corrected OAuth Token expiration to map only through `credentials.expires_at`; sub2api account-level expiration is intentionally not fabricated from Token expiry.
+- Added account-page OAuth import/export and selected-account SessionKey export controls without rendering credentials or storing migration payloads in browser storage.
+- Updated secondary-development documentation. `gofmt -w .`, `go test ./...`, the required backend build, resource-console type-check/build, and `git diff --check` all pass.
+- Isolated browser QA imported a synthetic sub2api file and exposed the selected-account OAuth/SessionKey actions. The import dialog and toolbar/card layouts had no document overflow at 375/768/1024/1440; the temporary server, database, auth file, binary, fixture, and viewport override were removed.
+- Native download-confirmation automation did not complete reliably, so browser download completion is not claimed. The OAuth/session export handlers remain covered for body separation, text media type, unavailable count, and no-store responses.
+
 ## 2026-07-26 sub2api Anthropic Quota Collection Research
 
 - Verified the updated local source as sub2api `0.1.165` at commit `2730c1c43b29be003925b033f3f9e645e726bb8c` and excluded the older similarly named checkout.
@@ -451,3 +462,9 @@
 - Added failing regressions that reproduced both probes, then preserved ordered system cache controls in migrated user blocks and added one shared error request ID for body and headers.
 - Focused executor and Claude handler package tests pass, including the existing pure-mode and count-token regressions.
 - Completed `gofmt -w .`, `go test ./...`, the required `go build -o test-output ./cmd/server`, and `git diff --check`; all passed and the temporary binary was removed.
+# sub2api-Compatible Account Import And Export (2026-07-26)
+
+- Confirmed the previously discussed feature was not implemented: only proxy import, SessionKey login, OAuth login, and existing-auth attachment are present.
+- Confirmed existing SessionKeys are irrecoverable because successful jobs clear the raw value and persist only OAuth credentials.
+- Inspected sub2api `sub2api-data` version 1 account/proxy backup contract and selected it as the bidirectional OAuth interchange format.
+- Started the backend migration/API implementation; existing protocol, quota, and strict-proxy behavior remains out of scope.

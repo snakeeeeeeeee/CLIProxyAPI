@@ -1,5 +1,38 @@
 # Task Plan: Multi-Pool API Keys, Pricing, Usage, And Console
 
+## Current Implementation: sub2api-Compatible Account Import And Export
+
+### Goal
+
+Add bidirectional batch migration between the Claude Code account pool and sub2api, plus explicit plaintext SessionKey retention/export for accounts imported through SessionKey jobs after this upgrade.
+
+### Phases
+
+1. [completed] Define the exact sub2api data bundle, OAuth credential, proxy, pool, and duplicate-account mappings.
+2. [completed] Add idempotent account provenance/SessionKey storage migration and Store APIs that never expose secrets through normal account reads.
+3. [completed] Add Management-only OAuth bundle import/export and separate SessionKey export endpoints with batch result reporting.
+4. [completed] Add account-page selection, OAuth import/export, and SessionKey export controls with explicit sensitive-data warnings.
+5. [completed] Add migrations/API/parser/UI tests and update secondary-development documentation.
+6. [completed] Run gofmt, full Go tests, required Go build, frontend type-check/build, and responsive browser verification.
+
+### Decisions
+
+- OAuth export uses sub2api `sub2api-data` version 1 and includes selected accounts plus their bound proxies so the file imports directly into sub2api.
+- OAuth import accepts the same sub2api bundle and targets one explicit account pool; duplicate accounts in another pool fail without silent movement.
+- SessionKey export is a separate newline text download and only includes accounts whose original SessionKey was retained after this migration.
+- The user explicitly accepts plaintext SessionKey storage. It remains isolated to a dedicated SQLite column and authenticated export response; normal APIs, logs, SSE, diagnostics, and errors must not expose it.
+- Existing SessionKeys were intentionally discarded and cannot be reconstructed from OAuth tokens; old accounts remain OAuth-exportable only.
+
+### Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| The previous fixed-baseline plan explicitly excluded the earlier export/import request | 1 | The user has now approved it as a separate implementation scope; preserve the completed baseline and add this independent phase. |
+| The new round-trip test called `CreateAccountPool` with a struct instead of its existing `(name, description)` signature | 1 | Updated the test to use the repository's actual method signature before rerunning the package tests. |
+| The first focused compile received two values from `FindAccountOverlay`, which returns `(overlay, found, error)` | 1 | Updated the import identity lookup to handle all three values and fail the individual item when the lookup itself fails. |
+| Browser automation did not surface the native OAuth export confirmation quickly enough for the download event test | 1 | Kept the verified UI control/layout result and relied on handler tests for the exact download body, media type, and no-store headers; did not claim browser download completion. |
+| The environment rejected a broad `rm -f` cleanup command | 1 | Deleted hand-written fixtures with `apply_patch`, then explicitly unlinked only the generated binary, SQLite, and synthetic auth file before removing the empty directories. |
+
 ## Current Implementation: Claude Code 2.1.220 Fixed Baseline, Quota Collection, And Strict Proxying
 
 ### Goal

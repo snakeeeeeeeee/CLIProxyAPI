@@ -1111,6 +1111,9 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/claude-code-account-pool/accounts", s.mgmt.ListClaudeCodeAccounts)
 		mgmt.POST("/claude-code-account-pool/accounts/import-auth", s.mgmt.ImportClaudeAuthToAccountPool)
+		mgmt.POST("/claude-code-account-pool/accounts/import", s.mgmt.ImportClaudeCodeAccounts)
+		mgmt.POST("/claude-code-account-pool/accounts/export", s.mgmt.ExportClaudeCodeAccounts)
+		mgmt.POST("/claude-code-account-pool/accounts/export-session-keys", s.mgmt.ExportClaudeCodeSessionKeys)
 		mgmt.POST("/claude-code-account-pool/accounts/batch", s.mgmt.BatchClaudeCodeAccounts)
 		mgmt.PATCH("/claude-code-account-pool/accounts/:id", s.mgmt.PatchClaudeCodeAccount)
 		mgmt.POST("/claude-code-account-pool/accounts/:id/move", s.mgmt.MoveClaudeCodeAccount)

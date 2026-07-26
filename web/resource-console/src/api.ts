@@ -29,6 +29,8 @@ export interface ClaudeCodeAccount {
   cloak_user_id?: string;
   email: string;
   has_auth_data?: boolean;
+  login_source?: "oauth" | "oauth_import" | "session_key" | "unknown" | string;
+  has_session_key?: boolean;
   token_expires_at?: string;
   enabled: boolean;
   schedulable: boolean;
@@ -981,6 +983,48 @@ export interface ProxyBatchResult {
 
 export type AccountBatchResult = ProxyBatchResult;
 
+export interface Sub2APIDataProxy {
+  proxy_key: string;
+  name: string;
+  protocol: "http" | "https" | "socks5" | "socks5h" | string;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  status: "active" | "inactive" | string;
+}
+
+export interface Sub2APIDataAccount {
+  name: string;
+  notes?: string;
+  platform: string;
+  type: string;
+  credentials: Record<string, unknown>;
+  extra?: Record<string, unknown>;
+  proxy_key?: string;
+  concurrency: number;
+  priority: number;
+  expires_at?: number;
+}
+
+export interface Sub2APIDataPayload {
+  type?: string;
+  version?: number;
+  exported_at: string;
+  proxies: Sub2APIDataProxy[];
+  accounts: Sub2APIDataAccount[];
+}
+
+export interface Sub2APIImportResult {
+  proxy_created: number;
+  proxy_reused: number;
+  proxy_failed: number;
+  account_created: number;
+  account_updated: number;
+  account_failed: number;
+  errors?: Array<{ kind: string; name?: string; proxy_key?: string; message: string }>;
+}
+
 export interface AccountTestPayload {
   model?: string;
   message?: string;
@@ -1080,6 +1124,30 @@ async function download(path: string): Promise<Blob> {
   return response.blob();
 }
 
+async function downloadRequest(path: string, options: RequestInit): Promise<{ blob: Blob; unavailable: number }> {
+  const key = getManagementKey().trim();
+  const headers = new Headers(options.headers);
+  headers.set("Content-Type", "application/json");
+  if (key) {
+    headers.set("X-Management-Key", key);
+  }
+  const response = await fetch(`/v0/management${path}`, { ...options, headers });
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`;
+    try {
+      const payload = (await response.json()) as { message?: string; error?: string };
+      message = payload.message || payload.error || message;
+    } catch {
+      // Keep the status message when the endpoint returns a non-JSON body.
+    }
+    throw new ManagementAPIError(message, response.status);
+  }
+  return {
+    blob: await response.blob(),
+    unavailable: Number(response.headers.get("X-Session-Key-Unavailable") || 0)
+  };
+}
+
 export const api = {
   config: () => request<ResourcePoolConfig>("/resource-pools/config"),
   accountPools: (window: UsageWindow = "30d", includeArchived = false) =>
@@ -1101,6 +1169,21 @@ export const api = {
     if (poolID) params.set("pool_id", poolID);
     return request<{ items: AccountRow[] }>(`/claude-code-account-pool/accounts?${params.toString()}`);
   },
+  exportAccounts: (poolID: string, ids: string[] = [], includeProxies = true) =>
+    request<Sub2APIDataPayload>("/claude-code-account-pool/accounts/export", {
+      method: "POST",
+      body: JSON.stringify({ pool_id: poolID, ids, include_proxies: includeProxies })
+    }),
+  importAccounts: (poolID: string, data: Sub2APIDataPayload) =>
+    request<Sub2APIImportResult>("/claude-code-account-pool/accounts/import", {
+      method: "POST",
+      body: JSON.stringify({ pool_id: poolID, data })
+    }),
+  exportSessionKeys: (poolID: string, ids: string[] = []) =>
+    downloadRequest("/claude-code-account-pool/accounts/export-session-keys", {
+      method: "POST",
+      body: JSON.stringify({ pool_id: poolID, ids })
+    }),
   poolAPIKeys: (poolID = "", window: UsageWindow = "30d", includeRevoked = false) => {
     const params = new URLSearchParams({ window, include_revoked: String(includeRevoked) });
     if (poolID) params.set("pool_id", poolID);

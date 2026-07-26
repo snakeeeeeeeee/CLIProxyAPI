@@ -869,3 +869,53 @@ web/resource-console/node_modules/
 - `overage=rejected` 只表示额外用量不可用，不代表 Sonnet、Opus 或 Fable 额度耗尽。
 - 账号测试收到 HTTP 200 但没有文本时，会显示响应类型、停止原因或 SSE 事件摘要；`stop_reason=refusal` 表示模型拒绝生成，不是网络连接失败。
 - 账号测试是真实上游请求，会写入 `1h 可用性`和真实 token 用量；HTTP 2xx 算可用，非 2xx、代理或传输失败算不可用。
+
+## 20. 与 sub2api 批量迁移账号
+
+账号页支持标准 sub2api 文件的双向迁移。导出的 JSON 可以直接在 sub2api 账号导入页面使用，sub2api 导出的 `sub2api-data` version 1 JSON 也可以直接导入指定账号池。
+
+文件结构：
+
+```json
+{
+  "type": "sub2api-data",
+  "version": 1,
+  "exported_at": "2026-07-26T00:00:00Z",
+  "proxies": [],
+  "accounts": []
+}
+```
+
+操作规则：
+
+- “导出全部”导出当前池全部账号；勾选账号后可以只导出选中账号。
+- 默认连同绑定代理导出，账号通过 `proxy_key` 关联代理。
+- 导入始终进入当前账号池，不会自动移动已属于其他池的账号。
+- OAuth 文件包含 access token、refresh token 和代理凭据明文，应按密钥文件保管。
+- 同一账号重新导入当前池会更新 OAuth 凭据；导入其他池会返回 `账号已属于其他账号池`。
+- `credentials.expires_at` 与本项目内部 `expired` 双向兼容。
+- sub2api 顶层账号 `expires_at` 是独立的运营到期时间，不等同于 OAuth Token 到期时间；本项目没有对应字段，因此不会伪造或覆盖该值。
+
+SessionKey 规则：
+
+- SessionKey 单独导出为 TXT，一行一个。
+- 只有本版本升级后通过 SessionKey 成功登录并留存原文的账号可以导出。
+- 老账号即使来源是 SessionKey，也无法恢复升级前已丢弃的原文。
+- SQLite 中的 SessionKey 是明文，仅普通账号 API、日志、SSE 和诊断接口保持不返回原文。
+
+Management API 示例：
+
+```bash
+curl -sS "$BASE_URL/v0/management/claude-code-account-pool/accounts/export" \
+  -H "X-Management-Key: $MANAGEMENT_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"pool_id":"default","ids":[],"include_proxies":true}' \
+  -o sub2api-account.json
+```
+
+```bash
+curl -sS "$BASE_URL/v0/management/claude-code-account-pool/accounts/import" \
+  -H "X-Management-Key: $MANAGEMENT_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary "$(jq -n --arg pool default --slurpfile data sub2api-account.json '{pool_id:$pool,data:$data[0]}')"
+```

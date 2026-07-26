@@ -554,8 +554,8 @@ func (h *Handler) processSessionKeyJobItem(job *sessionKeyJob, index int) {
 		factory = defaultSessionKeyAuthenticatorFactory
 	}
 	bundle, err := factory(cfg, proxyURL).Authenticate(ctx, sessionKey)
-	sessionKey = ""
 	if err != nil {
+		sessionKey = ""
 		code := classifySessionKeyAuthError(err)
 		h.failSessionKeyItem(job, item, code, sessionKeyErrorMessage(code))
 		return
@@ -577,7 +577,8 @@ func (h *Handler) processSessionKeyJobItem(job *sessionKeyJob, index int) {
 		resourcepool.PublishSessionKeyJobChanged(job.ID, "item_completed")
 		return
 	}
-	account, updated, err := h.persistSessionKeyAccount(ctx, job.PoolID, job.ID, item.ID, proxyID, bundle)
+	account, updated, err := h.persistSessionKeyAccount(ctx, job.PoolID, job.ID, item.ID, proxyID, sessionKey, bundle)
+	sessionKey = ""
 	if err == nil {
 		h.sessionKeyJobs.mu.Lock()
 		job.claimed[accountUUID] = item.ID
@@ -615,7 +616,7 @@ func (h *Handler) processSessionKeyJobItem(job *sessionKeyJob, index int) {
 	resourcepool.PublishSessionKeyJobChanged(job.ID, "item_completed")
 }
 
-func (h *Handler) persistSessionKeyAccount(ctx context.Context, poolID, jobID, itemID, proxyID string, bundle *claudeauth.ClaudeAuthBundle) (*resourcepool.ClaudeCodeAccount, bool, error) {
+func (h *Handler) persistSessionKeyAccount(ctx context.Context, poolID, jobID, itemID, proxyID, sessionKey string, bundle *claudeauth.ClaudeAuthBundle) (*resourcepool.ClaudeCodeAccount, bool, error) {
 	storage := &claudeauth.ClaudeTokenStorage{
 		AccessToken: bundle.TokenData.AccessToken, RefreshToken: bundle.TokenData.RefreshToken,
 		LastRefresh: bundle.LastRefresh, Email: bundle.TokenData.Email,
@@ -648,7 +649,7 @@ func (h *Handler) persistSessionKeyAccount(ctx context.Context, poolID, jobID, i
 	if updated && strings.TrimSpace(proxyID) == "" && strings.TrimSpace(existing.ProxyResourceID) != "" {
 		return nil, false, resourcepool.ErrAccountProxyModeConflict
 	}
-	account, err := store.RegisterClaudeCodeAccountWithAuthReservationInPool(ctx, poolID, authID, storage.Email, proxyID, record, jobID, itemID)
+	account, err := store.RegisterClaudeCodeAccountWithCredentialOriginInPool(ctx, poolID, authID, storage.Email, proxyID, record, jobID, itemID, "session_key", sessionKey)
 	if err != nil {
 		return nil, false, err
 	}

@@ -42,6 +42,7 @@ import {
   ShieldAlert,
   Trash2,
   Unlink,
+  Upload,
   UserRoundCog,
   UsersRound,
   X
@@ -81,6 +82,8 @@ import {
   RoutingEvent,
   UsageSummary,
   UsageCalibrationResponse,
+  Sub2APIDataPayload,
+  Sub2APIImportResult,
   api,
   getManagementKey,
   isManagementAuthError,
@@ -471,6 +474,7 @@ function App() {
   const notify = (message: string, danger = false) => showToast(message, danger ? "danger" : "default");
   const accountWorkspace = (forcedTab: "accounts" | "config") => (
     <AccountsView
+      poolID={currentPoolID || "default"}
       accounts={accounts}
       pools={pools}
       available={available}
@@ -820,6 +824,7 @@ function ToastView({ toast }: { toast: ToastState }) {
 const ACCOUNT_PAGE_SIZE = 20;
 
 function AccountsView({
+  poolID,
   accounts,
   pools,
   available,
@@ -845,6 +850,7 @@ function AccountsView({
   onDone,
   onRefreshDiagnostics
 }: {
+  poolID: string;
   accounts: AccountRow[];
   pools: ClaudeCodeAccountPool[];
   available: ProxyResource[];
@@ -882,6 +888,8 @@ function AccountsView({
   const [visibleCardCount, setVisibleCardCount] = useState(ACCOUNT_PAGE_SIZE);
   const [detailRow, setDetailRow] = useState<AccountRow | null>(null);
   const [moveRow, setMoveRow] = useState<AccountRow | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [transferPending, setTransferPending] = useState(false);
   const selectedSet = useMemo(() => new Set(selectedIDs), [selectedIDs]);
   const selectedCount = selectedIDs.length;
   const filteredAccounts = useMemo(() => {
@@ -1078,6 +1086,44 @@ function AccountsView({
     batchMutation.mutate({ action, ids: selectedIDs, confirmed: action === "refresh-quota" });
   };
 
+  const exportOAuth = async (ids: string[]) => {
+    if (transferPending) return;
+    const scope = ids.length > 0 ? `选中的 ${ids.length} 个账号` : "当前账号池的全部账号";
+    if (!window.confirm(`将导出${scope}的 OAuth Token 和绑定代理明文。文件可直接导入 sub2api，请确认继续。`)) {
+      return;
+    }
+    setTransferPending(true);
+    try {
+      const payload = await api.exportAccounts(poolID, ids, true);
+      downloadBrowserFile(
+        new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }),
+        `sub2api-account-${fileTimestamp()}.json`
+      );
+      onToast(`已导出 ${payload.accounts.length} 个 OAuth 账号`);
+    } catch (error) {
+      onToast(`OAuth 导出失败：${errorMessage(error)}`, "danger");
+    } finally {
+      setTransferPending(false);
+    }
+  };
+
+  const exportSessionKeys = async (ids: string[]) => {
+    if (transferPending || ids.length === 0) return;
+    if (!window.confirm(`将以明文导出所选 ${ids.length} 个账号中仍保留的 SessionKey，确认继续？`)) {
+      return;
+    }
+    setTransferPending(true);
+    try {
+      const result = await api.exportSessionKeys(poolID, ids);
+      downloadBrowserFile(result.blob, `claude-session-keys-${fileTimestamp()}.txt`);
+      onToast(result.unavailable > 0 ? `SessionKey 已导出；另有 ${result.unavailable} 个账号没有可恢复的原始 SessionKey` : "SessionKey 已导出");
+    } catch (error) {
+      onToast(`SessionKey 导出失败：${errorMessage(error)}`, "danger");
+    } finally {
+      setTransferPending(false);
+    }
+  };
+
   const refreshQuota = (account: ClaudeCodeAccount) => {
     if (activeQuotaCollectionDisabled) {
       onToast("当前已禁用主动额度采集", "danger");
@@ -1132,6 +1178,9 @@ function AccountsView({
             onQueryChange={setSearchQuery}
             onStatusChange={setStatusFilter}
             onViewModeChange={setViewMode}
+            transferPending={transferPending}
+            onImportOAuth={() => setImportOpen(true)}
+            onExportAllOAuth={() => void exportOAuth([])}
           />
           <AccountCardsPanel
             rows={visibleRows}
@@ -1143,7 +1192,7 @@ function AccountsView({
             pagePartiallySelected={pagePartiallySelected}
             selectedSet={selectedSet}
             selectedCount={selectedCount}
-            pending={batchMutation.isPending}
+            pending={batchMutation.isPending || transferPending}
             availableCount={available.length}
             viewMode={viewMode}
             onPageChange={setPage}
@@ -1152,6 +1201,8 @@ function AccountsView({
             onSelectAccount={setAccountSelected}
             onRunBatch={runBatch}
             onClearSelection={clearSelection}
+            onExportOAuth={() => void exportOAuth(selectedIDs)}
+            onExportSessionKeys={() => void exportSessionKeys(selectedIDs)}
             onDetails={setDetailRow}
             onTest={onTest}
             onBind={onBind}
@@ -1167,6 +1218,24 @@ function AccountsView({
                 deleteMutation.mutate(account.id);
               }
             }}
+          />
+          <OAuthBundleImportDialog
+            open={importOpen}
+            poolID={poolID}
+            onOpenChange={setImportOpen}
+            onImported={async (result) => {
+              await onDone();
+              const imported = result.account_created + result.account_updated;
+              if (result.account_failed > 0 || result.proxy_failed > 0) {
+                const firstError = result.errors?.[0]?.message;
+                onToast(`导入完成：成功 ${imported}，失败 ${result.account_failed}${firstError ? `，首个错误：${firstError}` : ""}`, "danger");
+              } else if (result.errors?.length) {
+                onToast(`导入完成：成功 ${imported}，但有警告：${result.errors[0].message}`, "danger");
+              } else {
+                onToast(`导入完成：新增 ${result.account_created}，更新 ${result.account_updated}`);
+              }
+            }}
+            onToast={onToast}
           />
         </div>
       ) : activeTab === "metrics" ? (
@@ -2887,18 +2956,24 @@ function AccountWorkspaceToolbar({
   viewMode,
   total,
   filtered,
+  transferPending,
   onQueryChange,
   onStatusChange,
-  onViewModeChange
+  onViewModeChange,
+  onImportOAuth,
+  onExportAllOAuth
 }: {
   query: string;
   status: "all" | "available" | "checking" | "cooling" | "error" | "disabled";
   viewMode: "cards" | "table";
   total: number;
   filtered: number;
+  transferPending: boolean;
   onQueryChange: (value: string) => void;
   onStatusChange: (value: "all" | "available" | "checking" | "cooling" | "error" | "disabled") => void;
   onViewModeChange: (value: "cards" | "table") => void;
+  onImportOAuth: () => void;
+  onExportAllOAuth: () => void;
 }) {
   return (
     <div className="workspace-toolbar flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card p-3">
@@ -2927,9 +3002,17 @@ function AccountWorkspaceToolbar({
         </Select>
         <span className="whitespace-nowrap text-xs text-muted-foreground">{filtered} / {total}</span>
       </div>
-      <div className="view-toggle flex rounded-lg border bg-muted/40 p-0.5" aria-label="账号显示方式">
-        <button type="button" className={cn("icon-segment", viewMode === "cards" && "active")} onClick={() => onViewModeChange("cards")} title="卡片视图" aria-label="卡片视图"><LayoutGrid className="h-4 w-4" /></button>
-        <button type="button" className={cn("icon-segment", viewMode === "table" && "active")} onClick={() => onViewModeChange("table")} title="表格视图" aria-label="表格视图"><List className="h-4 w-4" /></button>
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="outline" size="sm" onClick={onImportOAuth} disabled={transferPending}>
+          <Upload className="h-3.5 w-3.5" />导入 OAuth
+        </Button>
+        <Button variant="outline" size="sm" onClick={onExportAllOAuth} disabled={transferPending || total === 0}>
+          {transferPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}导出全部
+        </Button>
+        <div className="view-toggle flex rounded-lg border bg-muted/40 p-0.5" aria-label="账号显示方式">
+          <button type="button" className={cn("icon-segment", viewMode === "cards" && "active")} onClick={() => onViewModeChange("cards")} title="卡片视图" aria-label="卡片视图"><LayoutGrid className="h-4 w-4" /></button>
+          <button type="button" className={cn("icon-segment", viewMode === "table" && "active")} onClick={() => onViewModeChange("table")} title="表格视图" aria-label="表格视图"><List className="h-4 w-4" /></button>
+        </div>
       </div>
     </div>
   );
@@ -2954,6 +3037,8 @@ function AccountCardsPanel({
   onSelectAccount,
   onRunBatch,
   onClearSelection,
+  onExportOAuth,
+  onExportSessionKeys,
   onDetails,
   onTest,
   onBind,
@@ -2984,6 +3069,8 @@ function AccountCardsPanel({
   onSelectAccount: (id: string, selected: boolean) => void;
   onRunBatch: (action: AccountBatchAction) => void;
   onClearSelection: () => void;
+  onExportOAuth: () => void;
+  onExportSessionKeys: () => void;
   onDetails: (row: AccountRow) => void;
   onTest: (account: ClaudeCodeAccount) => void;
   onBind: (account: ClaudeCodeAccount) => void;
@@ -3035,6 +3122,12 @@ function AccountCardsPanel({
             <span className="text-muted-foreground">已选 {selectedCount}</span>
           </label>
           <div className="flex flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={onExportOAuth} disabled={selectedCount === 0 || pending}>
+              <Download className="h-3.5 w-3.5" />OAuth
+            </Button>
+            <Button variant="outline" size="sm" onClick={onExportSessionKeys} disabled={selectedCount === 0 || pending}>
+              <KeyRound className="h-3.5 w-3.5" />SessionKey
+            </Button>
             <Button variant="outline" size="sm" onClick={() => onRunBatch("test")} disabled={selectedCount === 0 || pending}>
               {pending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
               测试
@@ -5204,6 +5297,117 @@ function DataTable<T>({ table, empty }: { table: Table<T>; empty: string }) {
   );
 }
 
+function OAuthBundleImportDialog({
+  open,
+  poolID,
+  onOpenChange,
+  onImported,
+  onToast
+}: {
+  open: boolean;
+  poolID: string;
+  onOpenChange: (open: boolean) => void;
+  onImported: (result: Sub2APIImportResult) => Promise<void>;
+  onToast: (message: string, tone?: ToastState["tone"]) => void;
+}) {
+  const [fileName, setFileName] = useState("");
+  const [payload, setPayload] = useState<Sub2APIDataPayload | null>(null);
+  const [parseError, setParseError] = useState("");
+  const [result, setResult] = useState<Sub2APIImportResult | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setFileName("");
+      setPayload(null);
+      setParseError("");
+      setResult(null);
+    }
+  }, [open]);
+
+  const mutation = useMutation({
+    mutationFn: () => {
+      if (!payload) throw new Error("请选择有效的账号文件");
+      return api.importAccounts(poolID, payload);
+    },
+    onSuccess: async (data) => {
+      setResult(data);
+      await onImported(data);
+      if (data.account_failed === 0 && data.proxy_failed === 0 && !data.errors?.length) {
+        onOpenChange(false);
+      }
+    },
+    onError: (error) => onToast(`OAuth 导入失败：${errorMessage(error)}`, "danger")
+  });
+
+  const selectFile = async (file?: File) => {
+    setFileName(file?.name || "");
+    setPayload(null);
+    setParseError("");
+    setResult(null);
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text()) as unknown;
+      const root = parsed as { data?: unknown; accounts?: unknown; proxies?: unknown; type?: unknown; version?: unknown };
+      const candidate = Array.isArray(root?.accounts) && Array.isArray(root?.proxies) ? root : root?.data as typeof root;
+      if (!candidate || !Array.isArray(candidate.accounts) || !Array.isArray(candidate.proxies)) {
+        throw new Error("文件中缺少 accounts 或 proxies 数组");
+      }
+      if (candidate.type && candidate.type !== "sub2api-data" && candidate.type !== "sub2api-bundle") {
+        throw new Error(`不支持的数据类型 ${String(candidate.type)}`);
+      }
+      if (candidate.version && candidate.version !== 1) {
+        throw new Error(`不支持的数据版本 ${String(candidate.version)}`);
+      }
+      setPayload(candidate as Sub2APIDataPayload);
+    } catch (error) {
+      setParseError(errorMessage(error));
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2"><Upload className="h-5 w-5 text-primary" />导入 OAuth 账号</DialogTitle>
+          <DialogDescription>目标账号池：{poolID}</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-950">
+            文件可包含 OAuth Token 和代理凭据。导入结果不会在页面显示这些明文。
+          </div>
+          <Field label="sub2api 账号文件">
+            <Input type="file" accept="application/json,.json" onChange={(event) => void selectFile(event.target.files?.[0])} disabled={mutation.isPending} />
+          </Field>
+          {payload ? (
+            <div className="grid grid-cols-3 gap-3 rounded-md border bg-muted/30 p-3 text-sm max-[520px]:grid-cols-1">
+              <div><span className="text-muted-foreground">文件</span><div className="mt-1 truncate font-medium" title={fileName}>{fileName}</div></div>
+              <div><span className="text-muted-foreground">账号</span><div className="mt-1 font-semibold tabular-nums">{payload.accounts.length}</div></div>
+              <div><span className="text-muted-foreground">代理</span><div className="mt-1 font-semibold tabular-nums">{payload.proxies.length}</div></div>
+            </div>
+          ) : null}
+          {parseError ? <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800" role="alert">{parseError}</div> : null}
+          {result?.errors?.length ? (
+            <div className="max-h-44 overflow-auto rounded-md border">
+              {(result.errors || []).map((item, index) => (
+                <div key={`${item.kind}-${item.name || index}-${index}`} className="border-b px-3 py-2 text-sm last:border-b-0">
+                  <span className="font-medium">{item.name || item.kind}</span>
+                  <span className="ml-2 text-muted-foreground">{item.message}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={mutation.isPending}>取消</Button>
+            <Button type="button" onClick={() => mutation.mutate()} disabled={!payload || mutation.isPending}>
+              {mutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}导入
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function ResourceModal({
   modal,
   pools,
@@ -6669,6 +6873,21 @@ function EmptyState({ title, description }: { title: string; description: string
       </div>
     </div>
   );
+}
+
+function downloadBrowserFile(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function fileTimestamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
 function errorMessage(error: unknown) {

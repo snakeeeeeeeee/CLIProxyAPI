@@ -124,6 +124,15 @@ CREATE TABLE IF NOT EXISTS claude_code_accounts (
 	FOREIGN KEY(pool_id) REFERENCES claude_code_pools(id) ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS claude_code_account_credentials (
+	account_id TEXT PRIMARY KEY,
+	login_source TEXT NOT NULL DEFAULT 'unknown',
+	session_key TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	FOREIGN KEY(account_id) REFERENCES claude_code_accounts(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS proxy_reservations (
 	proxy_resource_id TEXT PRIMARY KEY,
 	owner_id TEXT NOT NULL,
@@ -1789,6 +1798,15 @@ func (s *Store) RegisterClaudeCodeAccountWithAuthReservation(ctx context.Context
 
 // RegisterClaudeCodeAccountWithAuthReservationInPool registers an account in one pool and consumes its matching proxy reservation.
 func (s *Store) RegisterClaudeCodeAccountWithAuthReservationInPool(ctx context.Context, poolID, authID, email, proxyResourceID string, auth *coreauth.Auth, reservationOwner, reservationItem string) (*ClaudeCodeAccount, error) {
+	return s.registerClaudeCodeAccountWithAuthReservationInPool(ctx, poolID, authID, email, proxyResourceID, auth, reservationOwner, reservationItem, "oauth", "")
+}
+
+// RegisterClaudeCodeAccountWithCredentialOriginInPool registers an account and atomically stores its login origin.
+func (s *Store) RegisterClaudeCodeAccountWithCredentialOriginInPool(ctx context.Context, poolID, authID, email, proxyResourceID string, auth *coreauth.Auth, reservationOwner, reservationItem, loginSource, sessionKey string) (*ClaudeCodeAccount, error) {
+	return s.registerClaudeCodeAccountWithAuthReservationInPool(ctx, poolID, authID, email, proxyResourceID, auth, reservationOwner, reservationItem, loginSource, sessionKey)
+}
+
+func (s *Store) registerClaudeCodeAccountWithAuthReservationInPool(ctx context.Context, poolID, authID, email, proxyResourceID string, auth *coreauth.Auth, reservationOwner, reservationItem, loginSource, sessionKey string) (*ClaudeCodeAccount, error) {
 	poolID = normalizeAccountPoolID(poolID)
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
@@ -1864,6 +1882,28 @@ SET email = CASE WHEN ? = '' THEN email ELSE ? END,
 WHERE id = ?
 `, email, email, authJSON, authJSON, AccountHealthHealthy, dbTime(nextQuotaAt), proxyResourceID, proxyResourceID, dbTime(now), accountID); err != nil {
 			return nil, mapSQLiteConstraintError(err, "claude code account")
+		}
+	}
+	loginSource = normalizeAccountLoginSource(loginSource)
+	if loginSource != "" || strings.TrimSpace(sessionKey) != "" {
+		if loginSource == "" {
+			loginSource = "unknown"
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO claude_code_account_credentials(account_id, login_source, session_key, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET
+    login_source = CASE
+        WHEN claude_code_account_credentials.session_key <> '' AND excluded.session_key = '' THEN claude_code_account_credentials.login_source
+        ELSE excluded.login_source
+    END,
+    session_key = CASE
+        WHEN excluded.session_key = '' THEN claude_code_account_credentials.session_key
+        ELSE excluded.session_key
+    END,
+    updated_at = excluded.updated_at
+`, accountID, loginSource, strings.TrimSpace(sessionKey), dbTime(now), dbTime(now)); err != nil {
+			return nil, fmt.Errorf("save claude code account credential origin: %w", err)
 		}
 	}
 	if proxyResourceID != "" && reservationOwner != "" {
@@ -2004,6 +2044,7 @@ func (s *Store) ListAccountsByPool(ctx context.Context, poolID string) ([]Claude
 	poolID = strings.TrimSpace(poolID)
 	rows, err := s.db.QueryContext(ctx, `
 SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
+	   COALESCE(c.login_source, 'unknown'), CASE WHEN COALESCE(c.session_key, '') <> '' THEN 1 ELSE 0 END,
        a.email, a.enabled, a.health_status, a.blocked_until, a.blocked_reason, a.last_health_check_at, a.next_health_check_at,
        a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
@@ -2015,6 +2056,7 @@ SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) 
 FROM claude_code_accounts a
 LEFT JOIN claude_code_account_quota q ON q.account_id = a.id
 LEFT JOIN proxy_resources p ON p.id = a.proxy_resource_id
+LEFT JOIN claude_code_account_credentials c ON c.account_id = a.id
 WHERE (? = '' OR a.pool_id = ?)
 ORDER BY a.enabled DESC, a.updated_at DESC, a.email ASC
 	`, poolID, poolID)
@@ -2052,6 +2094,7 @@ func (s *Store) GetAccount(ctx context.Context, id string) (*ClaudeCodeAccount, 
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
+	   COALESCE(c.login_source, 'unknown'), CASE WHEN COALESCE(c.session_key, '') <> '' THEN 1 ELSE 0 END,
        a.email, a.enabled, a.health_status, a.blocked_until, a.blocked_reason, a.last_health_check_at, a.next_health_check_at,
        a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
@@ -2063,6 +2106,7 @@ SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) 
 FROM claude_code_accounts a
 LEFT JOIN claude_code_account_quota q ON q.account_id = a.id
 LEFT JOIN proxy_resources p ON p.id = a.proxy_resource_id
+LEFT JOIN claude_code_account_credentials c ON c.account_id = a.id
 WHERE a.id = ?
 	`, id)
 	if err != nil {
@@ -2096,6 +2140,7 @@ func (s *Store) GetAccountByAuthID(ctx context.Context, authID string) (*ClaudeC
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
+	   COALESCE(c.login_source, 'unknown'), CASE WHEN COALESCE(c.session_key, '') <> '' THEN 1 ELSE 0 END,
        a.email, a.enabled, a.health_status, a.blocked_until, a.blocked_reason, a.last_health_check_at, a.next_health_check_at,
        a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
@@ -2107,6 +2152,7 @@ SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) 
 FROM claude_code_accounts a
 LEFT JOIN claude_code_account_quota q ON q.account_id = a.id
 LEFT JOIN proxy_resources p ON p.id = a.proxy_resource_id
+LEFT JOIN claude_code_account_credentials c ON c.account_id = a.id
 WHERE a.auth_id = ?
 	`, authID)
 	if err != nil {
@@ -2551,6 +2597,7 @@ func (s *Store) FindAccountOverlay(ctx context.Context, authID, email string) (*
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) <> '' THEN 1 ELSE 0 END, a.auth_json,
+	       COALESCE(c.login_source, 'unknown'), CASE WHEN COALESCE(c.session_key, '') <> '' THEN 1 ELSE 0 END,
 	       a.email, a.enabled, a.health_status, a.blocked_until, a.blocked_reason, a.last_health_check_at, a.next_health_check_at,
 	       a.priority, COALESCE(a.proxy_resource_id, ''),
        a.note, a.excluded_models_json, a.test_status, a.consecutive_failures,
@@ -2562,6 +2609,7 @@ SELECT a.id, a.pool_id, a.auth_id, a.cloak_user_id, CASE WHEN TRIM(a.auth_json) 
 FROM claude_code_accounts a
 LEFT JOIN claude_code_account_quota q ON q.account_id = a.id
 LEFT JOIN proxy_resources p ON p.id = a.proxy_resource_id
+LEFT JOIN claude_code_account_credentials c ON c.account_id = a.id
 WHERE (? <> '' AND a.auth_id = ?) OR (? <> '' AND lower(a.email) = lower(?))
 ORDER BY CASE WHEN a.auth_id = ? THEN 0 ELSE 1 END
 LIMIT 1
@@ -2710,7 +2758,7 @@ func scanAccountWithProxy(rows interface {
 	Scan(dest ...interface{}) error
 }) (ClaudeCodeAccount, error) {
 	var account ClaudeCodeAccount
-	var enabled, hasAuthData int
+	var enabled, hasAuthData, hasSessionKey int
 	var authJSON, excludedJSON string
 	var accountCreatedRaw, accountUpdatedRaw string
 	var accountLastTestRaw, blockedUntilRaw, lastHealthCheckRaw, nextHealthCheckRaw sql.NullString
@@ -2726,6 +2774,8 @@ func scanAccountWithProxy(rows interface {
 		&account.CloakUserID,
 		&hasAuthData,
 		&authJSON,
+		&account.LoginSource,
+		&hasSessionKey,
 		&account.Email,
 		&enabled,
 		&account.HealthStatus,
@@ -2773,6 +2823,11 @@ func scanAccountWithProxy(rows interface {
 	account.LastHealthCheckAt = parseNullTime(lastHealthCheckRaw)
 	account.NextHealthCheckAt = parseNullTime(nextHealthCheckRaw)
 	account.HasAuthData = hasAuthData != 0
+	account.LoginSource = normalizeAccountLoginSource(account.LoginSource)
+	if account.LoginSource == "" {
+		account.LoginSource = "unknown"
+	}
+	account.HasSessionKey = hasSessionKey != 0
 	account.TokenExpiresAt = tokenExpiresAtFromAuthJSON(authJSON)
 	account.TestStatus = normalizeAccountTestStatus(account.TestStatus)
 	account.LastTestAt = parseNullTime(accountLastTestRaw)
@@ -2873,6 +2928,17 @@ func validateProxyURL(raw string) (string, error) {
 		return "", fmt.Errorf("proxy url must use http, https, socks5, or socks5h")
 	}
 	return trimmed, nil
+}
+
+func normalizeAccountLoginSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "oauth", "oauth_import", "session_key":
+		return strings.ToLower(strings.TrimSpace(source))
+	case "unknown":
+		return "unknown"
+	default:
+		return ""
+	}
 }
 
 func defaultProxyName(proxyURL string) string {

@@ -112,6 +112,13 @@ func TestSessionKeyJobLimitsConcurrencyAndDoesNotExposeSecrets(t *testing.T) {
 	if len(accounts) != 2 {
 		t.Fatalf("account count = %d, want 2", len(accounts))
 	}
+	retainedKeys, unavailable, err := store.ExportSessionKeys(context.Background(), resourcepool.DefaultAccountPoolID, nil)
+	if err != nil {
+		t.Fatalf("ExportSessionKeys() error = %v", err)
+	}
+	if len(retainedKeys) != 2 || unavailable != 0 {
+		t.Fatalf("retained SessionKeys = %d unavailable=%d, want 2/0", len(retainedKeys), unavailable)
+	}
 	for _, item := range h.sessionKeyJobs.latest.Items {
 		if item.SessionKey != "" {
 			t.Fatalf("completed item %d retained SessionKey", item.Index)
