@@ -1175,12 +1175,13 @@ function AccountsView({
             viewMode={viewMode}
             total={accounts.length}
             filtered={filteredAccounts.length}
+            selectedCount={selectedCount}
             onQueryChange={setSearchQuery}
             onStatusChange={setStatusFilter}
             onViewModeChange={setViewMode}
             transferPending={transferPending}
             onImportOAuth={() => setImportOpen(true)}
-            onExportAllOAuth={() => void exportOAuth([])}
+            onExportSelectedOAuth={() => void exportOAuth(selectedIDs)}
           />
           <AccountCardsPanel
             rows={visibleRows}
@@ -2956,24 +2957,26 @@ function AccountWorkspaceToolbar({
   viewMode,
   total,
   filtered,
+  selectedCount,
   transferPending,
   onQueryChange,
   onStatusChange,
   onViewModeChange,
   onImportOAuth,
-  onExportAllOAuth
+  onExportSelectedOAuth
 }: {
   query: string;
   status: "all" | "available" | "checking" | "cooling" | "error" | "disabled";
   viewMode: "cards" | "table";
   total: number;
   filtered: number;
+  selectedCount: number;
   transferPending: boolean;
   onQueryChange: (value: string) => void;
   onStatusChange: (value: "all" | "available" | "checking" | "cooling" | "error" | "disabled") => void;
   onViewModeChange: (value: "cards" | "table") => void;
   onImportOAuth: () => void;
-  onExportAllOAuth: () => void;
+  onExportSelectedOAuth: () => void;
 }) {
   return (
     <div className="workspace-toolbar flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card p-3">
@@ -3006,8 +3009,15 @@ function AccountWorkspaceToolbar({
         <Button variant="outline" size="sm" onClick={onImportOAuth} disabled={transferPending}>
           <Upload className="h-3.5 w-3.5" />导入 OAuth
         </Button>
-        <Button variant="outline" size="sm" onClick={onExportAllOAuth} disabled={transferPending || total === 0}>
-          {transferPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}导出全部
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onExportSelectedOAuth}
+          disabled={transferPending || selectedCount === 0}
+          title={selectedCount === 0 ? "请先勾选账号" : `导出选中的 ${selectedCount} 个 OAuth 账号`}
+        >
+          {transferPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+          导出所选{selectedCount > 0 ? ` (${selectedCount})` : ""}
         </Button>
         <div className="view-toggle flex rounded-lg border bg-muted/40 p-0.5" aria-label="账号显示方式">
           <button type="button" className={cn("icon-segment", viewMode === "cards" && "active")} onClick={() => onViewModeChange("cards")} title="卡片视图" aria-label="卡片视图"><LayoutGrid className="h-4 w-4" /></button>
@@ -3123,10 +3133,10 @@ function AccountCardsPanel({
           </label>
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" size="sm" onClick={onExportOAuth} disabled={selectedCount === 0 || pending}>
-              <Download className="h-3.5 w-3.5" />OAuth
+              <Download className="h-3.5 w-3.5" />导出 OAuth
             </Button>
             <Button variant="outline" size="sm" onClick={onExportSessionKeys} disabled={selectedCount === 0 || pending}>
-              <KeyRound className="h-3.5 w-3.5" />SessionKey
+              <KeyRound className="h-3.5 w-3.5" />导出 SessionKey
             </Button>
             <Button variant="outline" size="sm" onClick={() => onRunBatch("test")} disabled={selectedCount === 0 || pending}>
               {pending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
