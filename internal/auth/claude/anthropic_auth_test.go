@@ -17,6 +17,82 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func TestOAuthTokenExchangeUsesAxiosHeaders(t *testing.T) {
+	auth := &ClaudeAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				assertOAuthTokenHeaders(t, req)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(strings.NewReader(`{
+						"access_token":"access",
+						"refresh_token":"refresh",
+						"expires_in":3600,
+						"organization":{"uuid":"org"},
+						"account":{"uuid":"account","email_address":"owner@example.com"}
+					}`)),
+					Header:  make(http.Header),
+					Request: req,
+				}, nil
+			}),
+		},
+	}
+	bundle, err := auth.doTokenExchange(context.Background(), "https://platform.claude.test/v1/oauth/token", map[string]interface{}{
+		"grant_type": "authorization_code",
+	})
+	if err != nil {
+		t.Fatalf("doTokenExchange() error = %v", err)
+	}
+	if bundle == nil || bundle.TokenData.AccessToken != "access" {
+		t.Fatalf("token bundle = %+v", bundle)
+	}
+}
+
+func TestOAuthTokenRefreshUsesAxiosHeaders(t *testing.T) {
+	resetClaudeRefreshState()
+	defer resetClaudeRefreshState()
+
+	auth := &ClaudeAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				assertOAuthTokenHeaders(t, req)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(strings.NewReader(`{
+						"access_token":"new-access",
+						"refresh_token":"new-refresh",
+						"token_type":"Bearer",
+						"expires_in":3600,
+						"account":{"email_address":"owner@example.com"}
+					}`)),
+					Header:  make(http.Header),
+					Request: req,
+				}, nil
+			}),
+		},
+	}
+	tokenData, err := auth.RefreshClaudeCodeTokens(context.Background(), "refresh-header-test")
+	if err != nil {
+		t.Fatalf("RefreshClaudeCodeTokens() error = %v", err)
+	}
+	if tokenData == nil || tokenData.AccessToken != "new-access" {
+		t.Fatalf("token data = %+v", tokenData)
+	}
+}
+
+func assertOAuthTokenHeaders(t *testing.T, req *http.Request) {
+	t.Helper()
+	if got := req.Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := req.Header.Get("Accept"); got != oauthTokenAccept {
+		t.Fatalf("Accept = %q, want %q", got, oauthTokenAccept)
+	}
+	if got := req.Header.Get("User-Agent"); got != oauthTokenUserAgent {
+		t.Fatalf("User-Agent = %q, want %q", got, oauthTokenUserAgent)
+	}
+}
+
 func TestRefreshTokensWithRetry_429BlocksImmediateReplay(t *testing.T) {
 	resetClaudeRefreshState()
 	defer resetClaudeRefreshState()

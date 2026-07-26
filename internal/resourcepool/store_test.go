@@ -195,6 +195,43 @@ func TestStoreEnforcesOneToOneBinding(t *testing.T) {
 	}
 }
 
+func TestAccountProxyChangeRejectsInFlightRequest(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	proxy, err := store.CreateProxy(ctx, ProxyResourceSeed{ProxyURL: "http://127.0.0.1:18080"})
+	if err != nil {
+		t.Fatalf("CreateProxy() error = %v", err)
+	}
+	auth := &coreauth.Auth{
+		ID:       "claude-inflight@example.com.json",
+		Provider: "claude",
+		Metadata: map[string]any{"email": "inflight@example.com", "access_token": "access"},
+	}
+	account, err := store.RegisterClaudeCodeAccountWithAuth(ctx, auth.ID, "inflight@example.com", proxy.ID, auth)
+	if err != nil {
+		t.Fatalf("RegisterClaudeCodeAccountWithAuth() error = %v", err)
+	}
+	scope := AccountRoutingScope(account.PoolID)
+	claudeapipool.SetScopedRoutingConfig(scope, claudeapipool.EffectiveRouting(claudeapipool.RoutingConfig{
+		PerAccountRPM:         10,
+		PerAccountConcurrency: 1,
+	}))
+	lease, selection := claudeapipool.AcquireScopedAccountRoute(ctx, scope, claudeapipool.AccountRouteDescriptor{
+		Model: "claude-sonnet-4-6",
+	}, []claudeapipool.AccountRouteCandidate{{AuthID: account.AuthID}}, nil)
+	if lease == nil {
+		t.Fatalf("AcquireScopedAccountRoute() selection = %+v", selection)
+	}
+	if _, err := store.UnbindAccountProxy(ctx, account.ID); !errors.Is(err, ErrAccountProxyChangeInFlight) {
+		lease.Release()
+		t.Fatalf("UnbindAccountProxy() error = %v, want ErrAccountProxyChangeInFlight", err)
+	}
+	lease.Release()
+	if _, err := store.UnbindAccountProxy(ctx, account.ID); err != nil {
+		t.Fatalf("UnbindAccountProxy() after release error = %v", err)
+	}
+}
+
 func TestProxyReservationsExcludeAndConsumeHealthyProxy(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -281,14 +318,14 @@ func TestRegisterClaudeCodeAccountGeneratesClaudeCodeUserID(t *testing.T) {
 	}
 }
 
-func TestNewAccountStartsCheckingAndManualRecoveryNeedsExplicitClear(t *testing.T) {
+func TestNewAccountStartsHealthyWithUnknownQuotaAndManualRecoveryNeedsExplicitClear(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	account, err := store.RegisterClaudeCodeAccount(ctx, "claude-health.json", "health@example.com", "")
 	if err != nil {
 		t.Fatalf("RegisterClaudeCodeAccount() error = %v", err)
 	}
-	if account.HealthStatus != AccountHealthChecking || account.EffectiveSchedulable {
+	if account.HealthStatus != AccountHealthHealthy || account.NextHealthCheckAt == nil || account.Quota != nil {
 		t.Fatalf("new account lifecycle = %+v", account)
 	}
 	now := time.Now()
@@ -405,8 +442,8 @@ func TestStoreConfigSQLiteWinsAfterInitialImport(t *testing.T) {
 	if effective.IntervalText != "17m0s" || effective.TimeoutText != "3s" || effective.Concurrency != 2 || effective.FailureThreshold != 4 {
 		t.Fatalf("effective health config = %+v, want sqlite override", effective)
 	}
-	if effective.TestURL != "https://example.test/health" {
-		t.Fatalf("TestURL = %q, want sqlite value", effective.TestURL)
+	if effective.TestURL != "https://api.ipify.org?format=json" {
+		t.Fatalf("TestURL = %q, want fixed ipify target", effective.TestURL)
 	}
 }
 
@@ -1088,7 +1125,7 @@ func TestStoreMigratesLegacyBuiltinClaudeCodeProfileWithoutDroppingData(t *testi
 	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_profile_json'`, string(raw)); err != nil {
 		t.Fatalf("write legacy profile: %v", err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_207_r3'`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_220_r1'`); err != nil {
 		t.Fatalf("delete migration marker: %v", err)
 	}
 	if err := store.migrateClaudeCodeProfileRevision(ctx); err != nil {
@@ -1111,14 +1148,14 @@ func TestStoreMigratesLegacyBuiltinClaudeCodeProfileWithoutDroppingData(t *testi
 	}
 }
 
-func TestBuiltinClaudeCodeProfileR3MigrationBoundary(t *testing.T) {
+func TestBuiltinClaudeCodeProfileR1MigrationBoundary(t *testing.T) {
 	tests := []struct {
 		name    string
 		profile ClaudeCodeProfile
 		want    bool
 	}{
 		{name: "legacy r1", profile: ClaudeCodeProfile{Revision: "2.1.207-r1", Version: "2.1.207", UpdatedFrom: "builtin-trace-baseline:2.1.207", Locked: true}, want: true},
-		{name: "current r3", profile: defaultClaudeCodeProfile(), want: false},
+		{name: "current r1", profile: defaultClaudeCodeProfile(), want: false},
 		{name: "external profile", profile: ClaudeCodeProfile{Revision: "2.1.207-r1", Version: "2.1.207", UpdatedFrom: "manual", Locked: true}, want: false},
 	}
 	for _, tt := range tests {
@@ -1130,7 +1167,7 @@ func TestBuiltinClaudeCodeProfileR3MigrationBoundary(t *testing.T) {
 	}
 
 	profile := EffectiveClaudeCodeProfile(ClaudeCodeProfile{})
-	if profile.Revision != "2.1.207-r3" || profile.Headers["X-Stainless-Os"] != "MacOS" || profile.Headers["X-Stainless-Arch"] != "arm64" {
+	if profile.Revision != "2.1.220-r1" || profile.Headers["X-Stainless-Os"] != "MacOS" || profile.Headers["X-Stainless-Arch"] != "arm64" {
 		t.Fatalf("effective profile identity = revision %q platform %q/%q", profile.Revision, profile.Headers["X-Stainless-Os"], profile.Headers["X-Stainless-Arch"])
 	}
 	if len(profile.HeaderOrder) == 0 || profile.TLSJA3 == "" || profile.TLSJA4 == "" || profile.TLSALPN != "http/1.1" {
@@ -1151,12 +1188,12 @@ func TestBuiltinClaudeCodeProfileR3MigrationBoundary(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeProfileR3MigrationUpgradesExactR2AndStalesCalibration(t *testing.T) {
+func TestClaudeCodeProfileR1MigrationUpgradesExactR2AndStalesCalibration(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	r2 := builtinClaudeCodeProfileR2()
 	raw, _ := json.Marshal(r2)
-	oldEffective := EffectiveClaudeCodeProfile(r2)
+	oldEffective := effectiveClaudeCodeProfileFromNormalized(r2)
 	oldFingerprint := ClaudeCodeProfileFingerprint(oldEffective)
 	oldOverhead := ClaudeCodeProfileInjectedOverheadTokens(oldEffective)
 	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_profile_json'`, string(raw)); err != nil {
@@ -1165,8 +1202,8 @@ func TestClaudeCodeProfileR3MigrationUpgradesExactR2AndStalesCalibration(t *test
 	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_pool_json'`, fmt.Sprintf(`{"pure_mode":true,"usage":{"system_prompt_overhead_tokens":%d}}`, oldOverhead)); err != nil {
 		t.Fatalf("write r2 usage config: %v", err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_207_r3'`); err != nil {
-		t.Fatalf("delete r3 marker: %v", err)
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_220_r1'`); err != nil {
+		t.Fatalf("delete r1 marker: %v", err)
 	}
 	if _, err := store.UpsertUsageCalibration(ctx, UsageCalibration{
 		Model:              "claude-opus-4-8",
@@ -1195,11 +1232,11 @@ func TestClaudeCodeProfileR3MigrationUpgradesExactR2AndStalesCalibration(t *test
 		t.Fatalf("old calibration = %+v, err=%v, want stale", calibration, err)
 	}
 	if err := store.migrateClaudeCodeProfileRevision(ctx); err != nil {
-		t.Fatalf("repeat r3 migration: %v", err)
+		t.Fatalf("repeat r1 migration: %v", err)
 	}
 }
 
-func TestClaudeCodeProfileR3MigrationPreservesCustomR2(t *testing.T) {
+func TestClaudeCodeProfileR1MigrationReplacesBuiltinDerivedCustomR2(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	custom := builtinClaudeCodeProfileR2()
@@ -1208,8 +1245,8 @@ func TestClaudeCodeProfileR3MigrationPreservesCustomR2(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, `UPDATE pool_config SET value = ? WHERE key = 'claude_code_profile_json'`, string(raw)); err != nil {
 		t.Fatalf("write custom r2 profile: %v", err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_207_r3'`); err != nil {
-		t.Fatalf("delete r3 marker: %v", err)
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM pool_config WHERE key = 'claude_code_profile_2_1_220_r1'`); err != nil {
+		t.Fatalf("delete r1 marker: %v", err)
 	}
 	if err := store.migrateClaudeCodeProfileRevision(ctx); err != nil {
 		t.Fatalf("migrate custom r2 profile: %v", err)
@@ -1218,8 +1255,8 @@ func TestClaudeCodeProfileR3MigrationPreservesCustomR2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetConfig() error = %v", err)
 	}
-	if doc.Profile.Revision != "2.1.207-r2" || doc.Profile.Headers["X-Stainless-Timeout"] != "900" {
-		t.Fatalf("custom r2 profile was overwritten: %+v", doc.Profile)
+	if doc.Profile.Revision != DefaultClaudeCodeProfileRevision || doc.Profile.Headers["X-Stainless-Timeout"] != "600" {
+		t.Fatalf("built-in-derived custom r2 profile was not replaced: %+v", doc.Profile)
 	}
 }
 

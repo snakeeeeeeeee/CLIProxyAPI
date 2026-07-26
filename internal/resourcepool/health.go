@@ -2,9 +2,12 @@ package resourcepool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +17,12 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-var healthCheckerOnce sync.Once
+const proxyHealthCheckURL = "https://api.ipify.org?format=json"
+
+var (
+	healthCheckerOnce     sync.Once
+	proxyHealthRequestURL = proxyHealthCheckURL
+)
 
 // StartHealthChecker starts the background proxy health worker once per process.
 func StartHealthChecker(ctx context.Context, configFilePath string, cfgProvider func() *config.Config) {
@@ -118,12 +126,15 @@ func TestProxyAndStore(ctx context.Context, store *Store, proxyID string, health
 	if err != nil {
 		return nil, err
 	}
-	ok, latency, errTest := TestProxy(ctx, *proxy, healthCfg)
-	result, errUpdate := store.UpdateProxyHealth(ctx, proxy.ID, ok, latency, errTest, healthCfg.FailureThreshold)
+	ok, latency, exitIP, errTest := testProxyExitIP(ctx, *proxy, healthCfg)
+	result, errUpdate := store.UpdateProxyHealthWithExitIP(ctx, proxy.ID, ok, latency, exitIP, errTest, healthCfg.FailureThreshold)
 	if errUpdate != nil {
 		return nil, errUpdate
 	}
 	PublishProxyChanged(proxy.ID, "health")
+	if result.ExitChanged {
+		PublishProxyChanged(proxy.ID, "proxy_exit_changed")
+	}
 	routingScope := ""
 	var boundPoolID string
 	if err := store.db.QueryRowContext(ctx, `SELECT pool_id FROM claude_code_accounts WHERE proxy_resource_id = ?`, proxy.ID).Scan(&boundPoolID); err == nil {
@@ -150,27 +161,29 @@ func TestProxyAndStore(ctx context.Context, store *Store, proxyID string, health
 
 // TestProxy verifies connectivity through one proxy without mutating storage.
 func TestProxy(ctx context.Context, proxy ProxyResource, healthCfg EffectiveProxyHealthConfig) (bool, time.Duration, error) {
+	ok, latency, _, err := testProxyExitIP(ctx, proxy, healthCfg)
+	return ok, latency, err
+}
+
+func testProxyExitIP(ctx context.Context, proxy ProxyResource, healthCfg EffectiveProxyHealthConfig) (bool, time.Duration, string, error) {
 	transport, mode, err := proxyutil.BuildHTTPTransport(proxy.ProxyURL)
 	if err != nil {
-		return false, 0, err
+		return false, 0, "", err
 	}
 	if mode != proxyutil.ModeProxy || transport == nil {
-		return false, 0, fmt.Errorf("proxy resource does not contain a concrete proxy")
+		return false, 0, "", fmt.Errorf("proxy resource does not contain a concrete proxy")
 	}
 	timeout := healthCfg.Timeout
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	testURL := healthCfg.TestURL
-	if testURL == "" {
-		testURL = "https://api.anthropic.com/"
-	}
+	testURL := proxyHealthRequestURL
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, testURL, nil)
 	if err != nil {
 		transport.CloseIdleConnections()
-		return false, 0, err
+		return false, 0, "", err
 	}
 	client := &http.Client{Transport: transport}
 	start := time.Now()
@@ -178,7 +191,7 @@ func TestProxy(ctx context.Context, proxy ProxyResource, healthCfg EffectiveProx
 	latency := time.Since(start)
 	transport.CloseIdleConnections()
 	if err != nil {
-		return false, latency, err
+		return false, latency, "", err
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
@@ -186,10 +199,20 @@ func TestProxy(ctx context.Context, proxy ProxyResource, healthCfg EffectiveProx
 			log.WithError(errClose).Warn("close proxy health response body failed")
 		}
 	}()
-	if resp.StatusCode >= http.StatusInternalServerError {
-		return false, latency, fmt.Errorf("test url returned %s", resp.Status)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return false, latency, "", fmt.Errorf("ipify returned %s", resp.Status)
 	}
-	return true, latency, nil
+	var payload struct {
+		IP string `json:"ip"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&payload); err != nil {
+		return false, latency, "", fmt.Errorf("decode ipify response: %w", err)
+	}
+	exitIP := strings.TrimSpace(payload.IP)
+	if net.ParseIP(exitIP) == nil {
+		return false, latency, "", fmt.Errorf("ipify returned an invalid IP address")
+	}
+	return true, latency, exitIP, nil
 }
 
 func currentResourcePoolConfig(cfgProvider func() *config.Config) *config.Config {

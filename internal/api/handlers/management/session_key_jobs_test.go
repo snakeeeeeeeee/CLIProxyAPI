@@ -170,8 +170,8 @@ func TestSessionKeyJobCanSkipProxyBinding(t *testing.T) {
 	proxyMu.Lock()
 	gotProxyURL := proxyURL
 	proxyMu.Unlock()
-	if gotProxyURL != "" {
-		t.Fatalf("authenticator proxy URL = %q, want empty account proxy", gotProxyURL)
+	if gotProxyURL != "direct" {
+		t.Fatalf("authenticator proxy URL = %q, want explicit direct mode", gotProxyURL)
 	}
 	accounts, err := store.ListAccounts(context.Background())
 	if err != nil {
@@ -210,8 +210,8 @@ func TestSessionKeyJobCanSkipProxyBinding(t *testing.T) {
 		t.Fatalf("decode refresh response: %v", err)
 	}
 	refreshJob := waitForSessionKeyJob(t, h, refreshResponse.Job.ID)
-	if refreshJob.Updated != 1 {
-		t.Fatalf("refresh job summary = %+v, want updated=1", refreshJob)
+	if refreshJob.Failed != 1 || len(refreshJob.Items) != 1 || refreshJob.Items[0].ErrorCode != "account_proxy_mode_conflict" {
+		t.Fatalf("refresh job summary = %+v, want account_proxy_mode_conflict", refreshJob)
 	}
 	updatedAccount, err := store.GetAccount(context.Background(), accounts[0].ID)
 	if err != nil {

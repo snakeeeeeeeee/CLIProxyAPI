@@ -169,16 +169,19 @@ proxy-health:
   timeout: "10s"
   concurrency: 8
   failure-threshold: 3
-  test-url: "https://api.anthropic.com/"
-  optional-exit-ip-url: "https://api.ipify.org?format=json"
 ```
+
+每次健康检查只通过该代理发送一次 `GET https://api.ipify.org?format=json`，验证 HTTP 状态、JSON IP、出口 IP 和延迟。目标不可编辑，不会额外访问 `api.anthropic.com`。出口 IP 变化会产生 `proxy_exit_changed` 事件和诊断提醒，但不会自动换代理。
 
 绑定规则：
 
 - 一个代理最多绑定一个 Claude Code 账号。
 - 一个 Claude Code 账号最多绑定一个代理。
 - 账号可以不绑定代理。
-- 账号绑定代理后，OAuth refresh 和推理请求都走该代理。
+- 未绑定账号的服务端流量显式直连，并忽略全局代理、环境代理和上下文 fallback。
+- 账号绑定代理后，Token exchange/refresh、主动额度、账号测试、`count_tokens` 和推理都只走该代理。
+- 绑定代理缺失、禁用、不健康或配置错误时请求直接失败，不会使用服务器出口、全局代理或其他代理。
+- 绑定或解绑只允许账号没有在途请求时执行；成功后会清理旧连接、Session 亲和和临时 Session。
 
 ## 6. Claude Code 账号池
 
@@ -202,6 +205,14 @@ proxy-health:
 - 清除冷却。
 - 在无在途请求时移动到其他账号池。
 - 批量操作账号。
+
+额度采集有三种全局模式：
+
+- `manual`：默认。真实推理响应 Header 继续被动更新额度；管理员确认后可以主动查询一次 `/api/oauth/usage`。
+- `scheduled`：在被动更新和手动查询之外，按 `15m/30m/1h` 低频定时查询，默认 `30m`，各账号带确定性抖动。
+- `disabled`：仍接受真实响应 Header，但禁止手动和定时 `/api/oauth/usage` 请求。
+
+新账号不会立即主动探测。手动查询需要每次确认；同账号成功结果 3 分钟、失败结果 1 分钟内不会重复发网请求。一次 usage 查询同时解析 5h、7d、Sonnet、Opus、Fable 和动态模型窗口，不按模型发送推理探测。
 
 账号测试只用于验证所选模型、OAuth 和绑定代理的连通性，使用最小 Claude Code 兼容提示词，不携带生产稳定提示词中的安全规则。该测试不会改变实际推理请求的 system prompt；纯净计费校准仍按完整生产 profile 计算。
 
@@ -651,7 +662,16 @@ Claude Code 账号池 -> 配置 -> 账号池日志
 
 Trace 工具用于对齐真实 Claude Code 请求形态。
 
-当前生产基线为 Claude Code `2.1.207` / profile revision `2.1.207-r3`。后续版本必须先录制真实 trace 并完成 diff，不能只根据 Phistory 自动升级生产 profile。
+当前生产基线固定为 Claude Code `2.1.220` / profile revision `2.1.220-r1`。它不是“自动最新版”别名；后续版本必须先录制真实 trace、完成评审并增加显式迁移，不能根据 npm latest 或 Phistory 自动升级生产 Profile。
+
+当前固定元组：
+
+- UA：`claude-cli/2.1.220 (external, sdk-cli)`
+- Stainless：JS `0.94.0`、Node `v26.3.0`、MacOS/arm64
+- timeout：流式 `600`，非流式和 `count_tokens` 为 `300`；真实 Claude Code 的合法传入值保持原样
+- TLS：继续使用既有 JA3、JA4、ALPN；custom Base URL/MITM 抓包不能作为原生 TLS 变化证据
+
+2.1.220 的 70 秒空闲观察没有发现固定数秒一次的 Messages 推理心跳。系统不会额外模拟心跳、标题请求、遥测、Statsig 或模型探测。
 
 ### 录制真实 Claude Code trace
 

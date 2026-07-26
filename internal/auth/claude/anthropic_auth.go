@@ -29,6 +29,8 @@ const (
 	RedirectURI            = "http://localhost:54545/callback"
 	ClaudeCodeRedirectURI  = "https://platform.claude.com/oauth/code/callback"
 	ClaudeCodeBrowserScope = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+	oauthTokenAccept       = "application/json, text/plain, */*"
+	oauthTokenUserAgent    = "axios/1.13.6"
 
 	claudeRefreshMinBackoff = 5 * time.Second
 	claudeRefreshMaxBackoff = 5 * time.Minute
@@ -318,8 +320,7 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	applyOAuthTokenHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -412,9 +413,7 @@ func (o *ClaudeAuth) doTokenExchange(ctx context.Context, tokenURL string, reqBo
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("User-Agent", "axios/1.13.6")
+	applyOAuthTokenHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -555,8 +554,7 @@ func (o *ClaudeAuth) refreshTokensSingleFlightWithEndpoint(ctx context.Context, 
 		return nil, fmt.Errorf("failed to create refresh request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	applyOAuthTokenHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -603,6 +601,15 @@ func (o *ClaudeAuth) refreshTokensSingleFlightWithEndpoint(ctx context.Context, 
 		AccountUUID:      tokenResp.Account.UUID,
 		Expire:           time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}, nil
+}
+
+func applyOAuthTokenHeaders(req *http.Request) {
+	if req == nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", oauthTokenAccept)
+	req.Header.Set("User-Agent", oauthTokenUserAgent)
 }
 
 // CreateTokenStorage creates a new ClaudeTokenStorage from auth bundle and user info.

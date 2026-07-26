@@ -14,8 +14,12 @@ const (
 	DefaultConfigFileName            = "resource-pools.yaml"
 	DefaultDBFileName                = "resource-pools.db"
 	DefaultAccountPoolID             = "default"
-	DefaultClaudeCodeProfileVersion  = "2.1.207"
-	DefaultClaudeCodeProfileRevision = "2.1.207-r3"
+	DefaultClaudeCodeProfileVersion  = "2.1.220"
+	DefaultClaudeCodeProfileRevision = "2.1.220-r1"
+
+	AccountQuotaModeManual    = "manual"
+	AccountQuotaModeScheduled = "scheduled"
+	AccountQuotaModeDisabled  = "disabled"
 
 	HealthUnknown   = "unknown"
 	HealthHealthy   = "healthy"
@@ -89,6 +93,8 @@ type ProxyHealthConfig struct {
 
 // AccountQuotaConfig controls background Claude OAuth usage refreshes.
 type AccountQuotaConfig struct {
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
+	// Enabled is retained only for migration from pre-mode configurations.
 	Enabled     *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	Interval    string `yaml:"interval,omitempty" json:"interval,omitempty"`
 	Concurrency int    `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
@@ -856,6 +862,7 @@ type ClaudeCodeAccount struct {
 	LastError            string                      `json:"last_error,omitempty"`
 	CreatedAt            time.Time                   `json:"created_at"`
 	UpdatedAt            time.Time                   `json:"updated_at"`
+	quotaFreshnessTTL    time.Duration
 }
 
 // AccountQuota is the latest Claude OAuth usage snapshot for one account.
@@ -868,6 +875,15 @@ type AccountQuota struct {
 	RawJSON   string             `json:"raw_json,omitempty"`
 	Source    string             `json:"source,omitempty"`
 	Probe     *AccountQuotaProbe `json:"probe,omitempty"`
+}
+
+// AccountQuotaRefreshResult describes whether an explicit refresh performed network I/O.
+type AccountQuotaRefreshResult struct {
+	Account          *ClaudeCodeAccount `json:"account,omitempty"`
+	NetworkPerformed bool               `json:"network_performed"`
+	Cached           bool               `json:"cached"`
+	RequestedAt      time.Time          `json:"requested_at"`
+	NextAllowedAt    time.Time          `json:"next_allowed_at"`
 }
 
 // AccountQuotaProbe is a safe summary of the latest OAuth usage transport.
@@ -977,6 +993,8 @@ type ImportResult struct {
 type HealthResult struct {
 	ID                  string     `json:"id"`
 	HealthStatus        string     `json:"health_status"`
+	ExitIP              string     `json:"exit_ip,omitempty"`
+	ExitChanged         bool       `json:"exit_changed"`
 	LatencyMS           int64      `json:"latency_ms"`
 	ConsecutiveFailures int        `json:"consecutive_failures"`
 	LastCheckedAt       *time.Time `json:"last_checked_at,omitempty"`

@@ -64,12 +64,13 @@ func (h *Handler) GetResourcePoolConfig(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"enabled":      true,
-		"storage":      "sqlite",
-		"path":         store.Path(),
-		"proxy_health": resourcepool.EffectiveProxyHealth(doc.ProxyHealth),
-		"claude_code":  resourcepool.EffectiveClaudeCodePool(doc.ClaudeCode),
-		"summary":      summary,
+		"enabled":       true,
+		"storage":       "sqlite",
+		"path":          store.Path(),
+		"proxy_health":  resourcepool.EffectiveProxyHealth(doc.ProxyHealth),
+		"account_quota": resourcepool.EffectiveAccountQuota(doc.AccountQuota),
+		"claude_code":   resourcepool.EffectiveClaudeCodePool(doc.ClaudeCode),
+		"summary":       summary,
 	})
 }
 
@@ -468,6 +469,28 @@ func (h *Handler) PutClaudeCodePoolConfig(c *gin.Context) {
 	resourcepool.PublishConfigChanged("save")
 	resourcepool.PublishStatsChanged("config")
 	c.JSON(http.StatusOK, gin.H{"raw": doc.ClaudeCode, "effective": effective})
+}
+
+func (h *Handler) PutClaudeCodeAccountQuotaConfig(c *gin.Context) {
+	var body resourcepool.AccountQuotaConfig
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "额度采集配置无效"})
+		return
+	}
+	store, ok := h.openResourcePoolStore(c)
+	if !ok {
+		return
+	}
+	defer closeResourcePoolStore(store)
+	doc, err := store.SaveAccountQuotaConfig(c.Request.Context(), body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "save_failed", "message": err.Error()})
+		return
+	}
+	effective := resourcepool.EffectiveAccountQuota(doc.AccountQuota)
+	resourcepool.PublishConfigChanged("account_quota")
+	resourcepool.PublishStatsChanged("config")
+	c.JSON(http.StatusOK, gin.H{"raw": doc.AccountQuota, "effective": effective})
 }
 
 func (h *Handler) GetClaudeCodeAccountPoolConfig(c *gin.Context) {
@@ -2391,12 +2414,18 @@ func (h *Handler) ImportClaudeAuthToAccountPool(c *gin.Context) {
 		resourcepool.PublishProxyChanged(account.ProxyResourceID, "bind")
 	}
 	resourcepool.PublishStatsChanged("account")
-	h.startClaudeCodeAccountInitialProbe(account.ID)
 	c.JSON(http.StatusOK, gin.H{"account": account})
 }
 
 // RecheckClaudeCodeAccount runs an explicit usage probe that may clear manual recovery.
 func (h *Handler) RecheckClaudeCodeAccount(c *gin.Context) {
+	var body struct {
+		Confirmed bool `json:"confirmed"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || !body.Confirmed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "confirmation_required", "message": "重新检查会向 Anthropic 发送一次真实额度请求，请确认后重试"})
+		return
+	}
 	store, ok := h.openResourcePoolStore(c)
 	if !ok {
 		return
@@ -2406,15 +2435,35 @@ func (h *Handler) RecheckClaudeCodeAccount(c *gin.Context) {
 	cfg := h.cfg
 	configPath := h.configFilePath
 	h.mu.Unlock()
-	account, err := resourcepool.RecheckStoredAccountQuota(c.Request.Context(), configPath, cfg, store, c.Param("id"))
+	doc, errConfig := store.GetConfig(c.Request.Context())
+	if errConfig != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "load_failed", "message": errConfig.Error()})
+		return
+	}
+	if resourcepool.EffectiveAccountQuota(doc.AccountQuota).Mode == resourcepool.AccountQuotaModeDisabled {
+		c.JSON(http.StatusConflict, gin.H{"error": "quota_active_collection_disabled", "message": "当前已禁用主动额度采集"})
+		return
+	}
+	result, err := resourcepool.RecheckStoredAccountQuotaWithResult(c.Request.Context(), configPath, cfg, store, c.Param("id"))
+	var account *resourcepool.ClaudeCodeAccount
+	if result != nil {
+		account = result.Account
+	}
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "recheck_failed", "message": err.Error(), "account": account})
+		payload := gin.H{"error": "recheck_failed", "message": err.Error(), "account": account}
+		if result != nil {
+			payload["network_performed"] = result.NetworkPerformed
+			payload["cached"] = result.Cached
+			payload["requested_at"] = result.RequestedAt
+			payload["next_allowed_at"] = result.NextAllowedAt
+		}
+		c.JSON(http.StatusBadGateway, payload)
 		return
 	}
 	h.triggerConfigReload(c.Request.Context())
 	resourcepool.PublishAccountChanged(account.ID, "recovered")
 	resourcepool.PublishStatsChanged("account_health")
-	c.JSON(http.StatusOK, gin.H{"account": account})
+	c.JSON(http.StatusOK, result)
 }
 
 func (h *Handler) PatchClaudeCodeAccount(c *gin.Context) {
@@ -2541,6 +2590,8 @@ func (h *Handler) BindClaudeCodeAccountProxy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bind_failed", "message": err.Error()})
 		return
 	}
+	helps.ClearClaudeCodeNodeTransports(account.ID)
+	helps.ClearCachedSessionIDs()
 	h.triggerConfigReload(c.Request.Context())
 	resourcepool.PublishAccountChanged(account.ID, "bind_proxy")
 	resourcepool.PublishProxyChanged(account.ProxyResourceID, "bind")
@@ -2559,6 +2610,8 @@ func (h *Handler) UnbindClaudeCodeAccountProxy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unbind_failed", "message": err.Error()})
 		return
 	}
+	helps.ClearClaudeCodeNodeTransports(account.ID)
+	helps.ClearCachedSessionIDs()
 	h.triggerConfigReload(c.Request.Context())
 	resourcepool.PublishAccountChanged(account.ID, "unbind_proxy")
 	resourcepool.PublishProxyChanged("", "unbind")
@@ -2649,21 +2702,48 @@ func (h *Handler) TestClaudeCodeAccount(c *gin.Context) {
 }
 
 func (h *Handler) RefreshClaudeCodeAccountQuota(c *gin.Context) {
+	var body struct {
+		Confirmed bool `json:"confirmed"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || !body.Confirmed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "confirmation_required", "message": "手动刷新会向 Anthropic 发送一次真实额度请求，请确认后重试"})
+		return
+	}
 	store, ok := h.openResourcePoolStore(c)
 	if !ok {
 		return
 	}
 	defer closeResourcePoolStore(store)
-	account, err := h.refreshClaudeCodeAccountQuota(c.Request.Context(), store, c.Param("id"))
+	doc, errConfig := store.GetConfig(c.Request.Context())
+	if errConfig != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "load_failed", "message": errConfig.Error()})
+		return
+	}
+	if resourcepool.EffectiveAccountQuota(doc.AccountQuota).Mode == resourcepool.AccountQuotaModeDisabled {
+		c.JSON(http.StatusConflict, gin.H{"error": "quota_active_collection_disabled", "message": "当前已禁用主动额度采集"})
+		return
+	}
+	result, err := h.refreshClaudeCodeAccountQuotaResult(c.Request.Context(), store, c.Param("id"))
+	var account *resourcepool.ClaudeCodeAccount
+	if result != nil {
+		account = result.Account
+	}
 	if account != nil {
 		resourcepool.PublishAccountChanged(account.ID, "quota")
 		resourcepool.PublishStatsChanged("account")
 	}
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"account": account, "warning": err.Error()})
+		payload := gin.H{"account": account, "warning": err.Error()}
+		if result != nil {
+			payload["network_performed"] = result.NetworkPerformed
+			payload["cached"] = result.Cached
+			payload["requested_at"] = result.RequestedAt
+			payload["next_allowed_at"] = result.NextAllowedAt
+		}
+		c.JSON(http.StatusOK, payload)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"account": account})
+	c.JSON(http.StatusOK, result)
 }
 
 func (h *Handler) RefreshClaudeCodeAccountToken(c *gin.Context) {
@@ -2711,6 +2791,21 @@ func (h *Handler) RefreshClaudeCodeAccountToken(c *gin.Context) {
 }
 
 func (h *Handler) refreshClaudeCodeAccountQuota(ctx context.Context, store *resourcepool.Store, accountID string) (*resourcepool.ClaudeCodeAccount, error) {
+	result, err := h.refreshClaudeCodeAccountQuotaResult(ctx, store, accountID)
+	if result == nil {
+		return nil, err
+	}
+	return result.Account, err
+}
+
+func (h *Handler) refreshClaudeCodeAccountQuotaResult(ctx context.Context, store *resourcepool.Store, accountID string) (*resourcepool.AccountQuotaRefreshResult, error) {
+	doc, errConfig := store.GetConfig(ctx)
+	if errConfig != nil {
+		return nil, errConfig
+	}
+	if resourcepool.EffectiveAccountQuota(doc.AccountQuota).Mode == resourcepool.AccountQuotaModeDisabled {
+		return nil, fmt.Errorf("active quota collection is disabled")
+	}
 	account, err := store.GetAccount(ctx, accountID)
 	if err != nil {
 		return nil, err
@@ -2730,9 +2825,9 @@ func (h *Handler) refreshClaudeCodeAccountQuota(ctx context.Context, store *reso
 		if errSave != nil {
 			return nil, errSave
 		}
-		return nowAccount, errAuth
+		return &resourcepool.AccountQuotaRefreshResult{Account: nowAccount}, errAuth
 	}
-	return resourcepool.RefreshAccountQuota(ctx, cfg, store, account.ID, auth, func(updated *coreauth.Auth) error {
+	return resourcepool.RefreshAccountQuotaWithResult(ctx, cfg, store, account.ID, auth, func(updated *coreauth.Auth) error {
 		if h.authManager != nil {
 			if _, err := h.authManager.Update(ctx, updated); err != nil {
 				return err
@@ -2744,8 +2839,9 @@ func (h *Handler) refreshClaudeCodeAccountQuota(ctx context.Context, store *reso
 
 func (h *Handler) BatchClaudeCodeAccounts(c *gin.Context) {
 	var body struct {
-		Action string   `json:"action"`
-		IDs    []string `json:"ids"`
+		Action    string   `json:"action"`
+		IDs       []string `json:"ids"`
+		Confirmed bool     `json:"confirmed"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -2755,6 +2851,10 @@ func (h *Handler) BatchClaudeCodeAccounts(c *gin.Context) {
 	ids := dedupeTrimmedStrings(body.IDs)
 	if action == "" || len(ids) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "action and ids are required"})
+		return
+	}
+	if action == "refresh-quota" && !body.Confirmed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "confirmation_required", "message": "批量刷新会为每个账号发送真实额度请求"})
 		return
 	}
 	store, ok := h.openResourcePoolStore(c)

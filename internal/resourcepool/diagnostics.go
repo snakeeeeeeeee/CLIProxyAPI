@@ -58,14 +58,19 @@ type AccountPoolProfileDiagnostics struct {
 	TLSJA4              string `json:"tls_ja4"`
 	TLSALPN             string `json:"tls_alpn"`
 	AllowClientCacheTTL bool   `json:"allow_client_cache_ttl"`
+	Baseline            string `json:"baseline"`
+	TimeoutPolicy       string `json:"timeout_policy"`
+	CustomOffset        bool   `json:"custom_offset"`
 }
 
 type AccountPoolQuotaDiagnostics struct {
-	Enabled         bool   `json:"enabled"`
-	Interval        string `json:"interval"`
-	Concurrency     int    `json:"concurrency"`
-	SchedulerTick   string `json:"scheduler_tick"`
-	GlobalProxyMode string `json:"global_proxy_mode"`
+	Mode               string     `json:"mode"`
+	Interval           string     `json:"interval"`
+	Concurrency        int        `json:"concurrency"`
+	SchedulerTick      string     `json:"scheduler_tick"`
+	LastActiveAt       *time.Time `json:"last_active_at,omitempty"`
+	LastActiveCategory string     `json:"last_active_category,omitempty"`
+	NextScheduledAt    *time.Time `json:"next_scheduled_at,omitempty"`
 }
 
 type AccountPoolDiagnosticSummary struct {
@@ -87,11 +92,13 @@ type AccountPoolAccountDiagnostic struct {
 	LastQuotaAt        *time.Time         `json:"last_quota_at,omitempty"`
 	NextQuotaAt        *time.Time         `json:"next_quota_at,omitempty"`
 	QuotaTransport     string             `json:"quota_transport,omitempty"`
+	NetworkMode        string             `json:"network_mode"`
 	Probe              *AccountQuotaProbe `json:"probe,omitempty"`
 }
 
 // Diagnostics reads only local configuration and SQLite state. It never probes an external service.
 func (s *Store) Diagnostics(ctx context.Context, cfg *config.Config, now time.Time) (*AccountPoolDiagnostics, error) {
+	_ = cfg
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -108,8 +115,12 @@ func (s *Store) Diagnostics(ctx context.Context, cfg *config.Config, now time.Ti
 		return nil, err
 	}
 	profile := EffectiveClaudeCodeProfile(doc.Profile)
+	profileFingerprint := ClaudeCodeProfileFingerprint(profile)
+	builtinProfileFingerprint := ClaudeCodeProfileFingerprint(EffectiveClaudeCodeProfile(ClaudeCodeProfile{}))
+	profileCustomOffset := profileFingerprint != builtinProfileFingerprint
 	poolConfig := EffectiveClaudeCodePool(doc.ClaudeCode)
 	quotaConfig := EffectiveAccountQuota(doc.AccountQuota)
+	recentExitChanges := s.recentProxyExitChanges(ctx, now.Add(-24*time.Hour))
 	diagnostics := &AccountPoolDiagnostics{
 		Status: "healthy",
 		AsOf:   now,
@@ -128,7 +139,7 @@ func (s *Store) Diagnostics(ctx context.Context, cfg *config.Config, now time.Ti
 		Profile: AccountPoolProfileDiagnostics{
 			Version:             profile.Version,
 			Revision:            profile.Revision,
-			Fingerprint:         ClaudeCodeProfileFingerprint(profile),
+			Fingerprint:         profileFingerprint,
 			UserAgent:           profile.UserAgent,
 			HeaderCount:         len(profile.Headers),
 			HeaderOrderCount:    len(profile.HeaderOrder),
@@ -138,20 +149,22 @@ func (s *Store) Diagnostics(ctx context.Context, cfg *config.Config, now time.Ti
 			TLSJA4:              profile.TLSJA4,
 			TLSALPN:             profile.TLSALPN,
 			AllowClientCacheTTL: poolConfig.AllowClientCacheTTL,
+			Baseline:            "builtin-trace-baseline:2.1.220",
+			TimeoutPolicy:       "stream=600,non-stream=300,count_tokens=300,passthrough=preserve-valid",
+			CustomOffset:        profileCustomOffset,
 		},
 		Quota: AccountPoolQuotaDiagnostics{
-			Enabled:         quotaConfig.Enabled != nil && *quotaConfig.Enabled,
-			Interval:        quotaConfig.Interval,
-			Concurrency:     quotaConfig.Concurrency,
-			SchedulerTick:   accountQuotaSchedulerTick.String(),
-			GlobalProxyMode: diagnosticProxyMode(configProxyURL(cfg)),
+			Mode:          quotaConfig.Mode,
+			Interval:      quotaConfig.Interval,
+			Concurrency:   quotaConfig.Concurrency,
+			SchedulerTick: accountQuotaSchedulerTick.String(),
 		},
 		Accounts: make([]AccountPoolAccountDiagnostic, 0, len(accounts)),
 	}
 	if diagnostics.Build.Commit == "" || strings.EqualFold(diagnostics.Build.Commit, "none") {
 		diagnostics.Issues = append(diagnostics.Issues, "build_commit_unknown")
 	}
-	if profile.Revision != DefaultClaudeCodeProfileRevision {
+	if profileCustomOffset {
 		diagnostics.Issues = append(diagnostics.Issues, "profile_revision_custom")
 	}
 	if profile.TLSProfile != helps.ClaudeCodeNodeTLSProfileName || profile.TLSALPN != helps.ClaudeCodeNodeTLSALPN {
@@ -161,7 +174,17 @@ func (s *Store) Diagnostics(ctx context.Context, cfg *config.Config, now time.Ti
 		diagnostics.Issues = append(diagnostics.Issues, "no_accounts")
 	}
 	for _, account := range accounts {
-		item := accountDiagnostic(account, profile.Revision, now)
+		item := accountDiagnostic(account, profile.Revision, recentExitChanges, now)
+		if item.Probe != nil && (diagnostics.Quota.LastActiveAt == nil || item.Probe.RequestedAt.After(*diagnostics.Quota.LastActiveAt)) {
+			requestedAt := item.Probe.RequestedAt
+			diagnostics.Quota.LastActiveAt = &requestedAt
+			diagnostics.Quota.LastActiveCategory = "oauth-usage"
+		}
+		if quotaConfig.Mode == AccountQuotaModeScheduled && item.NextQuotaAt != nil &&
+			(diagnostics.Quota.NextScheduledAt == nil || item.NextQuotaAt.Before(*diagnostics.Quota.NextScheduledAt)) {
+			nextAt := *item.NextQuotaAt
+			diagnostics.Quota.NextScheduledAt = &nextAt
+		}
 		diagnostics.Accounts = append(diagnostics.Accounts, item)
 		switch item.Status {
 		case "critical":
@@ -188,7 +211,7 @@ func (s *Store) Diagnostics(ctx context.Context, cfg *config.Config, now time.Ti
 	return diagnostics, nil
 }
 
-func accountDiagnostic(account ClaudeCodeAccount, profileRevision string, now time.Time) AccountPoolAccountDiagnostic {
+func accountDiagnostic(account ClaudeCodeAccount, profileRevision string, recentExitChanges map[string]bool, now time.Time) AccountPoolAccountDiagnostic {
 	item := AccountPoolAccountDiagnostic{
 		AccountFingerprint: shortDiagnosticHash(account.ID),
 		DeviceFingerprint:  cloakDeviceFingerprint(account.CloakUserID),
@@ -197,9 +220,17 @@ func accountDiagnostic(account ClaudeCodeAccount, profileRevision string, now ti
 		ProxyResourceID:    strings.TrimSpace(account.ProxyResourceID),
 		TokenExpiresAt:     account.TokenExpiresAt,
 		NextQuotaAt:        account.NextHealthCheckAt,
+		NetworkMode:        "direct",
+	}
+	if account.ProxyResourceID != "" {
+		item.NetworkMode = "invalid"
 	}
 	if account.Proxy != nil {
 		item.LastObservedExitIP = strings.TrimSpace(account.Proxy.ExitIP)
+		setting, err := proxyutil.Parse(account.Proxy.ProxyURL)
+		if err == nil && setting.Mode == proxyutil.ModeProxy && account.Proxy.Enabled {
+			item.NetworkMode = "bound_proxy"
+		}
 	}
 	if account.Quota != nil {
 		item.LastQuotaAt = account.Quota.CheckedAt
@@ -239,6 +270,9 @@ func accountDiagnostic(account ClaudeCodeAccount, profileRevision string, now ti
 	} else if account.Proxy != nil && account.Proxy.HealthStatus == HealthUnhealthy {
 		addCritical("proxy_unhealthy")
 	}
+	if recentExitChanges[strings.TrimSpace(account.ProxyResourceID)] {
+		addAttention("proxy_exit_changed")
+	}
 	if account.Quota == nil || account.Quota.CheckedAt == nil {
 		addAttention("quota_never_observed")
 	} else if account.QuotaFreshness == quotaFreshnessStale {
@@ -265,6 +299,31 @@ func accountDiagnostic(account ClaudeCodeAccount, profileRevision string, now ti
 		item.Status = "attention"
 	}
 	return item
+}
+
+func (s *Store) recentProxyExitChanges(ctx context.Context, since time.Time) map[string]bool {
+	out := make(map[string]bool)
+	if s == nil || s.db == nil {
+		return out
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT data_json FROM pool_events WHERE type = 'proxy_exit_changed' AND created_at >= ?`, dbTime(since))
+	if err != nil {
+		return out
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			continue
+		}
+		var data map[string]string
+		if json.Unmarshal([]byte(raw), &data) == nil {
+			if proxyID := strings.TrimSpace(data["proxy_id"]); proxyID != "" {
+				out[proxyID] = true
+			}
+		}
+	}
+	return out
 }
 
 func accountPoolHeaderConfigHash(profile EffectiveClaudeCodeProfileConfig) string {
@@ -307,13 +366,6 @@ func diagnosticProxyMode(raw string) string {
 	default:
 		return "inherit"
 	}
-}
-
-func configProxyURL(cfg *config.Config) string {
-	if cfg == nil {
-		return ""
-	}
-	return strings.TrimSpace(cfg.ProxyURL)
 }
 
 func normalizedDiagnosticIssues(issues []string) []string {

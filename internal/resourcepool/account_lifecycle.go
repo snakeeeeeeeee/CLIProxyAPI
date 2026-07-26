@@ -125,11 +125,12 @@ func (account *ClaudeCodeAccount) applyDerivedHealth(now time.Time) {
 	account.SharedQuotaBand = claudeapipool.QuotaBandUnknown
 	account.QuotaWindow = ""
 	account.QuotaResetAt = nil
-	account.QuotaWindowStates = buildQuotaWindowStates(account.Quota, now)
+	freshnessTTL := account.effectiveQuotaFreshnessTTL()
+	account.QuotaWindowStates = buildQuotaWindowStatesWithTTL(account.Quota, now, freshnessTTL)
 	if account.Quota != nil && account.Quota.CheckedAt != nil {
 		account.QuotaSource = quotaSource(account.Quota)
-		overall := evaluateQuotaRouting(account.Quota.Windows, account.Quota.CheckedAt, "*", now)
-		shared := evaluateQuotaRouting(account.Quota.Windows, account.Quota.CheckedAt, "", now)
+		overall := evaluateQuotaRoutingWithTTL(account.Quota.Windows, account.Quota.CheckedAt, "*", now, freshnessTTL)
+		shared := evaluateQuotaRoutingWithTTL(account.Quota.Windows, account.Quota.CheckedAt, "", now, freshnessTTL)
 		if overall.Known {
 			account.QuotaFreshness = "fresh"
 			headroom := overall.Headroom
@@ -153,6 +154,13 @@ func (account *ClaudeCodeAccount) applyDerivedHealth(now time.Time) {
 }
 
 func buildQuotaWindowStates(quota *AccountQuota, now time.Time) []QuotaWindowState {
+	return buildQuotaWindowStatesWithTTL(quota, now, quotaFreshnessTTL)
+}
+
+func buildQuotaWindowStatesWithTTL(quota *AccountQuota, now time.Time, freshnessTTL time.Duration) []QuotaWindowState {
+	if freshnessTTL <= 0 {
+		freshnessTTL = quotaFreshnessTTL
+	}
 	type windowSpec struct {
 		key       string
 		name      string
@@ -215,7 +223,7 @@ func buildQuotaWindowStates(quota *AccountQuota, now time.Time) []QuotaWindowSta
 		if state.ObservedAt == nil {
 			state.ObservedAt = checkedAt
 		}
-		state.Freshness = quotaWindowFreshness(window, state.ObservedAt, now)
+		state.Freshness = quotaWindowFreshnessWithTTL(window, state.ObservedAt, now, freshnessTTL)
 		state.UtilizationKnown = quotaWindowUtilizationKnown(window)
 		if state.UtilizationKnown {
 			used := clampPercent(window.UsedPercent)
@@ -233,13 +241,20 @@ func buildQuotaWindowStates(quota *AccountQuota, now time.Time) []QuotaWindowSta
 }
 
 func quotaWindowFreshness(window QuotaWindow, observedAt *time.Time, now time.Time) string {
+	return quotaWindowFreshnessWithTTL(window, observedAt, now, quotaFreshnessTTL)
+}
+
+func quotaWindowFreshnessWithTTL(window QuotaWindow, observedAt *time.Time, now time.Time, freshnessTTL time.Duration) string {
 	if observedAt == nil || observedAt.IsZero() {
 		return quotaFreshnessUnknown
 	}
 	if window.ResetsAt != nil && !window.ResetsAt.After(now) {
 		return quotaFreshnessStale
 	}
-	if now.Sub(*observedAt) > quotaFreshnessTTL {
+	if freshnessTTL <= 0 {
+		freshnessTTL = quotaFreshnessTTL
+	}
+	if now.Sub(*observedAt) > freshnessTTL {
 		return quotaFreshnessStale
 	}
 	return quotaFreshnessFresh
@@ -282,7 +297,7 @@ func (account *ClaudeCodeAccount) AccountHeadroom(model string, now time.Time) (
 	if account == nil || account.Quota == nil || account.Quota.CheckedAt == nil {
 		return 0.5, false
 	}
-	evaluation := evaluateQuotaRouting(account.Quota.Windows, account.Quota.CheckedAt, model, now)
+	evaluation := evaluateQuotaRoutingWithTTL(account.Quota.Windows, account.Quota.CheckedAt, model, now, account.effectiveQuotaFreshnessTTL())
 	if !evaluation.Known {
 		return 0.5, false
 	}
@@ -296,7 +311,7 @@ func applyAccountQuotaRouting(account *ClaudeCodeAccount, now time.Time) {
 	states := make(map[string]claudeapipool.AccountQuotaRoutingState)
 	if account.Quota != nil && account.Quota.CheckedAt != nil {
 		for _, family := range []string{"", "sonnet", "opus", "fable", "haiku"} {
-			evaluation := evaluateQuotaRouting(account.Quota.Windows, account.Quota.CheckedAt, family, now)
+			evaluation := evaluateQuotaRoutingWithTTL(account.Quota.Windows, account.Quota.CheckedAt, family, now, account.effectiveQuotaFreshnessTTL())
 			if !evaluation.Known {
 				continue
 			}
@@ -313,6 +328,13 @@ func applyAccountQuotaRouting(account *ClaudeCodeAccount, now time.Time) {
 	claudeapipool.UpdateScopedAccountQuotaRouting(AccountRoutingScope(account.PoolID), account.AuthID, states)
 }
 
+func (account *ClaudeCodeAccount) effectiveQuotaFreshnessTTL() time.Duration {
+	if account != nil && account.quotaFreshnessTTL > 0 {
+		return account.quotaFreshnessTTL
+	}
+	return quotaFreshnessTTL
+}
+
 type quotaRoutingEvaluation struct {
 	Known       bool
 	Headroom    float64
@@ -324,6 +346,13 @@ type quotaRoutingEvaluation struct {
 }
 
 func evaluateQuotaRouting(windows []QuotaWindow, checkedAt *time.Time, model string, now time.Time) quotaRoutingEvaluation {
+	return evaluateQuotaRoutingWithTTL(windows, checkedAt, model, now, quotaFreshnessTTL)
+}
+
+func evaluateQuotaRoutingWithTTL(windows []QuotaWindow, checkedAt *time.Time, model string, now time.Time, freshnessTTL time.Duration) quotaRoutingEvaluation {
+	if freshnessTTL <= 0 {
+		freshnessTTL = quotaFreshnessTTL
+	}
 	out := quotaRoutingEvaluation{Headroom: 0.5, Band: claudeapipool.QuotaBandUnknown}
 	includeAllModels := model == "*"
 	for _, window := range normalizeQuotaWindows(windows) {
@@ -337,10 +366,10 @@ func evaluateQuotaRouting(windows []QuotaWindow, checkedAt *time.Time, model str
 		if updatedAt == nil {
 			updatedAt = checkedAt
 		}
-		if updatedAt == nil || now.Sub(*updatedAt) > quotaFreshnessTTL {
+		if updatedAt == nil || now.Sub(*updatedAt) > freshnessTTL {
 			continue
 		}
-		expiresAt := updatedAt.Add(quotaFreshnessTTL)
+		expiresAt := updatedAt.Add(freshnessTTL)
 		used := clampPercent(window.UsedPercent)
 		band := quotaBandForWindow(window, used)
 		if !quotaWindowUtilizationKnown(window) {

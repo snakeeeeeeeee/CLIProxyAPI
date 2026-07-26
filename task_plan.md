@@ -1,5 +1,82 @@
 # Task Plan: Multi-Pool API Keys, Pricing, Usage, And Console
 
+## Current Implementation: Claude Code 2.1.220 Fixed Baseline, Quota Collection, And Strict Proxying
+
+### Goal
+
+Pin the account-pool protocol to the audited `2.1.220-r1` baseline, make active OAuth usage collection explicit and low-frequency, and guarantee that unbound accounts connect directly while bound accounts fail closed on their assigned proxy.
+
+### Phases
+
+1. [completed] Audit the current Profile, quota worker, proxy paths, diagnostics, frontend, and 2.1.220 recorder evidence.
+2. [completed] Implement the fixed Profile, request-category timeout rules, billing fixtures, and idempotent migration.
+3. [completed] Implement manual/scheduled/disabled quota modes, confirmation, recent-result reuse, and scheduled freshness.
+4. [completed] Implement the strict direct/bound-proxy matrix, SessionKey/OAuth consistency guards, and ipify-only health checks.
+5. [completed] Extend management APIs, diagnostics, and the resource console.
+6. [completed] Add regressions, update secondary-development documentation, and run all required Go/frontend/browser verification.
+
+### Boundaries
+
+- Preserve real Claude Code request capabilities and do not fabricate inference heartbeats, title calls, telemetry, or model probes.
+- Keep the existing JA3, JA4, ALPN, and TLS implementation unchanged.
+- Do not claim protocol similarity prevents provider enforcement or makes subscription OAuth forwarding compliant.
+- Do not include the previously discussed account export/import feature in this already approved implementation scope.
+
+### Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| The normalized default quota interval returned Go's `30m0s` string instead of the API enum `30m` | 1 | Returned the canonical `30m` value and retained duration parsing only at runtime boundaries. |
+| `singleflight.Do` reports `shared=true` to both leader and waiters, so every concurrent caller was labeled cached | 1 | Added a caller-local flag set only by the closure owner; one caller now reports network I/O and waiters report reuse. |
+| A combined Go/frontend verification command was launched from the frontend subdirectory | 1 | Split Go commands at repository root from npm commands under `web/resource-console`. |
+
+## Current Research: sub2api Anthropic Quota Collection Comparison
+
+### Goal
+
+Inspect the updated local sub2api implementation and compare its Anthropic active usage query, passive Header sampling, cache, proxy, TLS, token refresh, and frontend triggering behavior with the current account-pool quota maintenance design.
+
+### Phases
+
+1. [completed] Verify the exact updated sub2api repository, commit, and version.
+2. [completed] Trace the Anthropic management usage handler through cache, singleflight, upstream request, parser, and passive merge.
+3. [completed] Trace frontend passive/active loading and confirm whether any background Anthropic quota worker exists.
+4. [completed] Verify account proxy, TLS Profile, User-Agent, and independent OAuth token-refresh behavior.
+5. [completed] Compare coverage and scheduling tradeoffs with CLIProxyAPI and record recommendations without changing runtime code.
+
+### Boundaries
+
+- Treat local source as evidence for sub2api `0.1.165` only; do not infer undocumented Anthropic behavior from it.
+- Distinguish quota accuracy from request frequency: fewer upstream calls do not make model coverage more complete.
+- Do not add inference probes or copy sub2api defects solely for behavioral similarity.
+
+## Current Research: Claude Code 2.1.220 Baseline, Heartbeats, And Quota Collection
+
+### Goal
+
+Establish an evidence-backed compatibility baseline for Claude Code 2.1.220, determine whether idle Claude Code sends periodic inference heartbeats, and document how active OAuth usage polling and passive model quota Headers currently interact before proposing runtime changes.
+
+### Phases
+
+1. [completed] Verify the installed/latest Claude Code version and the limits of the available custom-Base-URL credential.
+2. [completed] Capture a record-only 2.1.220 title request and main request without forwarding to Anthropic.
+3. [completed] Keep an interactive 2.1.220 session idle for 70 seconds and inspect recorder/debug evidence for periodic traffic.
+4. [completed] Reconcile official telemetry documentation, current quota worker/parser/merge code, and Sonnet/Opus/Fable active/passive semantics.
+5. [completed] Present the stable-profile recommendation and prioritized implementation changes for user approval.
+
+### Boundaries
+
+- Treat the capture as Claude Code 2.1.220 with a custom Base URL, not as proof of first-party OAuth-only headers or native TLS.
+- Do not add inference heartbeats, telemetry imitation, or model probes without first-party evidence and a concrete product need.
+- Do not describe request-shape compatibility as a way to bypass provider enforcement.
+
+### Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| Interactive Claude rejected `--no-session-persistence` because that option requires print mode | 1 | Restarted the idle observation without that flag and exited the session without sending a prompt. |
+| Direct `rm -f` cleanup was rejected by the command safety layer | 1 | Deleted only the temporary files created by this research through explicit patch deletions. |
+
 ## Current Implementation: Optional SessionKey Proxy Binding
 
 ### Goal

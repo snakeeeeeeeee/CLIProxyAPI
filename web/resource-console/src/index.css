@@ -113,7 +113,7 @@
   }
 
   .overflow-menu-content {
-    @apply fixed z-50 grid min-w-36 overflow-hidden rounded-lg border bg-card p-1 shadow-panel;
+    @apply pointer-events-auto fixed z-[60] grid min-w-36 overflow-hidden rounded-lg border bg-card p-1 shadow-panel;
   }
 
   .overflow-menu-content button {

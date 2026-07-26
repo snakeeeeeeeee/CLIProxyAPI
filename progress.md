@@ -1,5 +1,29 @@
 # Progress: Multi-Pool API Keys, Pricing, Usage, And Console
 
+## 2026-07-26 sub2api Anthropic Quota Collection Research
+
+- Verified the updated local source as sub2api `0.1.165` at commit `2730c1c43b29be003925b033f3f9e645e726bb8c` and excluded the older similarly named checkout.
+- Traced the only Anthropic active usage call from the admin handler through the 3-minute success cache, 1-minute error cache, account singleflight, 0-800ms jitter, proxy/TLS transport, response parser, and passive-store synchronization.
+- Confirmed there is no Anthropic quota polling worker. Account cards and account-list refresh use local passive data; only the dedicated active-query control can call `/api/oauth/usage`.
+- Confirmed `force=true` is ignored by the Anthropic service branch and therefore cannot bypass the backend success cache.
+- Verified active coverage is limited to 5h, 7d, Sonnet, and Fable, while passive coverage is limited to 5h, 7d, and Fable. Opus and dynamic model limits are not implemented.
+- Verified usage requests use the bound account proxy and optional account TLS Profile/User-Agent fingerprint, but do not refresh a stale token inline. The separate token refresh worker is enabled by default, checks every 5 minutes, and refreshes 30 minutes before expiry.
+- Compared the design with CLIProxyAPI. No runtime changes were made; the recommended follow-up remains an independent active OAuth-probe clock plus symmetric fresh passive-window preservation.
+
+## 2026-07-26 Claude Code 2.1.220 Heartbeat And Quota Research
+
+- Confirmed the available Claude credential is custom-Base-URL-only when user settings are active; empty setting sources have no independent first-party login.
+- Started a local record-only trace recorder and captured one safe-mode Claude Code 2.1.220 invocation without forwarding any request to Anthropic.
+- Captured one Haiku title helper and one Sonnet main request, including redacted request shape, Header order, runtime tuple, Session consistency, beta lists, cache-control shape, request-kind billing suffixes, and body summaries.
+- Observed that all main-request cache controls omit `ttl`; this contradicts the current assumption that Claude Code 2.1.220 always explicitly requests 1h caching.
+- Ran a 70-second interactive idle observation. No HTTP request reached the recorder; debug only showed disabled third-party telemetry and a dropped local event.
+- Stopped the record-only recorder, the unused MITM process, and the interactive Claude process. No tracked runtime code was changed.
+- Began reconciling active OAuth quota polling with passive response Header updates; identified asymmetric passive fallback preservation for Fable versus Sonnet/Opus.
+- Confirmed a second quota scheduling defect: inference success and passive Header observations advance the same due timestamps used by the OAuth worker, so busy accounts are not guaranteed a periodic active usage call.
+- Checked the external review against current source. Token-refresh UA/transport, Anthropic-root Go health probes, trace/runtime classifier drift, and fixed timeout concerns remain present; the target token-refresh profile still requires first-party evidence.
+- Verified the existing billing fingerprint algorithm against the new main request: 2.1.220 plus `Reply with exactly OK.` produces the observed `032` suffix.
+- Correlated the idle capture with official monitoring, network, changelog, and prompt-caching documentation. No evidence supports adding a normal Messages heartbeat; omitted cache TTL is officially 5 minutes.
+
 ## 2026-07-26 Optional SessionKey Proxy Binding
 
 - Read the secondary-development notes and traced the complete SessionKey job, reservation, direct/proxy authenticator, persistence, API client, and batch-form flow.
@@ -135,6 +159,26 @@
 ---
 
 # Previous Progress: Proactive Model Quota Scheduling
+
+## 2026-07-26 Claude Code 2.1.220 Fixed Baseline Implementation
+
+- Recovered the previous inspection context and preserved the existing planning-file changes.
+- Confirmed the current implementation already has stable ordinary mode, account-scoped Sessions, beta capability merging, per-account quota singleflight, safe diagnostics, and malformed-proxy fail-closed behavior.
+- Started the approved implementation with the shared Profile, quota-mode, and explicit-direct foundations; no runtime edit had been made before this point.
+- Completed the fixed `2.1.220-r1` Profile, request-category timeout rules, title-helper passthrough regression, billing fixture, and built-in migration.
+- Completed manual/scheduled/disabled quota modes, delayed first collection, active-probe due clock, confirmation, singleflight, three-minute success reuse, one-minute failure reuse, and scheduled freshness.
+- Corrected the normalized default interval from `30m0s` to the public `30m` enum and corrected leader/waiter network metadata for concurrent quota calls.
+- Enforced explicit direct routing for unbound stored/overlaid auths and fail-closed routing for missing, disabled, unhealthy, or malformed bound proxies.
+- Added OAuth direct/bound consistency tests, SessionKey bound-account conflict handling, in-flight bind-change rejection, and strict proxy overlay/storage tests.
+- Unified OAuth token exchange and refresh on the Axios-compatible Header tuple.
+- Replaced proxy health with one ipify request, exit-IP validation, and redacted exit-change event coverage.
+- Completed quota configuration, confirmation, disabled-mode 409, diagnostics, SessionKey/OAuth copy, and responsive frontend integration; frontend type-check passes.
+- Updated `2dev/迭代开发日志.md`, `2dev/2dev.md`, and the fidelity audit with the fixed baseline, no-heartbeat evidence, quota modes, strict proxy boundary, browser OAuth limitation, and policy-risk caveat.
+- Focused resourcepool, management, executor, transport, and Claude auth tests pass. Full `go test ./...` passes.
+- The isolated browser smoke initially reused a management-key hash that did not match the documented temporary key. Replaced only the temporary config hash, restarted the isolated server, and verified authenticated management access without touching real config or data.
+- Responsive browser verification passed at 375/768/1024/1440 with no page-level horizontal overflow. Quota mode controls, scheduled intervals, diagnostics, OAuth strict-routing copy, and SessionKey bound/unbound states remained readable; browser warning/error logs were empty.
+- Final `go test ./...`, required backend build, resource-console type-check/build, and `git diff --check` all pass after the last API adjustment.
+- Reset and finalized the browser, stopped the isolated `28320` service, and removed `.codex-220-smoke`. No valid authorized account is available, so Anthropic online smoke remains an explicit rollout gate rather than a passed check.
 
 ## Claude Code Observable Fingerprint Research (2026-07-12)
 

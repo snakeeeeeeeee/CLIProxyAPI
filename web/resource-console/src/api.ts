@@ -213,8 +213,27 @@ export interface ResourcePoolConfig {
     test_url: string;
     optional_exit_ip_url?: string;
   };
+  account_quota: AccountQuotaConfig;
   claude_code: Record<string, unknown>;
   summary: ConsoleSummary;
+}
+
+export type AccountQuotaMode = "manual" | "scheduled" | "disabled";
+
+export interface AccountQuotaConfig {
+  mode: AccountQuotaMode;
+  enabled?: boolean;
+  interval: "15m" | "30m" | "1h";
+  concurrency: number;
+}
+
+export interface AccountQuotaRefreshResponse {
+  account?: ClaudeCodeAccount;
+  warning?: string;
+  network_performed: boolean;
+  cached: boolean;
+  requested_at: string;
+  next_allowed_at: string;
 }
 
 export interface RoutingEffectiveConfig {
@@ -826,6 +845,7 @@ export interface AccountPoolAccountDiagnostic {
   last_quota_at?: string;
   next_quota_at?: string;
   quota_transport?: string;
+  network_mode: "direct" | "bound_proxy" | "invalid" | string;
   probe?: AccountPoolQuotaProbeDiagnostic;
 }
 
@@ -858,13 +878,18 @@ export interface AccountPoolDiagnostics {
     tls_ja4: string;
     tls_alpn: string;
     allow_client_cache_ttl: boolean;
+    baseline: string;
+    timeout_policy: string;
+    custom_offset: boolean;
   };
   quota: {
-    enabled: boolean;
+    mode: AccountQuotaMode | string;
     interval: string;
     concurrency: number;
     scheduler_tick: string;
-    global_proxy_mode: string;
+    last_active_at?: string;
+    last_active_category?: string;
+    next_scheduled_at?: string;
   };
   summary: {
     total: number;
@@ -1110,6 +1135,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(payload)
     }),
+  saveQuotaConfig: (payload: AccountQuotaConfig) =>
+    request<{ raw: AccountQuotaConfig; effective: AccountQuotaConfig }>("/claude-code-account-pool/quota-config", {
+      method: "PUT",
+      body: JSON.stringify(payload)
+    }),
   poolStats: (poolID = "", window: UsageWindow = "30d") => {
     const params = new URLSearchParams({ window });
     if (poolID) params.set("pool_id", poolID);
@@ -1232,21 +1262,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload)
     }),
-	  refreshAccountQuota: (id: string) =>
-    request<{ account: ClaudeCodeAccount; warning?: string }>(`/claude-code-account-pool/accounts/${id}/quota/refresh`, {
-      method: "POST"
-	    }),
-	  recheckAccount: (id: string) =>
-	    request<{ account: ClaudeCodeAccount }>(`/claude-code-account-pool/accounts/${id}/recheck`, { method: "POST" }),
+  refreshAccountQuota: (id: string) =>
+    request<AccountQuotaRefreshResponse>(`/claude-code-account-pool/accounts/${id}/quota/refresh`, {
+      method: "POST",
+      body: JSON.stringify({ confirmed: true })
+    }),
+  recheckAccount: (id: string) =>
+    request<AccountQuotaRefreshResponse>(`/claude-code-account-pool/accounts/${id}/recheck`, {
+      method: "POST",
+      body: JSON.stringify({ confirmed: true })
+    }),
   refreshAccountToken: (id: string) =>
     request<{ account: ClaudeCodeAccount; warning?: string }>(`/claude-code-account-pool/accounts/${id}/token/refresh`, {
       method: "POST"
     }),
   deleteAccount: (id: string) => request<{ status: string }>(`/claude-code-account-pool/accounts/${id}`, { method: "DELETE" }),
-  batchAccounts: (action: AccountBatchAction, ids: string[]) =>
+  batchAccounts: (action: AccountBatchAction, ids: string[], confirmed = false) =>
     request<AccountBatchResult>("/claude-code-account-pool/accounts/batch", {
       method: "POST",
-      body: JSON.stringify({ action, ids })
+      body: JSON.stringify({ action, ids, confirmed })
     }),
   bindAccountProxy: (accountID: string, proxyID: string) =>
     request<{ account: ClaudeCodeAccount }>(`/claude-code-account-pool/accounts/${accountID}/bind-proxy`, {

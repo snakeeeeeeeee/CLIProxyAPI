@@ -244,7 +244,7 @@ func TestRefreshAccountQuotaSavesUsageSnapshot(t *testing.T) {
 			http.Error(w, fmt.Sprintf("anthropic-beta = %q", got), http.StatusBadRequest)
 			return
 		}
-		if got := r.Header.Get("User-Agent"); got != "claude-cli/2.1.207 (external, sdk-cli)" {
+		if got := r.Header.Get("User-Agent"); got != "claude-cli/2.1.220 (external, sdk-cli)" {
 			http.Error(w, fmt.Sprintf("User-Agent = %q", got), http.StatusBadRequest)
 			return
 		}
@@ -301,7 +301,8 @@ func TestRefreshAccountQuotaUsesConfiguredInterval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetConfig() error = %v", err)
 	}
-	doc.AccountQuota.Interval = "40s"
+	doc.AccountQuota.Mode = AccountQuotaModeScheduled
+	doc.AccountQuota.Interval = "15m"
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("BeginTx() error = %v", err)
@@ -338,25 +339,145 @@ func TestRefreshAccountQuotaUsesConfiguredInterval(t *testing.T) {
 		t.Fatal("NextHealthCheckAt is nil")
 	}
 	delta := refreshed.NextHealthCheckAt.Sub(fixedNow)
-	if delta < 32*time.Second || delta > 48*time.Second {
-		t.Fatalf("next check delta = %s, want configured 40s with jitter", delta)
+	if delta < 12*time.Minute || delta > 18*time.Minute {
+		t.Fatalf("next check delta = %s, want configured 15m with jitter", delta)
 	}
 }
 
 func TestAccountQuotaRefreshDueUsesShortenedInterval(t *testing.T) {
 	observedAt := time.Date(2026, 7, 14, 3, 0, 0, 0, time.UTC)
-	oldNext := observedAt.Add(5 * time.Minute)
+	oldNext := observedAt.Add(time.Hour)
 	account := ClaudeCodeAccount{
 		ID:                "shortened-interval-account",
 		HealthStatus:      AccountHealthHealthy,
-		LastHealthCheckAt: &observedAt,
 		NextHealthCheckAt: &oldNext,
+		Quota: &AccountQuota{
+			Source:    "oauth_usage",
+			CheckedAt: &observedAt,
+			Probe:     &AccountQuotaProbe{RequestedAt: observedAt},
+		},
 	}
-	if !accountQuotaRefreshDue(account, observedAt.Add(time.Minute), 30*time.Second) {
-		t.Fatal("shortened interval should make the account due before the stored five-minute timestamp")
+	if !accountQuotaRefreshDue(account, observedAt.Add(20*time.Minute), 15*time.Minute) {
+		t.Fatal("shortened interval should make the account due before the stored one-hour timestamp")
 	}
-	if accountQuotaRefreshDue(account, observedAt.Add(time.Minute), 10*time.Minute) {
+	if accountQuotaRefreshDue(account, observedAt.Add(20*time.Minute), time.Hour) {
 		t.Fatal("lengthened interval should not retain the old earlier timestamp")
+	}
+}
+
+func TestEffectiveAccountQuotaModesAndLegacyMigration(t *testing.T) {
+	enabled := true
+	disabled := false
+	for _, test := range []struct {
+		name string
+		raw  AccountQuotaConfig
+		mode string
+		wait string
+	}{
+		{name: "default", raw: AccountQuotaConfig{}, mode: AccountQuotaModeManual, wait: "30m"},
+		{name: "legacy enabled", raw: AccountQuotaConfig{Enabled: &enabled, Interval: "5m"}, mode: AccountQuotaModeManual, wait: "30m"},
+		{name: "legacy disabled", raw: AccountQuotaConfig{Enabled: &disabled, Interval: "5m"}, mode: AccountQuotaModeDisabled, wait: "30m"},
+		{name: "scheduled", raw: AccountQuotaConfig{Mode: AccountQuotaModeScheduled, Interval: "15m", Concurrency: 4}, mode: AccountQuotaModeScheduled, wait: "15m"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := EffectiveAccountQuota(test.raw)
+			if got.Mode != test.mode || got.Interval != test.wait {
+				t.Fatalf("EffectiveAccountQuota() = %+v, want mode=%s interval=%s", got, test.mode, test.wait)
+			}
+		})
+	}
+	if ttl := accountQuotaFreshnessTTL(AccountQuotaConfig{Mode: AccountQuotaModeScheduled, Interval: "1h"}); ttl != 90*time.Minute {
+		t.Fatalf("scheduled freshness TTL = %s, want 90m", ttl)
+	}
+	if ttl := accountQuotaFreshnessTTL(AccountQuotaConfig{Mode: AccountQuotaModeManual, Interval: "1h"}); ttl != 15*time.Minute {
+		t.Fatalf("manual freshness TTL = %s, want 15m", ttl)
+	}
+}
+
+func TestRefreshAccountQuotaReusesRecentResult(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":10}}`))
+	}))
+	defer server.Close()
+	previousURL := claudeOAuthUsageURL
+	claudeOAuthUsageURL = server.URL
+	t.Cleanup(func() { claudeOAuthUsageURL = previousURL })
+	fixedNow := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+	previousNow := accountQuotaNow
+	accountQuotaNow = func() time.Time { return fixedNow }
+	t.Cleanup(func() { accountQuotaNow = previousNow })
+	auth := quotaTestAuth("recent-result-auth")
+	account, err := store.RegisterClaudeCodeAccountWithAuth(ctx, auth.ID, "recent@example.com", "", auth)
+	if err != nil {
+		t.Fatalf("RegisterClaudeCodeAccountWithAuth() error = %v", err)
+	}
+	first, err := RefreshAccountQuotaWithResult(ctx, &config.Config{}, store, account.ID, auth, nil)
+	if err != nil {
+		t.Fatalf("first refresh error = %v", err)
+	}
+	second, err := RefreshAccountQuotaWithResult(ctx, &config.Config{}, store, account.ID, auth, nil)
+	if err != nil {
+		t.Fatalf("second refresh error = %v", err)
+	}
+	if !first.NetworkPerformed || first.Cached || second.NetworkPerformed || !second.Cached {
+		t.Fatalf("refresh metadata first=%+v second=%+v", first, second)
+	}
+	if first.RequestedAt != fixedNow || second.RequestedAt != fixedNow || first.NextAllowedAt.Sub(fixedNow) != 3*time.Minute {
+		t.Fatalf("refresh timing first=%+v second=%+v", first, second)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("usage request count = %d, want 1", got)
+	}
+}
+
+func TestRefreshAccountQuotaReusesRecentFailureForOneMinute(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid request"}`))
+	}))
+	defer server.Close()
+	previousURL := claudeOAuthUsageURL
+	claudeOAuthUsageURL = server.URL
+	t.Cleanup(func() { claudeOAuthUsageURL = previousURL })
+	currentNow := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+	previousNow := accountQuotaNow
+	accountQuotaNow = func() time.Time { return currentNow }
+	t.Cleanup(func() { accountQuotaNow = previousNow })
+	auth := quotaTestAuth("recent-failure-auth")
+	account, err := store.RegisterClaudeCodeAccountWithAuth(ctx, auth.ID, "recent-failure@example.com", "", auth)
+	if err != nil {
+		t.Fatalf("RegisterClaudeCodeAccountWithAuth() error = %v", err)
+	}
+	first, firstErr := RefreshAccountQuotaWithResult(ctx, &config.Config{}, store, account.ID, auth, nil)
+	second, secondErr := RefreshAccountQuotaWithResult(ctx, &config.Config{}, store, account.ID, auth, nil)
+	if firstErr == nil || secondErr == nil {
+		t.Fatalf("refresh errors first=%v second=%v", firstErr, secondErr)
+	}
+	if first == nil || !first.NetworkPerformed || first.Cached || first.NextAllowedAt.Sub(currentNow) != time.Minute {
+		t.Fatalf("first failure metadata = %+v", first)
+	}
+	if second == nil || second.NetworkPerformed || !second.Cached || second.RequestedAt != first.RequestedAt {
+		t.Fatalf("second failure metadata = %+v", second)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("usage request count within failure cache = %d, want 1", got)
+	}
+
+	currentNow = currentNow.Add(time.Minute + time.Second)
+	third, thirdErr := RefreshAccountQuotaWithResult(ctx, &config.Config{}, store, account.ID, auth, nil)
+	if thirdErr == nil || third == nil || !third.NetworkPerformed || third.Cached {
+		t.Fatalf("third failure metadata=%+v error=%v", third, thirdErr)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("usage request count after failure cache = %d, want 2", got)
 	}
 }
 
@@ -384,27 +505,42 @@ func TestRefreshAccountQuotaSingleflightByAccount(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	errs := make(chan error, 2)
+	type refreshCall struct {
+		result *AccountQuotaRefreshResult
+		err    error
+	}
+	results := make(chan refreshCall, 2)
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, errRefresh := RefreshAccountQuota(ctx, &config.Config{}, store, account.ID, auth, nil)
-			errs <- errRefresh
+			result, errRefresh := RefreshAccountQuotaWithResult(ctx, &config.Config{}, store, account.ID, auth, nil)
+			results <- refreshCall{result: result, err: errRefresh}
 		}()
 	}
 	<-started
 	time.Sleep(25 * time.Millisecond)
 	close(release)
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("RefreshAccountQuota() error = %v", err)
+	close(results)
+	networkPerformed := 0
+	cached := 0
+	for call := range results {
+		if call.err != nil {
+			t.Fatalf("RefreshAccountQuota() error = %v", call.err)
+		}
+		if call.result.NetworkPerformed {
+			networkPerformed++
+		}
+		if call.result.Cached {
+			cached++
 		}
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("usage request count = %d, want 1", got)
+	}
+	if networkPerformed != 1 || cached != 1 {
+		t.Fatalf("singleflight metadata network=%d cached=%d, want 1/1", networkPerformed, cached)
 	}
 }
 

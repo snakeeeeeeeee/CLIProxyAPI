@@ -311,9 +311,10 @@ CREATE INDEX IF NOT EXISTS idx_claude_code_profile_snapshots_updated ON claude_c
 
 // Store wraps the SQLite resource pool database.
 type Store struct {
-	db       *sql.DB
-	path     string
-	initPath string
+	db                *sql.DB
+	path              string
+	initPath          string
+	quotaFreshnessTTL time.Duration
 }
 
 const databaseInstanceIDConfigKey = "database_instance_id"
@@ -381,10 +382,20 @@ func Open(configFilePath string, cfg *config.Config) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.migrateQuotaAndProxyPolicyV10(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := store.ensureDatabaseInstanceID(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	doc, err := store.GetConfig(context.Background())
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	store.quotaFreshnessTTL = accountQuotaFreshnessTTL(EffectiveAccountQuota(doc.AccountQuota))
 	return store, nil
 }
 
@@ -578,7 +589,7 @@ func (s *Store) migrateClaudeCodeProfileRevision(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	const marker = "claude_code_profile_2_1_207_r3"
+	const marker = "claude_code_profile_2_1_220_r1"
 	var markerValue string
 	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, marker).Scan(&markerValue); err == nil {
 		return nil
@@ -595,16 +606,21 @@ func (s *Store) migrateClaudeCodeProfileRevision(ctx context.Context) error {
 	}
 	isR2Baseline := isExactBuiltinClaudeCodeProfileR2(storedProfile)
 	requiresUpgrade := shouldMigrateBuiltinClaudeCodeProfile(storedProfile) || isR2Baseline
-	oldProfile := EffectiveClaudeCodeProfile(builtinClaudeCodeProfileR2())
-	oldFingerprint := ClaudeCodeProfileFingerprint(oldProfile)
-	oldDefaultOverhead := ClaudeCodeProfileInjectedOverheadTokens(oldProfile)
+	oldR2Profile := effectiveClaudeCodeProfileFromNormalized(builtinClaudeCodeProfileR2())
+	oldR3Profile := effectiveClaudeCodeProfileFromNormalized(builtinClaudeCodeProfileR3())
+	oldR2Fingerprint := ClaudeCodeProfileFingerprint(oldR2Profile)
+	oldR3Fingerprint := ClaudeCodeProfileFingerprint(oldR3Profile)
+	oldR2DefaultOverhead := ClaudeCodeProfileInjectedOverheadTokens(oldR2Profile)
+	oldR3DefaultOverhead := ClaudeCodeProfileInjectedOverheadTokens(oldR3Profile)
 	doc, err := s.GetConfig(ctx)
 	if err != nil {
 		return err
 	}
 	if requiresUpgrade {
 		doc.Profile = defaultClaudeCodeProfile()
-		if doc.ClaudeCode.Usage.SystemPromptOverheadTokens == 1909 || doc.ClaudeCode.Usage.SystemPromptOverheadTokens == oldDefaultOverhead {
+		if doc.ClaudeCode.Usage.SystemPromptOverheadTokens == 1909 ||
+			doc.ClaudeCode.Usage.SystemPromptOverheadTokens == oldR2DefaultOverhead ||
+			doc.ClaudeCode.Usage.SystemPromptOverheadTokens == oldR3DefaultOverhead {
 			doc.ClaudeCode.Usage.SystemPromptOverheadTokens = DefaultCleanInputOverheadTokens
 		}
 	}
@@ -617,7 +633,7 @@ func (s *Store) migrateClaudeCodeProfileRevision(ctx context.Context) error {
 		if err := savePoolConfigTx(ctx, tx, doc); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE claude_code_usage_calibrations SET status = ?, updated_at = ? WHERE profile_fingerprint = ? AND status = ?`, UsageCalibrationStale, dbTime(time.Now()), oldFingerprint, UsageCalibrationCalibrated); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE claude_code_usage_calibrations SET status = ?, updated_at = ? WHERE profile_fingerprint IN (?, ?) AND status = ?`, UsageCalibrationStale, dbTime(time.Now()), oldR2Fingerprint, oldR3Fingerprint, UsageCalibrationCalibrated); err != nil {
 			return fmt.Errorf("mark old Claude Code usage calibrations stale: %w", err)
 		}
 	}
@@ -1147,6 +1163,7 @@ func (s *Store) GetConfig(ctx context.Context) (*ConfigFile, error) {
 				return nil, fmt.Errorf("decode proxy health config: %w", err)
 			}
 		case "account_quota_json":
+			doc.AccountQuota = AccountQuotaConfig{}
 			if err := json.Unmarshal([]byte(value), &doc.AccountQuota); err != nil {
 				return nil, fmt.Errorf("decode account quota config: %w", err)
 			}
@@ -1173,6 +1190,42 @@ func (s *Store) GetConfig(ctx context.Context) (*ConfigFile, error) {
 	}
 	normalizeConfigFile(doc)
 	return doc, nil
+}
+
+func (s *Store) migrateQuotaAndProxyPolicyV10(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	const marker = "account_quota_proxy_policy_v10"
+	var value string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM pool_config WHERE key = ?`, marker).Scan(&value); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read quota/proxy policy migration marker: %w", err)
+	}
+	doc, err := s.GetConfig(ctx)
+	if err != nil {
+		return err
+	}
+	doc.AccountQuota = EffectiveAccountQuota(doc.AccountQuota)
+	doc.ProxyHealth.TestURL = defaultConfigFile().ProxyHealth.TestURL
+	doc.ProxyHealth.OptionalExitIPURL = ""
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin quota/proxy policy migration: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	if err := savePoolConfigTx(ctx, tx, doc); err != nil {
+		return err
+	}
+	now := dbTime(time.Now())
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pool_config(key, value, created_at, updated_at) VALUES(?, '1', ?, ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at`, marker, now, now); err != nil {
+		return fmt.Errorf("write quota/proxy policy migration marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit quota/proxy policy migration: %w", err)
+	}
+	return nil
 }
 
 func savePoolConfigTx(ctx context.Context, tx *sql.Tx, doc *ConfigFile) error {
@@ -1237,6 +1290,33 @@ func (s *Store) SaveClaudeCodePoolConfig(ctx context.Context, cfg ClaudeCodePool
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit save claude code pool config: %w", err)
+	}
+	return s.GetConfig(ctx)
+}
+
+// SaveAccountQuotaConfig persists the active OAuth usage collection policy.
+func (s *Store) SaveAccountQuotaConfig(ctx context.Context, cfg AccountQuotaConfig) (*ConfigFile, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("resource pool store is nil")
+	}
+	doc, err := s.GetConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	doc.AccountQuota = EffectiveAccountQuota(cfg)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin save account quota config: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	if err := savePoolConfigTx(ctx, tx, doc); err != nil {
+		return nil, err
+	}
+	if err := insertEventTx(ctx, tx, "account_quota.config", "account quota collection config updated", nil); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit save account quota config: %w", err)
 	}
 	return s.GetConfig(ctx)
 }
@@ -1608,6 +1688,11 @@ func (s *Store) UnbindProxy(ctx context.Context, id string) error {
 
 // UpdateProxyHealth stores the result of one proxy health check.
 func (s *Store) UpdateProxyHealth(ctx context.Context, id string, ok bool, latency time.Duration, checkErr error, failureThreshold int) (*HealthResult, error) {
+	return s.UpdateProxyHealthWithExitIP(ctx, id, ok, latency, "", checkErr, failureThreshold)
+}
+
+// UpdateProxyHealthWithExitIP stores health and the verified proxy exit address.
+func (s *Store) UpdateProxyHealthWithExitIP(ctx context.Context, id string, ok bool, latency time.Duration, exitIP string, checkErr error, failureThreshold int) (*HealthResult, error) {
 	proxy, err := s.GetProxy(ctx, id)
 	if err != nil {
 		return nil, err
@@ -1639,16 +1724,36 @@ func (s *Store) UpdateProxyHealth(ctx context.Context, id string, ok bool, laten
 			lastError = checkErr.Error()
 		}
 	}
-	if _, err := s.db.ExecContext(ctx, `
+	exitIP = strings.TrimSpace(exitIP)
+	exitChanged := ok && exitIP != "" && strings.TrimSpace(proxy.ExitIP) != "" && !strings.EqualFold(strings.TrimSpace(proxy.ExitIP), exitIP)
+	if !ok || exitIP == "" {
+		exitIP = strings.TrimSpace(proxy.ExitIP)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin update proxy health: %w", err)
+	}
+	defer rollbackUnlessCommitted(tx)
+	if _, err := tx.ExecContext(ctx, `
 UPDATE proxy_resources
-SET health_status = ?, latency_ms = ?, consecutive_failures = ?, last_checked_at = ?, last_error = ?, updated_at = ?
+SET health_status = ?, exit_ip = ?, latency_ms = ?, consecutive_failures = ?, last_checked_at = ?, last_error = ?, updated_at = ?
 WHERE id = ?
-`, status, latencyMS, failures, dbTime(now), lastError, dbTime(now), proxy.ID); err != nil {
+`, status, exitIP, latencyMS, failures, dbTime(now), lastError, dbTime(now), proxy.ID); err != nil {
 		return nil, fmt.Errorf("update proxy health: %w", err)
+	}
+	if exitChanged {
+		if err := insertEventTx(ctx, tx, "proxy_exit_changed", "proxy exit IP changed", map[string]string{"proxy_id": proxy.ID}); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit update proxy health: %w", err)
 	}
 	return &HealthResult{
 		ID:                  proxy.ID,
 		HealthStatus:        status,
+		ExitIP:              exitIP,
+		ExitChanged:         exitChanged,
 		LatencyMS:           latencyMS,
 		ConsecutiveFailures: failures,
 		LastCheckedAt:       &now,
@@ -1695,6 +1800,10 @@ func (s *Store) RegisterClaudeCodeAccountWithAuthReservationInPool(ctx context.C
 	if errAuthJSON != nil {
 		return nil, errAuthJSON
 	}
+	interval, errInterval := s.accountQuotaInterval(ctx)
+	if errInterval != nil {
+		interval = quotaDefaultInterval
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin register claude code account: %w", err)
@@ -1722,6 +1831,7 @@ func (s *Store) RegisterClaudeCodeAccountWithAuthReservationInPool(ctx context.C
 	now := time.Now()
 	if errors.Is(err, sql.ErrNoRows) {
 		accountID = uuid.NewString()
+		nextQuotaAt := nextAccountHealthCheck(accountID, now, interval)
 		if proxyResourceID != "" {
 			if err := assertProxyBindableTx(ctx, tx, accountID, proxyResourceID, reservationOwner, reservationItem); err != nil {
 				return nil, err
@@ -1730,10 +1840,11 @@ func (s *Store) RegisterClaudeCodeAccountWithAuthReservationInPool(ctx context.C
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO claude_code_accounts(id, pool_id, auth_id, cloak_user_id, auth_json, email, enabled, health_status, next_health_check_at, priority, proxy_resource_id, excluded_models_json, created_at, updated_at)
 VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?, 0, NULLIF(?, ''), '[]', ?, ?)
-`, accountID, poolID, authID, generateClaudeCodeCloakUserID(), authJSON, email, AccountHealthChecking, dbTime(now), proxyResourceID, dbTime(now), dbTime(now)); err != nil {
+`, accountID, poolID, authID, generateClaudeCodeCloakUserID(), authJSON, email, AccountHealthHealthy, dbTime(nextQuotaAt), proxyResourceID, dbTime(now), dbTime(now)); err != nil {
 			return nil, mapSQLiteConstraintError(err, "claude code account")
 		}
 	} else {
+		nextQuotaAt := nextAccountHealthCheck(accountID, now, interval)
 		if proxyResourceID != "" {
 			if err := assertProxyBindableTx(ctx, tx, accountID, proxyResourceID, reservationOwner, reservationItem); err != nil {
 				return nil, err
@@ -1751,7 +1862,7 @@ SET email = CASE WHEN ? = '' THEN email ELSE ? END,
     proxy_resource_id = CASE WHEN ? = '' THEN proxy_resource_id ELSE ? END,
     updated_at = ?
 WHERE id = ?
-`, email, email, authJSON, authJSON, AccountHealthChecking, dbTime(now), proxyResourceID, proxyResourceID, dbTime(now), accountID); err != nil {
+`, email, email, authJSON, authJSON, AccountHealthHealthy, dbTime(nextQuotaAt), proxyResourceID, proxyResourceID, dbTime(now), accountID); err != nil {
 			return nil, mapSQLiteConstraintError(err, "claude code account")
 		}
 	}
@@ -2091,13 +2202,31 @@ func (s *Store) BindAccountProxy(ctx context.Context, accountID, proxyID string)
 	if proxyID == "" {
 		return nil, fmt.Errorf("proxy id is required")
 	}
-	return s.PatchAccount(ctx, accountID, AccountPatch{ProxyResourceID: &proxyID})
+	return s.changeAccountProxy(ctx, accountID, proxyID)
 }
 
 // UnbindAccountProxy clears the proxy binding for one Claude Code account.
 func (s *Store) UnbindAccountProxy(ctx context.Context, accountID string) (*ClaudeCodeAccount, error) {
-	empty := ""
-	return s.PatchAccount(ctx, accountID, AccountPatch{ProxyResourceID: &empty})
+	return s.changeAccountProxy(ctx, accountID, "")
+}
+
+func (s *Store) changeAccountProxy(ctx context.Context, accountID, proxyID string) (*ClaudeCodeAccount, error) {
+	account, err := s.GetAccount(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	if account.RuntimeCapacity != nil && account.RuntimeCapacity.InFlight > 0 {
+		return nil, ErrAccountProxyChangeInFlight
+	}
+	proxyID = strings.TrimSpace(proxyID)
+	updated, err := s.PatchAccount(ctx, account.ID, AccountPatch{ProxyResourceID: &proxyID})
+	if err != nil {
+		return nil, err
+	}
+	scope := AccountRoutingScope(account.PoolID)
+	claudeapipool.ResetScopedRouteCooling(scope, account.AuthID)
+	claudeapipool.ClearScopedAccountBindings(scope, account.AuthID)
+	return updated, nil
 }
 
 // DeleteAccount removes one Claude Code account row and releases its proxy binding.

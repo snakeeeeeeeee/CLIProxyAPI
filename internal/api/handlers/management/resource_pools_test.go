@@ -133,6 +133,153 @@ func TestGetClaudeCodeAccountPoolDiagnostics(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeActiveQuotaHandlersRequireConfirmation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{}
+	tests := []struct {
+		name    string
+		body    string
+		handler func(*gin.Context)
+	}{
+		{name: "refresh", body: `{}`, handler: handler.RefreshClaudeCodeAccountQuota},
+		{name: "recheck", body: `{}`, handler: handler.RecheckClaudeCodeAccount},
+		{name: "batch", body: `{"action":"refresh-quota","ids":["account-a"]}`, handler: handler.BatchClaudeCodeAccounts},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(test.body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			ctx.Params = gin.Params{{Key: "id", Value: "account-a"}}
+			test.handler(ctx)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "confirmation_required") {
+				t.Fatalf("status = %d body=%s, want confirmation_required", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestRefreshClaudeCodeAccountQuotaRejectsDisabledMode(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(filepath.Join(dir, "resource-pools.yaml"), []byte("database-path: resource-pools.db\n"), 0o600); err != nil {
+		t.Fatalf("write resource pool config: %v", err)
+	}
+	cfg := &config.Config{ResourcePools: config.ResourcePoolsConfig{Enabled: true, ConfigFile: "resource-pools.yaml"}}
+	store, err := resourcepool.Open(configPath, cfg)
+	if err != nil {
+		t.Fatalf("resourcepool.Open() error = %v", err)
+	}
+	if _, err := store.SaveAccountQuotaConfig(context.Background(), resourcepool.AccountQuotaConfig{Mode: resourcepool.AccountQuotaModeDisabled}); err != nil {
+		_ = store.Close()
+		t.Fatalf("SaveAccountQuotaConfig() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close resource pool store: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"confirmed":true}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Params = gin.Params{{Key: "id", Value: "account-a"}}
+	handler := &Handler{cfg: cfg, configFilePath: configPath}
+	handler.RefreshClaudeCodeAccountQuota(ctx)
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "quota_active_collection_disabled") {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPutClaudeCodeAccountQuotaConfigNormalizesPolicy(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(filepath.Join(dir, "resource-pools.yaml"), []byte("database-path: resource-pools.db\n"), 0o600); err != nil {
+		t.Fatalf("write resource pool config: %v", err)
+	}
+	cfg := &config.Config{ResourcePools: config.ResourcePoolsConfig{Enabled: true, ConfigFile: "resource-pools.yaml"}}
+	handler := &Handler{cfg: cfg, configFilePath: configPath}
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/quota-config", strings.NewReader(`{"mode":"scheduled","interval":"15m","concurrency":4}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.PutClaudeCodeAccountQuotaConfig(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Effective resourcepool.AccountQuotaConfig `json:"effective"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode quota config response: %v", err)
+	}
+	if response.Effective.Mode != resourcepool.AccountQuotaModeScheduled || response.Effective.Interval != "15m" || response.Effective.Concurrency != 4 {
+		t.Fatalf("effective quota config = %+v", response.Effective)
+	}
+}
+
+func TestResolveClaudeCodeOAuthProxyRequiresMatchingBinding(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(filepath.Join(dir, "resource-pools.yaml"), []byte("database-path: resource-pools.db\n"), 0o600); err != nil {
+		t.Fatalf("write resource pool config: %v", err)
+	}
+	cfg := &config.Config{
+		SDKConfig:     config.SDKConfig{ProxyURL: "http://global-proxy.invalid:8080"},
+		ResourcePools: config.ResourcePoolsConfig{Enabled: true, ConfigFile: "resource-pools.yaml"},
+	}
+	store, err := resourcepool.Open(configPath, cfg)
+	if err != nil {
+		t.Fatalf("resourcepool.Open() error = %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	first, err := store.CreateProxy(context.Background(), resourcepool.ProxyResourceSeed{ProxyURL: "http://127.0.0.1:19080"})
+	if err != nil {
+		t.Fatalf("create first proxy: %v", err)
+	}
+	second, err := store.CreateProxy(context.Background(), resourcepool.ProxyResourceSeed{ProxyURL: "http://127.0.0.1:19081"})
+	if err != nil {
+		t.Fatalf("create second proxy: %v", err)
+	}
+	handler := &Handler{cfg: cfg, configFilePath: configPath}
+	gin.SetMode(gin.TestMode)
+	resolve := func(rawQuery, owner string) (string, string, string, error) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/?"+rawQuery, nil)
+		return handler.resolveClaudeCodeOAuthProxy(ctx, owner)
+	}
+
+	proxyURL, bindID, reservedID, err := resolve("pool=claude-code&login_proxy=direct&bind_proxy_resource_id=none", "direct-owner")
+	if err != nil || proxyURL != "direct" || bindID != "" || reservedID != "" {
+		t.Fatalf("direct unbound result url=%q bind=%q reserved=%q err=%v", proxyURL, bindID, reservedID, err)
+	}
+	if _, _, _, err := resolve("pool=claude-code&login_proxy=direct&bind_proxy_resource_id="+first.ID, "direct-bound-owner"); err == nil || !strings.Contains(err.Error(), "direct login cannot bind") {
+		t.Fatalf("direct bound error = %v", err)
+	}
+
+	query := "pool=claude-code&login_proxy=id&proxy_resource_id=" + first.ID + "&bind_proxy_resource_id=" + first.ID
+	proxyURL, bindID, reservedID, err = resolve(query, "matching-owner")
+	if err != nil || proxyURL != first.ProxyURL || bindID != first.ID || reservedID != first.ID {
+		t.Fatalf("matching proxy result url=%q bind=%q reserved=%q err=%v", proxyURL, bindID, reservedID, err)
+	}
+	if err := store.ReleaseProxyReservations(context.Background(), "matching-owner"); err != nil {
+		t.Fatalf("release matching reservation: %v", err)
+	}
+
+	query = "pool=claude-code&login_proxy=id&proxy_resource_id=" + first.ID + "&bind_proxy_resource_id=none"
+	if _, _, _, err := resolve(query, "unbound-owner"); err == nil || !strings.Contains(err.Error(), "must bind the same proxy") {
+		t.Fatalf("proxy unbound error = %v", err)
+	}
+
+	query = "pool=claude-code&login_proxy=id&proxy_resource_id=" + first.ID + "&bind_proxy_resource_id=" + second.ID
+	if _, _, _, err := resolve(query, "mismatch-owner"); err == nil || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("proxy mismatch error = %v", err)
+	}
+}
+
 func TestGetClaudeCodePoolAPIKeySecret(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")

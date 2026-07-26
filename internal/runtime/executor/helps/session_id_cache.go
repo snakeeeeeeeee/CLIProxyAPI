@@ -62,6 +62,13 @@ func purgeExpiredSessionIDs() {
 	sessionIDCacheMu.Unlock()
 }
 
+// ClearCachedSessionIDs removes local temporary Sessions after an account network binding changes.
+func ClearCachedSessionIDs() {
+	sessionIDCacheMu.Lock()
+	clear(sessionIDCache)
+	sessionIDCacheMu.Unlock()
+}
+
 func sessionIDCacheKey(scope string) string {
 	sum := sha256.Sum256([]byte(scope))
 	return hex.EncodeToString(sum[:])

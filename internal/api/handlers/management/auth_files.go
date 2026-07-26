@@ -2182,8 +2182,17 @@ func (h *Handler) resolveClaudeCodeOAuthProxy(c *gin.Context, reservationOwner s
 		bindProxyResourceID = ""
 		bindExplicitNone = true
 	}
+	if mode == "" && proxyResourceID == "" {
+		mode = "direct"
+	}
+	if mode == "" && proxyResourceID != "" {
+		mode = "id"
+	}
 	if mode == "direct" {
-		return "direct", bindProxyResourceID, "", nil
+		if bindProxyResourceID != "" {
+			return "", "", "", fmt.Errorf("direct login cannot bind a proxy resource")
+		}
+		return "direct", "", "", nil
 	}
 	h.mu.Lock()
 	cfg := h.cfg
@@ -2212,7 +2221,7 @@ func (h *Handler) resolveClaudeCodeOAuthProxy(c *gin.Context, reservationOwner s
 		}
 	}
 	if proxyResourceID == "" {
-		return "", bindProxyResourceID, "", nil
+		return "", "", "", fmt.Errorf("proxy login requires a proxy resource")
 	}
 	if mode != "auto" {
 		if _, err := store.ReserveProxy(ctx, proxyResourceID, reservationOwner, "login", "oauth-login", 10*time.Minute); err != nil {
@@ -2232,14 +2241,20 @@ func (h *Handler) resolveClaudeCodeOAuthProxy(c *gin.Context, reservationOwner s
 		_ = store.ReleaseProxyReservations(ctx, reservationOwner)
 		return "", "", "", fmt.Errorf("proxy resource is unhealthy")
 	}
+	if bindExplicitNone || bindProxyResourceID == "" {
+		_ = store.ReleaseProxyReservations(ctx, reservationOwner)
+		return "", "", "", fmt.Errorf("proxy login must bind the same proxy resource")
+	}
+	if bindProxyResourceID != proxyResourceID {
+		_ = store.ReleaseProxyReservations(ctx, reservationOwner)
+		return "", "", "", fmt.Errorf("login proxy and bound proxy must match")
+	}
 	return proxy.ProxyURL, bindProxyResourceID, proxyResourceID, nil
 }
 
 func (h *Handler) saveClaudeCodeOAuthAccount(ctx context.Context, record *coreauth.Auth, email, proxyResourceID string) (string, error) {
 	return h.saveClaudeCodeOAuthAccountWithReservationInPool(ctx, resourcepool.DefaultAccountPoolID, record, email, proxyResourceID, "", "")
 }
-
-var claudeCodeInitialProbeSem = make(chan struct{}, 2)
 
 func (h *Handler) saveClaudeCodeOAuthAccountWithReservation(ctx context.Context, record *coreauth.Auth, email, proxyResourceID, reservationOwner, reservationItem string) (string, error) {
 	return h.saveClaudeCodeOAuthAccountWithReservationInPool(ctx, resourcepool.DefaultAccountPoolID, record, email, proxyResourceID, reservationOwner, reservationItem)
@@ -2281,39 +2296,7 @@ func (h *Handler) saveClaudeCodeOAuthAccountWithReservationInPool(ctx context.Co
 		resourcepool.PublishProxyChanged(proxyResourceID, "bind")
 	}
 	resourcepool.PublishStatsChanged("account")
-	h.startClaudeCodeAccountInitialProbe(account.ID)
 	return "resource-pools.db:" + record.ID, nil
-}
-
-func (h *Handler) startClaudeCodeAccountInitialProbe(accountID string) {
-	accountID = strings.TrimSpace(accountID)
-	if accountID == "" {
-		return
-	}
-	h.mu.Lock()
-	cfg := h.cfg
-	configPath := h.configFilePath
-	h.mu.Unlock()
-	if cfg == nil {
-		return
-	}
-	go func() {
-		select {
-		case claudeCodeInitialProbeSem <- struct{}{}:
-			defer func() { <-claudeCodeInitialProbeSem }()
-		case <-time.After(5 * time.Minute):
-			return
-		}
-		store, err := resourcepool.Open(configPath, cfg)
-		if err != nil {
-			return
-		}
-		defer closeResourcePoolStore(store)
-		_, _ = resourcepool.RefreshStoredAccountQuota(context.Background(), configPath, cfg, store, accountID)
-		h.triggerConfigReload(context.Background())
-		resourcepool.PublishAccountChanged(accountID, "initial_probe")
-		resourcepool.PublishStatsChanged("account_health")
-	}()
 }
 
 func (h *Handler) releaseOAuthProxyReservation(owner string) {

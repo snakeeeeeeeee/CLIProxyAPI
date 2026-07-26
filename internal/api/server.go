@@ -1070,6 +1070,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/claude-code-account-pool/diagnostics", s.mgmt.GetClaudeCodeAccountPoolDiagnostics)
 		mgmt.PUT("/claude-code-account-pool/config", s.mgmt.PutClaudeCodePoolConfig)
 		mgmt.PATCH("/claude-code-account-pool/config", s.mgmt.PutClaudeCodePoolConfig)
+		mgmt.PUT("/claude-code-account-pool/quota-config", s.mgmt.PutClaudeCodeAccountQuotaConfig)
+		mgmt.PATCH("/claude-code-account-pool/quota-config", s.mgmt.PutClaudeCodeAccountQuotaConfig)
 		mgmt.GET("/claude-code-account-pool/profile", s.mgmt.GetClaudeCodeProfile)
 		mgmt.PUT("/claude-code-account-pool/profile", s.mgmt.PutClaudeCodeProfile)
 		mgmt.PATCH("/claude-code-account-pool/profile", s.mgmt.PutClaudeCodeProfile)

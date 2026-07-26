@@ -53,6 +53,7 @@ import {
   AccountAvailabilitySummary,
   AccountBatchAction,
   AccountCapacity,
+  AccountQuotaConfig,
   AccountModelStatus,
   AccountQuota,
   QuotaWindowState,
@@ -485,6 +486,7 @@ function App() {
       logs={poolLogs}
       calibrations={usageCalibrations}
       diagnostics={diagnostics}
+      quotaConfig={configQuery.data?.account_quota || defaultAccountQuotaConfig()}
       diagnosticsLoading={diagnosticsQuery.isLoading || diagnosticsQuery.isFetching}
       diagnosticsError={diagnosticsQuery.error}
       forcedTab={forcedTab}
@@ -833,6 +835,7 @@ function AccountsView({
   logs,
   calibrations,
   diagnostics,
+  quotaConfig,
   diagnosticsLoading,
   diagnosticsError,
   forcedTab,
@@ -857,6 +860,7 @@ function AccountsView({
   logs: AccountPoolLogLine[];
   calibrations?: UsageCalibrationResponse;
   diagnostics?: AccountPoolDiagnostics;
+  quotaConfig: AccountQuotaConfig;
   diagnosticsLoading: boolean;
   diagnosticsError: unknown;
   forcedTab?: "accounts" | "metrics" | "usage" | "events" | "config";
@@ -867,6 +871,7 @@ function AccountsView({
   onRefreshDiagnostics: () => Promise<void>;
 }) {
   const effectiveConfig = config?.effective || defaultPoolEffectiveConfig();
+  const activeQuotaCollectionDisabled = quotaConfig.mode === "disabled";
   const [selectedTab, setSelectedTab] = useState<"accounts" | "metrics" | "usage" | "events" | "config">("accounts");
   const activeTab = forcedTab || selectedTab;
   const [searchQuery, setSearchQuery] = useState("");
@@ -1002,26 +1007,28 @@ function AccountsView({
 		},
 		onError: (error) => onToast(`移动失败：${errorMessage(error)}`, "danger")
 	});
-	  const quotaMutation = useMutation({
+  const quotaMutation = useMutation({
     mutationFn: api.refreshAccountQuota,
     onSuccess: async (data) => {
       await onDone();
       if (data.warning) {
         onToast(`额度刷新异常：${data.warning}`, "danger");
+      } else if (data.cached) {
+        onToast("已复用近期额度查询结果");
       } else {
         onToast("额度已刷新");
       }
     },
     onError: (error) => onToast(`额度刷新失败：${errorMessage(error)}`, "danger")
-	  });
-	  const recheckMutation = useMutation({
-	    mutationFn: api.recheckAccount,
-	    onSuccess: async () => {
-	      await onDone();
-	      onToast("账号检查通过，已恢复调度");
-	    },
-	    onError: (error) => onToast(`重新检查失败：${errorMessage(error)}`, "danger")
-	  });
+  });
+  const recheckMutation = useMutation({
+    mutationFn: api.recheckAccount,
+    onSuccess: async () => {
+      await onDone();
+      onToast("账号检查通过，已恢复调度");
+    },
+    onError: (error) => onToast(`重新检查失败：${errorMessage(error)}`, "danger")
+  });
   const tokenMutation = useMutation({
     mutationFn: api.refreshAccountToken,
     onSuccess: async (data) => {
@@ -1035,7 +1042,8 @@ function AccountsView({
     onError: (error) => onToast(`Token 刷新失败：${errorMessage(error)}`, "danger")
   });
   const batchMutation = useMutation({
-    mutationFn: ({ action, ids }: { action: AccountBatchAction; ids: string[] }) => api.batchAccounts(action, ids),
+    mutationFn: ({ action, ids, confirmed }: { action: AccountBatchAction; ids: string[]; confirmed?: boolean }) =>
+      api.batchAccounts(action, ids, confirmed),
     onSuccess: async (data) => {
       await onDone();
       if (data.failed > 0) {
@@ -1055,10 +1063,41 @@ function AccountsView({
     if (selectedCount === 0 || batchMutation.isPending) {
       return;
     }
+    if (action === "refresh-quota") {
+      if (activeQuotaCollectionDisabled) {
+        onToast("当前已禁用主动额度采集", "danger");
+        return;
+      }
+      if (!window.confirm(`将为选中的 ${selectedCount} 个账号分别发起一次真实 Anthropic 额度请求，确认继续？`)) {
+        return;
+      }
+    }
     if (action === "delete" && !window.confirm(`确认删除选中的 ${selectedCount} 个账号？绑定代理会自动释放。`)) {
       return;
     }
-    batchMutation.mutate({ action, ids: selectedIDs });
+    batchMutation.mutate({ action, ids: selectedIDs, confirmed: action === "refresh-quota" });
+  };
+
+  const refreshQuota = (account: ClaudeCodeAccount) => {
+    if (activeQuotaCollectionDisabled) {
+      onToast("当前已禁用主动额度采集", "danger");
+      return;
+    }
+    if (!window.confirm(`刷新 ${account.email || account.auth_id} 的额度会向 Anthropic 发送一次真实请求，确认继续？`)) {
+      return;
+    }
+    quotaMutation.mutate(account.id);
+  };
+
+  const recheckAccount = (account: ClaudeCodeAccount) => {
+    if (activeQuotaCollectionDisabled) {
+      onToast("当前已禁用主动额度采集", "danger");
+      return;
+    }
+    if (!window.confirm(`重新检查 ${account.email || account.auth_id} 会向 Anthropic 发送一次真实额度请求，确认继续？`)) {
+      return;
+    }
+    recheckMutation.mutate(account.id);
   };
 
   if (loading) {
@@ -1118,8 +1157,9 @@ function AccountsView({
             onBind={onBind}
             onUnbind={(account) => unbindMutation.mutate(account.id)}
             onReset={(account) => resetMutation.mutate(account.id)}
-            onRefreshQuota={(account) => quotaMutation.mutate(account.id)}
+            onRefreshQuota={refreshQuota}
             quotaPending={quotaMutation.isPending}
+            quotaDisabled={activeQuotaCollectionDisabled}
 			onMove={(row) => setMoveRow(row)}
 	            onToggle={(account) => patchMutation.mutate({ accountID: account.id, schedulable: !account.schedulable })}
             onDelete={(account) => {
@@ -1153,6 +1193,7 @@ function AccountsView({
           <ClaudeCodeProfilePanel profile={profile} />
           <ClaudeCodeProfileSnapshotsPanel snapshots={profileSnapshots} profile={profile} onDone={onDone} onToast={onToast} />
           <AccountPoolConfigPanel config={effectiveConfig} path={config?.path} onDone={onDone} onToast={onToast} />
+          <AccountQuotaCollectionPanel config={quotaConfig} onDone={onDone} onToast={onToast} />
           <RoutingProtectionPanel config={effectiveConfig} onDone={onDone} onToast={onToast} />
         </div>
       )}
@@ -1165,13 +1206,14 @@ function AccountsView({
         onBind={onBind}
         onUnbind={(account) => unbindMutation.mutate(account.id)}
         onReset={(account) => resetMutation.mutate(account.id)}
-        onRefreshQuota={(account) => quotaMutation.mutate(account.id)}
+        onRefreshQuota={refreshQuota}
         quotaPending={quotaMutation.isPending}
+        quotaDisabled={activeQuotaCollectionDisabled}
 		pools={pools}
 		onMove={(account) => setMoveRow({ account, runtime: detailRow?.runtime })}
         onRefreshToken={(account) => tokenMutation.mutate(account.id)}
 	        tokenPending={tokenMutation.isPending}
-	        onRecheck={(account) => recheckMutation.mutate(account.id)}
+	        onRecheck={recheckAccount}
 	        recheckPending={recheckMutation.isPending}
 	        onToggle={(account) => patchMutation.mutate({ accountID: account.id, schedulable: !account.schedulable })}
         onDelete={(account) => {
@@ -1274,15 +1316,19 @@ function RuntimeDiagnosticsPanel({
                 icon={<Network className="h-4 w-4" />}
                 label="Profile / 传输"
                 value={`${diagnostics.profile.revision || "-"} · ${diagnostics.profile.tls_alpn || "-"}`}
-                detail={`${shortText(diagnostics.profile.fingerprint, 12)} · Headers ${diagnostics.profile.header_order_count}/${diagnostics.profile.header_count}`}
-                foot={diagnostics.profile.tls_profile || "-"}
+                detail={`${diagnostics.profile.baseline || "-"} · ${diagnostics.profile.custom_offset ? "存在自定义偏移" : "固定内置基线"}`}
+                foot={`${diagnostics.profile.timeout_policy || "-"} · ${shortText(diagnostics.profile.fingerprint, 12)}`}
               />
               <DiagnosticSummaryTile
                 icon={<Activity className="h-4 w-4" />}
-                label="额度调度"
-                value={diagnostics.quota.enabled ? `每 ${diagnostics.quota.interval}` : "已停用"}
-                detail={`扫描 ${diagnostics.quota.scheduler_tick} · 并发 ${diagnostics.quota.concurrency}`}
-                foot={`全局出口 ${diagnosticProxyModeText(diagnostics.quota.global_proxy_mode)}`}
+                label="额度采集"
+                value={accountQuotaModeText(diagnostics.quota.mode)}
+                detail={diagnostics.quota.mode === "scheduled"
+                  ? `每 ${diagnostics.quota.interval} · 扫描 ${diagnostics.quota.scheduler_tick} · 并发 ${diagnostics.quota.concurrency}`
+                  : `最近主动采集 ${formatTime(diagnostics.quota.last_active_at)}`}
+                foot={diagnostics.quota.mode === "scheduled"
+                  ? `下次计划 ${formatTime(diagnostics.quota.next_scheduled_at)}`
+                  : "未绑定账号直连 · 已绑定账号严格使用绑定代理"}
               />
             </div>
 
@@ -1306,7 +1352,7 @@ function RuntimeDiagnosticsPanel({
                   <tr>
                     <th className="w-[13%] px-3 py-2 font-medium">状态</th>
                     <th className="w-[16%] px-3 py-2 font-medium">账号指纹</th>
-                    <th className="w-[18%] px-3 py-2 font-medium">池与出口</th>
+                    <th className="w-[18%] px-3 py-2 font-medium">池与网络</th>
                     <th className="w-[14%] px-3 py-2 font-medium">Token</th>
                     <th className="w-[20%] px-3 py-2 font-medium">额度采集</th>
                     <th className="w-[19%] px-3 py-2 font-medium">问题</th>
@@ -1423,18 +1469,21 @@ function DiagnosticField({ label, value }: { label: string; value: string }) {
 }
 
 function diagnosticAccountProxyText(account: AccountPoolDiagnostics["accounts"][number]) {
-  if (account.proxy_resource_id) {
-    return `${account.proxy_resource_id}${account.last_observed_exit_ip ? ` · ${account.last_observed_exit_ip}` : ""}`;
+  const detail = account.proxy_resource_id
+    ? `${account.proxy_resource_id}${account.last_observed_exit_ip ? ` · ${account.last_observed_exit_ip}` : ""}`
+    : account.last_observed_exit_ip || "";
+  switch ((account.network_mode || "").toLowerCase()) {
+    case "bound_proxy": return `严格代理${detail ? ` · ${detail}` : ""}`;
+    case "invalid": return `绑定无效${detail ? ` · ${detail}` : ""}`;
+    default: return "未绑定直连";
   }
-  return account.last_observed_exit_ip || "未绑定";
 }
 
-function diagnosticProxyModeText(mode?: string) {
+function accountQuotaModeText(mode?: string) {
   switch ((mode || "").toLowerCase()) {
-    case "proxy": return "代理";
-    case "direct": return "直连";
-    case "invalid": return "配置无效";
-    default: return "继承";
+    case "scheduled": return "定时主动采集";
+    case "disabled": return "主动采集已禁用";
+    default: return "手动主动采集";
   }
 }
 
@@ -1464,7 +1513,8 @@ function diagnosticIssueText(issue: string) {
     quota_schedule_overdue: "额度采集逾期",
     quota_profile_mismatch: "采集 Profile 已变化",
     quota_proxy_invalid: "额度代理无效",
-    quota_probe_failed: "额度采集失败"
+    quota_probe_failed: "额度采集失败",
+    proxy_exit_changed: "代理出口 IP 已变化"
   };
   return labels[issue] || issue;
 }
@@ -1514,8 +1564,8 @@ function ClaudeCodeProfilePanel({
       </CardHeader>
       <CardContent className="grid gap-4">
         <div className="grid grid-cols-6 gap-3 max-[1280px]:grid-cols-3 max-[760px]:grid-cols-2 max-[560px]:grid-cols-1">
-          <ReadOnlyTile label="Claude Code 版本" value={effective?.version || "2.1.207"} />
-          <ReadOnlyTile label="Profile Revision" value={effective?.revision || "2.1.207-r3"} />
+          <ReadOnlyTile label="Claude Code 版本" value={effective?.version || "2.1.220"} />
+          <ReadOnlyTile label="Profile Revision" value={effective?.revision || "2.1.220-r1"} />
           <ReadOnlyTile label="平台" value={`${effective?.headers?.["X-Stainless-Os"] || "MacOS"} · ${effective?.headers?.["X-Stainless-Arch"] || "arm64"}`} />
           <ReadOnlyTile label="Billing" value={effective?.billing_block_enabled === false ? "关闭" : "sdk-cli · 无 CCH"} />
           <ReadOnlyTile label="Prompt" value="稳定工具无关" />
@@ -1524,7 +1574,7 @@ function ClaudeCodeProfilePanel({
 
         <div className="rounded-lg border bg-muted/30 p-3">
           <div className="text-xs font-medium text-muted-foreground">User-Agent</div>
-          <div className="mt-1 break-all font-mono text-sm">{effective?.user_agent || "claude-cli/2.1.207 (external, sdk-cli)"}</div>
+          <div className="mt-1 break-all font-mono text-sm">{effective?.user_agent || "claude-cli/2.1.220 (external, sdk-cli)"}</div>
         </div>
 
         <div className="grid grid-cols-2 gap-3 max-[860px]:grid-cols-1">
@@ -1588,7 +1638,7 @@ function ClaudeCodeProfileSnapshotsPanel({
   onDone: () => Promise<void>;
   onToast: (message: string, tone?: ToastState["tone"]) => void;
 }) {
-  const [version, setVersion] = useState(profile?.effective?.version || "2.1.207");
+  const [version, setVersion] = useState(profile?.effective?.version || "2.1.220");
   const [activeDiff, setActiveDiff] = useState<{ snapshot: ClaudeCodeProfileSnapshot; report: string } | null>(null);
   const fetchMutation = useMutation({
     mutationFn: ({ version, latest }: { version?: string; latest: boolean }) => api.fetchProfileSnapshot(version, latest),
@@ -1626,7 +1676,7 @@ function ClaudeCodeProfileSnapshotsPanel({
         <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-end gap-3 max-[760px]:grid-cols-1">
           <Label className="grid gap-2">
             <span>指定版本</span>
-            <Input value={version} onChange={(event) => setVersion(event.target.value)} placeholder="2.1.207" />
+            <Input value={version} onChange={(event) => setVersion(event.target.value)} placeholder="2.1.220" />
           </Label>
           <Button
             variant="outline"
@@ -2361,6 +2411,93 @@ function AccountPoolConfigPanel({
   );
 }
 
+function AccountQuotaCollectionPanel({
+  config,
+  onDone,
+  onToast
+}: {
+  config: AccountQuotaConfig;
+  onDone: () => Promise<void>;
+  onToast: (message: string, tone?: ToastState["tone"]) => void;
+}) {
+  const [mode, setMode] = useState<AccountQuotaConfig["mode"]>(config.mode);
+  const [interval, setInterval] = useState<AccountQuotaConfig["interval"]>(config.interval);
+  const [concurrency, setConcurrency] = useState(config.concurrency);
+  useEffect(() => {
+    setMode(config.mode);
+    setInterval(config.interval);
+    setConcurrency(config.concurrency);
+  }, [config.concurrency, config.interval, config.mode]);
+  const mutation = useMutation({
+    mutationFn: () => api.saveQuotaConfig({ mode, interval, concurrency }),
+    onSuccess: async () => {
+      await onDone();
+      onToast("额度采集策略已保存");
+    },
+    onError: (error) => onToast(`保存失败：${errorMessage(error)}`, "danger")
+  });
+  const modes: Array<{ value: AccountQuotaConfig["mode"]; label: string; description: string }> = [
+    { value: "manual", label: "手动", description: "被动接收真实响应 Header；确认后可手动查询 usage。" },
+    { value: "scheduled", label: "定时", description: "保留被动与手动采集，并按低频周期查询 usage。" },
+    { value: "disabled", label: "禁用主动", description: "只接收真实响应 Header，禁止手动和定时 usage 请求。" }
+  ];
+  const selectedMode = modes.find((item) => item.value === mode) || modes[0];
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>额度采集</CardTitle>
+        <CardDescription>主动查询会向 Anthropic 发送真实的 OAuth usage 请求；默认使用手动模式。</CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid grid-cols-3 overflow-hidden rounded-md border bg-muted/30 p-0.5 max-[640px]:grid-cols-1" role="radiogroup" aria-label="额度采集模式">
+          {modes.map((item) => (
+            <button
+              key={item.value}
+              type="button"
+              role="radio"
+              aria-checked={mode === item.value}
+              className={cn(
+                "min-h-10 px-3 py-2 text-sm font-medium transition-colors",
+                mode === item.value ? "bg-card text-foreground shadow-sm" : "text-muted-foreground hover:bg-muted"
+              )}
+              onClick={() => setMode(item.value)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+        <div className="rounded-md border bg-muted/25 px-3 py-2 text-sm leading-6 text-muted-foreground">
+          {selectedMode.description}
+        </div>
+        <div className="grid grid-cols-2 gap-3 max-[560px]:grid-cols-1">
+          {mode === "scheduled" ? (
+            <Field label="定时周期">
+              <Select value={interval} onChange={(event) => setInterval(event.target.value as AccountQuotaConfig["interval"])}>
+                <option value="15m">15 分钟</option>
+                <option value="30m">30 分钟</option>
+                <option value="1h">1 小时</option>
+              </Select>
+            </Field>
+          ) : null}
+          <NumberField
+            label="最大并发"
+            help="只限制后台定时批次；同账号仍会去重，手动查询也会复用近期结果。"
+            value={concurrency}
+            onChange={(value) => setConcurrency(Math.max(1, Math.min(8, value)))}
+          />
+        </div>
+        <div className="flex justify-end">
+          <Button onClick={() => mutation.mutate()} disabled={mutation.isPending}>
+            {mutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+            保存采集策略
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 const ROUTING_HELP: Partial<Record<keyof RoutingEffectiveConfig, string>> = {
   cache_affinity_enabled: "让同一显式会话优先使用同一账号，并让长上下文缓存前缀使用稳定的备用账号，提高 Anthropic 真实缓存命中率。没有 Session ID 的请求不会建立会话绑定。",
   cache_affinity_auto: "根据账号池规模、可用账号和当前压力自动调整亲和 lanes。关闭后固定使用下方配置的亲和 lanes 与最大 lanes。",
@@ -2824,6 +2961,7 @@ function AccountCardsPanel({
   onReset,
   onRefreshQuota,
   quotaPending,
+  quotaDisabled,
   onMove,
   onToggle,
   onDelete
@@ -2853,6 +2991,7 @@ function AccountCardsPanel({
   onReset: (account: ClaudeCodeAccount) => void;
   onRefreshQuota: (account: ClaudeCodeAccount) => void;
   quotaPending: boolean;
+  quotaDisabled: boolean;
   onMove: (row: AccountRow) => void;
   onToggle: (account: ClaudeCodeAccount) => void;
   onDelete: (account: ClaudeCodeAccount) => void;
@@ -2914,7 +3053,13 @@ function AccountCardsPanel({
               <Clock3 className="h-3.5 w-3.5" />
               清冷却
             </Button>
-            <Button variant="outline" size="sm" onClick={() => onRunBatch("refresh-quota")} disabled={selectedCount === 0 || pending}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => onRunBatch("refresh-quota")}
+              disabled={selectedCount === 0 || pending || quotaDisabled}
+              title={quotaDisabled ? "系统设置已禁用主动额度采集" : "刷新所选账号额度"}
+            >
               <RefreshCw className={cn("h-3.5 w-3.5", pending && "animate-spin")} />
               刷新额度
             </Button>
@@ -2937,6 +3082,7 @@ function AccountCardsPanel({
                   row={row}
                   selected={selectedSet.has(row.account.id)}
                   quotaPending={quotaPending}
+                  quotaDisabled={quotaDisabled}
                   onSelectedChange={(selected) => onSelectAccount(row.account.id, selected)}
                   onDetails={() => onDetails(row)}
                   onTest={() => onTest(row.account)}
@@ -2955,6 +3101,7 @@ function AccountCardsPanel({
               rows={rows}
               selectedSet={selectedSet}
               quotaPending={quotaPending}
+              quotaDisabled={quotaDisabled}
               onSelectAccount={onSelectAccount}
               onDetails={onDetails}
               onTest={onTest}
@@ -3002,6 +3149,7 @@ function AccountTable({
   rows,
   selectedSet,
   quotaPending,
+  quotaDisabled,
   onSelectAccount,
   onDetails,
   onTest,
@@ -3016,6 +3164,7 @@ function AccountTable({
   rows: AccountRow[];
   selectedSet: Set<string>;
   quotaPending: boolean;
+  quotaDisabled: boolean;
   onSelectAccount: (id: string, selected: boolean) => void;
   onDetails: (row: AccountRow) => void;
   onTest: (account: ClaudeCodeAccount) => void;
@@ -3076,7 +3225,14 @@ function AccountTable({
                     <OverflowMenu label="账号操作">
                       <button type="button" onClick={() => onDetails(row)}>查看详情</button>
                       <button type="button" onClick={() => (bound ? onUnbind(account) : onBind(account))}>{bound ? "解绑代理" : "绑定代理"}</button>
-                      <button type="button" onClick={() => onRefreshQuota(account)} disabled={quotaPending}>刷新额度</button>
+                      <button
+                        type="button"
+                        onClick={() => onRefreshQuota(account)}
+                        disabled={quotaPending || quotaDisabled}
+                        title={quotaDisabled ? "系统设置已禁用主动额度采集" : undefined}
+                      >
+                        刷新额度
+                      </button>
                       <button type="button" onClick={() => onReset(account)}>清除冷却</button>
                       <button type="button" onClick={() => onMove(row)}>移动账号池</button>
                       <button type="button" onClick={() => onToggle(account)}>{account.schedulable ? "暂停调度" : "参与调度"}</button>
@@ -3227,6 +3383,7 @@ function AccountPoolCard({
   row,
   selected,
   quotaPending,
+  quotaDisabled,
   onSelectedChange,
   onDetails,
   onTest,
@@ -3241,6 +3398,7 @@ function AccountPoolCard({
   row: AccountRow;
   selected: boolean;
   quotaPending: boolean;
+  quotaDisabled: boolean;
   onSelectedChange: (selected: boolean) => void;
   onDetails: () => void;
   onTest: () => void;
@@ -3301,7 +3459,14 @@ function AccountPoolCard({
           <OverflowMenu label="账号操作">
             <button type="button" onClick={onDetails}>查看详情</button>
             <button type="button" onClick={bound ? onUnbind : onBind}>{bound ? "解绑代理" : "绑定代理"}</button>
-            <button type="button" onClick={onRefreshQuota} disabled={quotaPending}>刷新额度</button>
+            <button
+              type="button"
+              onClick={onRefreshQuota}
+              disabled={quotaPending || quotaDisabled}
+              title={quotaDisabled ? "系统设置已禁用主动额度采集" : undefined}
+            >
+              刷新额度
+            </button>
             <button type="button" onClick={onReset}>清除冷却</button>
             <button type="button" onClick={onMove}>移动账号池</button>
             <button type="button" onClick={onToggle}>{account.schedulable ? "暂停调度" : "参与调度"}</button>
@@ -3521,6 +3686,7 @@ function AccountDetailDialog({
   onReset,
   onRefreshQuota,
   quotaPending,
+  quotaDisabled,
 	pools,
 	onMove,
 	  onRefreshToken,
@@ -3539,6 +3705,7 @@ function AccountDetailDialog({
   onReset: (account: ClaudeCodeAccount) => void;
   onRefreshQuota: (account: ClaudeCodeAccount) => void;
   quotaPending: boolean;
+  quotaDisabled: boolean;
   pools: ClaudeCodeAccountPool[];
   onMove: (account: ClaudeCodeAccount) => void;
   onRefreshToken: (account: ClaudeCodeAccount) => void;
@@ -3588,7 +3755,14 @@ function AccountDetailDialog({
                   <OverflowMenu label="更多账号操作">
                     <button type="button" onClick={() => (bound ? onUnbind(account) : onBind(account))}>{bound ? "解绑代理" : "绑定代理"}</button>
                     <button type="button" onClick={() => onReset(account)}>清除冷却</button>
-	                    <button type="button" onClick={() => onRecheck(account)} disabled={recheckPending}>重新检查并恢复</button>
+	                    <button
+                        type="button"
+                        onClick={() => onRecheck(account)}
+                        disabled={recheckPending || quotaDisabled}
+                        title={quotaDisabled ? "系统设置已禁用主动额度采集" : undefined}
+                      >
+                        重新检查并恢复
+                      </button>
 	                    <button type="button" onClick={() => onMove(account)}>移动账号池</button>
 	                    <button type="button" onClick={() => onToggle(account)}>{account.schedulable ? "暂停调度" : "参与调度"}</button>
                     <button type="button" className="danger" onClick={() => onDelete(account)}>删除账号</button>
@@ -3614,7 +3788,12 @@ function AccountDetailDialog({
 
               <div className="grid grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] items-start gap-3 max-[700px]:grid-cols-1">
                 <AvailabilityPanel availability={account.availability} />
-	                <DenseQuotaPanel account={account} onRefresh={() => onRefreshQuota(account)} refreshing={quotaPending} />
+	                <DenseQuotaPanel
+                    account={account}
+                    onRefresh={() => onRefreshQuota(account)}
+                    refreshing={quotaPending}
+                    disabled={quotaDisabled}
+                  />
               </div>
 
               {account.model_statuses ? <ModelStatusStrip statuses={account.model_statuses} /> : null}
@@ -3742,7 +3921,17 @@ function MoveAccountDialog({ row, pools, open, pending, onClose, onMove }: {
 	);
 }
 
-function DenseQuotaPanel({ account, onRefresh, refreshing }: { account: ClaudeCodeAccount; onRefresh: () => void; refreshing: boolean }) {
+function DenseQuotaPanel({
+  account,
+  onRefresh,
+  refreshing,
+  disabled
+}: {
+  account: ClaudeCodeAccount;
+  onRefresh: () => void;
+  refreshing: boolean;
+  disabled: boolean;
+}) {
   const quota = account.quota;
   const windows = accountQuotaWindowStates(account);
   return (
@@ -3755,7 +3944,15 @@ function DenseQuotaPanel({ account, onRefresh, refreshing }: { account: ClaudeCo
             {account.quota_band && account.quota_band !== "unknown" ? ` · ${quotaBandText(account.quota_band)}` : ""}
           </div>
         </div>
-        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={onRefresh} disabled={refreshing} title="刷新额度" aria-label="刷新额度">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7"
+          onClick={onRefresh}
+          disabled={refreshing || disabled}
+          title={disabled ? "系统设置已禁用主动额度采集" : "刷新额度"}
+          aria-label="刷新额度"
+        >
           <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
         </Button>
       </div>
@@ -4543,6 +4740,14 @@ function textToHeaders(text: string) {
   return out;
 }
 
+function defaultAccountQuotaConfig(): AccountQuotaConfig {
+  return {
+    mode: "manual",
+    interval: "30m",
+    concurrency: 2
+  };
+}
+
 function defaultPoolEffectiveConfig(): ClaudeCodePoolEffectiveConfig {
   return {
     enabled: true,
@@ -5196,7 +5401,7 @@ function SessionKeyBatchForm({
             <span className="min-w-0">
               <span className="block font-medium">绑定独立代理 IP</span>
               <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-                {bindProxy ? "每个账号预留并绑定一个健康代理。" : "新账号不绑定，已有账号保留原绑定；使用全局代理，未配置时直连。"}
+                {bindProxy ? "每个账号预留并绑定一个健康代理，登录和后续流量固定走该代理。" : "账号池流量将直连，不使用全局代理；已绑定旧账号必须改用绑定模式登录。"}
               </span>
             </span>
           </label>
@@ -5558,36 +5763,36 @@ function OAuthForm({
   onDone: (message: string) => Promise<void>;
   onToast: (message: string, tone?: ToastState["tone"]) => void;
 }) {
-  const [mode, setMode] = useState("");
+  const [mode, setMode] = useState<"direct" | "auto" | "id">("direct");
   const [proxyID, setProxyID] = useState("");
-  const [bindSameProxy, setBindSameProxy] = useState(true);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [authURL, setAuthURL] = useState("");
   const [authState, setAuthState] = useState("");
   const [callbackURL, setCallbackURL] = useState("");
   const [flowStatus, setFlowStatus] = useState("未生成授权链接");
   const selectedProxy = available.find((proxy) => proxy.id === proxyID);
-  const effectiveMode = proxyID ? "id" : mode === "id" ? "" : mode;
+  const effectiveMode = proxyID ? "id" : mode;
   const proxyHint =
     effectiveMode === "auto"
-      ? "后端会自动选择一个空闲且健康或未知的代理；若保持绑定选项，账号后续也会绑定同一个代理。"
+      ? "服务端会预留一个空闲代理，Token 换取和账号后续流量固定使用同一代理。"
       : effectiveMode === "id" && selectedProxy
-      ? `本次登录和 token 换取会走 ${selectedProxy.name}，授权成功后可绑定到该账号。`
-      : effectiveMode === "direct"
-      ? "本次登录强制直连；后续账号可保持未绑定，或授权后手动绑定代理。"
-      : "本次登录使用服务全局网络配置；如果没有全局代理，就是直连。";
+      ? `服务端 Token 换取和账号后续流量固定使用 ${selectedProxy.name}。`
+      : effectiveMode === "id"
+      ? "请选择一个代理；登录代理与账号最终绑定代理必须一致。"
+      : "服务端 Token 换取和账号后续流量均显式直连，不使用全局或环境代理。";
 
   const generateMutation = useMutation({
     mutationFn: async () => {
+      if (effectiveMode === "id" && !proxyID) {
+        throw new Error("请选择登录代理");
+      }
       const params = new URLSearchParams({ pool: "claude-code", is_webui: "true" });
       params.set("pool_id", poolID || "default");
-      if (effectiveMode) {
-        params.set("login_proxy", effectiveMode);
-      }
+      params.set("login_proxy", effectiveMode);
       if (proxyID) {
         params.set("proxy_resource_id", proxyID);
       }
-      if (!bindSameProxy) {
+      if (effectiveMode === "direct") {
         params.set("bind_proxy_resource_id", "none");
       }
       return api.authURL(params);
@@ -5684,16 +5889,15 @@ function OAuthForm({
             <Select
               value={mode}
               onChange={(event) => {
-                setMode(event.target.value);
+                setMode(event.target.value as "direct" | "auto" | "id");
                 if (event.target.value !== "id") {
                   setProxyID("");
                 }
               }}
             >
-              <option value="">直连或全局配置</option>
-              <option value="direct">强制直连</option>
-              <option value="auto">自动选择空闲代理</option>
-              <option value="id">指定代理</option>
+              <option value="direct">直连且不绑定</option>
+              <option value="auto">自动选择并绑定代理</option>
+              <option value="id">指定并绑定代理</option>
             </Select>
           </Field>
           <Field label="指定代理">
@@ -5704,7 +5908,7 @@ function OAuthForm({
               onClear={() => {
                 setProxyID("");
                 if (mode === "id") {
-                  setMode("");
+                  setMode("direct");
                 }
               }}
             />
@@ -5713,15 +5917,9 @@ function OAuthForm({
         <div className="rounded-lg border bg-muted/35 px-3 py-2 text-sm leading-6 text-muted-foreground">
           {proxyHint}
         </div>
-        <label className="flex items-start gap-2 text-sm">
-          <input
-            type="checkbox"
-            className="mt-1 h-4 w-4"
-            checked={bindSameProxy}
-            onChange={(event) => setBindSameProxy(event.target.checked)}
-          />
-          <span>授权成功后绑定同一个代理。直连登录时可先不绑定，之后在账号卡片中手动绑定。</span>
-        </label>
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-800">
+          Anthropic 授权页面由当前浏览器访问，服务端无法控制浏览器出口；服务端 Token 换取及登录后的账号流量严格遵循上方选择。
+        </div>
 
         <section className="rounded-lg border border-dashed bg-card p-4">
           <div className="grid gap-2">
@@ -5737,7 +5935,7 @@ function OAuthForm({
             )}
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button type="submit" disabled={generateMutation.isPending}>
+            <Button type="submit" disabled={generateMutation.isPending || (effectiveMode === "id" && !proxyID)}>
               {generateMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
               {authURL ? "重新生成链接" : "开始 Anthropic 登录"}
             </Button>
@@ -5784,7 +5982,7 @@ function OAuthForm({
       <ProxySelectorDialog
         open={selectorOpen}
         title="选择登录代理"
-        description="只展示未绑定的代理。选择后，OAuth 授权和 token 换取都会走这个出口。"
+        description="只展示未绑定的代理。选择后，服务端 Token 换取和账号后续流量固定走该代理。"
         available={available}
         selectedID={proxyID}
         onOpenChange={setSelectorOpen}

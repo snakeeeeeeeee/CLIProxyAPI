@@ -441,7 +441,7 @@ func (a *poolInsightAccumulator) addModelAccount(family struct {
 		model.item.ExhaustedCount++
 		model.item.MeasuredCount++
 	} else if state.Freshness == quotaFreshnessFresh && state.UtilizationKnown && state.Confidence != quotaConfidenceObserved {
-		evaluation := evaluateQuotaRouting(account.Quota.Windows, account.Quota.CheckedAt, family.model, now)
+		evaluation := evaluateQuotaRoutingWithTTL(account.Quota.Windows, account.Quota.CheckedAt, family.model, now, account.effectiveQuotaFreshnessTTL())
 		if evaluation.Known {
 			model.item.MeasuredCount++
 			model.headroomSum += evaluation.Headroom

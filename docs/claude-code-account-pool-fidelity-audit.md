@@ -1,7 +1,7 @@
 # Claude Code Account Pool Fidelity and Enforcement-Risk Audit
 
-**Audit date:** 2026-07-14
-**Repository state reviewed:** `d190b5f9` plus the current uncommitted protocol-consistency implementation
+**Audit date:** 2026-07-26
+**Repository state reviewed:** current `main` worktree with the uncommitted `2.1.220-r1` fixed-baseline implementation
 **Purpose:** Provide an independent reviewer with enough evidence to assess request fidelity, recent probe failures, deployment consistency, and account-restriction risk.
 
 ## Executive Summary
@@ -18,10 +18,11 @@ The ordinary-request path therefore injects a substantial stable prompt, but it 
 The original audit identified concrete Session, quota-transport, scheduling, proxy, Header-order, and deployment-observability mismatches. The current worktree now addresses them by:
 
 - Centralizing account-pool Session extraction, excluding `X-Client-Request-Id`, and adding a one-hour scoped fallback for no-Session calls.
-- Sending `/api/oauth/usage` with the account Profile UA, OAuth beta, compatible HTTP/1.1 transport, and bound proxy.
-- Making `account-quota.interval` authoritative and deduplicating manual/background probes per account.
-- Failing closed whenever a configured proxy is malformed; only empty or explicit `direct` settings permit direct routing.
-- Upgrading the exact built-in baseline to `2.1.207-r3` with the observed HTTP/1.1 Header order while leaving unverified native TLS fixtures unchanged.
+- Pinning the built-in profile to the reviewed `2.1.220-r1` tuple instead of following later Claude Code releases automatically.
+- Sending `/api/oauth/usage` with the account Profile UA, OAuth beta, compatible HTTP/1.1 transport, and strict account network route.
+- Replacing default background probing with explicit `manual`, `scheduled`, and `disabled` quota modes, plus short result reuse and per-account singleflight.
+- Enforcing explicit direct routing for unbound accounts and fail-closed bound-proxy routing for inference, token refresh, quota, and account tests.
+- Replacing Anthropic-root proxy probes with one ipify request that records the observed exit IP and change events.
 - Persisting a database instance identity and exposing a Management-only, redacted runtime diagnostics surface.
 
 Two material boundaries remain. Stable device identity still depends on retaining the same SQLite account row/database across deployments, and the ordinary mimic's stable core is intentionally not an exact copy of a full dynamic Claude Code runtime. Subscription OAuth pooling for third-party users also remains a provider-policy risk independent of headers, TLS, prompts, or Session metadata.
@@ -33,6 +34,7 @@ No evidence collected here can establish the exact reason Anthropic restricted a
 This report uses:
 
 - Current repository source code.
+- A redacted record-only Claude Code 2.1.220 custom-Base-URL capture and 70-second idle observation.
 - Existing redacted local Claude Code 2.1.207 captures.
 - A user-authorized, redacted live Claude Code 2.1.207 capture through the locally configured custom API Base URL.
 - Local routing and usage records from low-volume development tests.
@@ -47,7 +49,25 @@ This report does not use:
 - Unredacted credentials, proxy URLs, account UUIDs, or Session IDs.
 - Claims that matching a client fingerprint prevents enforcement.
 
-## Live Claude Code 2.1.207 Capture
+## Claude Code 2.1.220 Fixed Baseline Evidence
+
+The locally installed and npm-current version observed during this work was `2.1.220`. The available credential was supplied by user settings together with a custom API Base URL; excluding those settings left no direct first-party login. The capture is therefore evidence of custom-Base-URL HTTP construction, not proof of native Anthropic OAuth or TLS behavior.
+
+One record-only invocation emitted a Haiku `generate_session_title` helper and the main SDK request. Both used:
+
+- HTTP/1.1 with the same reviewed Header order.
+- `claude-cli/2.1.220 (external, sdk-cli)`.
+- Stainless JS `0.94.0`, Node `v26.3.0`, and MacOS/arm64.
+- Matching Session Header and nested metadata.
+- Request-specific billing suffixes rather than one hard-coded suffix.
+
+The main request's cache controls omitted `ttl`; under Anthropic's documented semantics this is normally a five-minute cache. The account-pool forced one-hour TTL remains an explicit gateway policy, not a verified universal Claude Code default.
+
+An interactive process remained idle for 70 seconds and sent no HTTP request to the recorder. This is evidence against a universal fixed-seconds Messages heartbeat in this configuration. Optional OpenTelemetry export intervals and remote-session keepalives are different mechanisms and do not justify synthetic inference calls. The implementation therefore does not add heartbeats, title calls, telemetry, Statsig traffic, or model probes.
+
+The fixed production profile is `2.1.220-r1`. Stream requests use Stainless timeout `600`; non-stream Messages and `count_tokens` use `300`; a valid timeout supplied by a positively identified real Claude Code request is preserved. JA3, JA4, ALPN, and the existing TLS implementation remain unchanged because custom Base URL and terminating capture evidence cannot revalidate native TLS.
+
+## Historical Live Claude Code 2.1.207 Capture
 
 ### Environment and limitations
 
@@ -139,7 +159,7 @@ An ordinary `/claude-acc-pool/v1/*` request is transformed as follows:
 3. The outbound top-level `system` becomes three blocks:
    - Claude Code-style billing metadata.
    - `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
-   - The stable, tool-independent Claude Code 2.1.207 prompt sections.
+   - The stable, tool-independent Claude Code 2.1.220 prompt sections.
 4. Client-provided tools remain present.
 5. No fake `Read`, `Bash`, `Edit`, `Agent`, or other Claude Code tools are added.
 
@@ -148,7 +168,7 @@ Relevant code:
 - `internal/runtime/executor/claude_executor.go:2372-2417`
 - `internal/runtime/executor/helps/claude_system_prompt.go:5-76`
 
-The `2.1.207-r3` ordinary core includes:
+The `2.1.220-r1` ordinary core includes:
 
 - Agent SDK identity and software-engineering context.
 - A requirement to use only capabilities and tools actually present in the request.
@@ -216,13 +236,21 @@ Four locally captured requests from one real Claude Code 2.1.207 conversation re
 
 **Status:** Resolved in the current worktree
 
-OAuth usage probes now use the selected account's Profile User-Agent, OAuth beta, Claude Code-compatible HTTP/1.1 transport, and account-bound proxy. They carry no Session, billing prompt, model, or inference body. `CLIProxyAPI Resource Pool` is no longer sent. A safe persisted probe summary records only time, Profile revision, transport category, proxy mode/resource ID, and status code.
+OAuth usage probes now use the selected account's Profile User-Agent, OAuth beta, Claude Code-compatible HTTP/1.1 transport, and strict account network route. They carry no Session, billing prompt, model, or inference body. `CLIProxyAPI Resource Pool` is no longer sent. A safe persisted probe summary records only time, Profile revision, transport category, proxy mode/resource ID, and status code.
+
+Active usage collection now has three explicit modes:
+
+- `manual` is the default: passive response Headers continue to update quota, and an administrator can confirm one real usage request.
+- `scheduled` adds a low-frequency `15m`, `30m`, or `1h` worker interval with deterministic account jitter.
+- `disabled` still accepts passive Headers but prohibits `/api/oauth/usage` network requests.
+
+New accounts do not trigger an immediate usage request. Successful active results are reused for three minutes, failures for one minute, and concurrent calls are collapsed by account. One usage response parses shared 5h/7d, Sonnet, Opus, Fable, and dynamic model limits without model-inference probes.
 
 ### 4. Quota scheduling now honors the configured interval
 
 **Status:** Resolved in the current worktree
 
-The 15-second scheduler tick only scans due accounts. Successful active probes, passive quota Header observations, and successful inference postponement all calculate the next check from `account-quota.interval` plus bounded jitter. Shortening the configuration can pull forward an old fixed deadline, manual refresh bypasses due checks, and manual/background calls are singleflight-deduplicated per database/account.
+The 15-second scheduler tick only scans due accounts while `scheduled` mode is active. The persisted active-probe time drives due checks, so passive inference traffic cannot postpone the next active collection indefinitely. Manual and disabled modes do not run background usage requests.
 
 ### 5. Account identity is stable only with persistent SQLite state
 
@@ -245,20 +273,22 @@ For Docker deployment, the configured database must remain under the persistent 
 
 **Status:** Resolved in the current worktree
 
-Empty proxy configuration and explicit `direct` remain valid direct-routing modes. Any malformed configured proxy now installs an error dialer in both Claude OAuth and protected uTLS transports. Login, refresh, quota, and inference therefore return a proxy error instead of silently moving the account to the server's direct IP.
+Unbound account-pool auths are assigned explicit `direct`, which bypasses global and environment proxies. Bound auths use only their stored proxy resource. Missing, disabled, unhealthy, or malformed bound proxies receive a fail-closed marker and cannot fall back to the server's direct IP, global proxy, another account proxy, or a context fallback.
 
-### 7. The built-in Header order is aligned in `2.1.207-r3`
+The same rule applies to inference, `count_tokens`, token exchange/refresh, active quota, and account tests. SessionKey login without binding is explicitly direct and rejects updates to an already bound account. OAuth login is valid only as direct-and-unbound or login-and-bind through the same proxy resource. Binding changes are rejected while requests are in flight and clear account transports, affinity, and temporary Sessions after success.
+
+### 7. The built-in Header order is fixed in `2.1.220-r1`
 
 **Status:** Resolved for the captured HTTP/1.1 evidence; native TLS remains intentionally unchanged
 
-The fresh live capture still matches these built-in values:
+The reviewed 2.1.220 custom-Base-URL capture matches these built-in values:
 
-- `claude-cli/2.1.207 (external, sdk-cli)`
+- `claude-cli/2.1.220 (external, sdk-cli)`
 - Stainless SDK package `0.94.0`
 - Node `v26.3.0`
 - `MacOS/arm64`
 
-The `2.1.207-r3` built-in profile now places Authorization second, uses the observed Stainless `arch/lang/os/package/retry/runtime/runtime-version/timeout` order, and places beta before dangerous-browser-access/version. Exact built-in r2 baselines migrate automatically; customized profiles remain untouched.
+The `2.1.220-r1` built-in profile uses the observed HTTP/1.1 Header order and request-category timeout rules. Existing 2.1.207 built-in-derived profiles migrate once to this fixed baseline. The revision is deliberately not tied to npm latest; later changes require a new capture, review, tests, and explicit migration.
 
 The capture still cannot revalidate JA3/JA4/ALPN because the deliberate MITM hop terminates native TLS. Those values therefore remain unchanged pending a first-party native capture.
 
@@ -269,6 +299,14 @@ A Linux Docker host does not automatically leak Linux/amd64 through these pinned
 **Status:** Resolved in the current worktree; direct first-party confirmation remains pending
 
 The fresh custom-base Claude Code requests did not include `oauth-2025-04-20`, which is expected for that client mode. The account-pool pipeline now preserves client/body capability betas and adds only the selected OAuth credential's required `oauth-2025-04-20` item. Real passthrough keeps inbound order while inserting the missing credential requirement. API-key, non-account-pool, and other-provider paths are unchanged. A direct first-party OAuth capture is still needed to validate the provider's current wire requirement independently.
+
+### 9. Token and proxy-maintenance traffic is separated from inference
+
+**Status:** Resolved in the current worktree
+
+OAuth token exchange and refresh use the `oauth-token` request shape with `axios/1.13.6`, JSON Content-Type, and `application/json, text/plain, */*` Accept. They do not carry Session, billing, model, or inference Headers.
+
+Proxy health checks no longer call the Anthropic root. Each check sends one `GET https://api.ipify.org?format=json` through the proxy, validates a JSON IP, records latency and the observed exit IP, and emits a redacted `proxy_exit_changed` event when the address changes. This verifies the route without generating Anthropic traffic. It does not prove that the proxy is accepted by Anthropic.
 
 ## Recent Probe Failures and Their Causes
 
@@ -346,10 +384,10 @@ The current uncommitted worktree now combines the downstream compatibility fixes
 
 - Pure-mode visible usage estimation, `count_tokens`, explicit cache metadata, and Anthropic error envelopes.
 - Stable/scoped account-pool Sessions and removal of `X-Client-Request-Id` from Session extraction.
-- `2.1.207-r3` Header-order/profile migration and credential-aware beta merging.
-- Configured quota intervals, jitter, singleflight, account-compatible usage transport, and safe probe persistence.
-- Fail-closed proxy behavior for OAuth and protected uTLS paths.
-- Persistent database identity and a redacted Management diagnostics API/UI.
+- Fixed `2.1.220-r1` Header/profile migration, request-category timeout rules, and credential-aware beta merging.
+- Manual/scheduled/disabled quota modes, delayed first collection, jitter, result reuse, singleflight, and safe probe persistence.
+- Explicit-direct unbound accounts and strict fail-closed bound proxies across login, refresh, quota, tests, and inference.
+- Ipify-only proxy health, exit-change diagnostics, persistent database identity, and a redacted Management diagnostics API/UI.
 
 Offline and local synthetic verification can cover these behaviors. A valid authorized account is still required for the final bound-proxy quota refresh, ordinary short request, and genuine Claude Code passthrough smoke.
 
@@ -378,12 +416,12 @@ For an external multi-user product, use Anthropic Console API keys or a supporte
 
 - Send quota usage requests through the same account proxy.
 - Reuse the account's Claude Code User-Agent, header policy, and compatible transport profile.
-- Honor the configured refresh interval.
-- Add jitter and singleflight/deduplication without creating idle query storms.
+- Keep passive Header collection in all modes and require explicit administrator choice before active usage traffic.
+- Use low-frequency intervals, jitter, short result reuse, and singleflight without creating idle query storms.
 
 ### P1: Refresh the versioned Claude Code profile coherently
 
-- Replace the stale pinned Header order with a tested 2.1.207 fixture, while keeping authentication-mode differences explicit.
+- Keep `2.1.220-r1` fixed until a new capture, review, and explicit migration are complete.
 - Preserve genuine Claude Code Headers, prompt blocks, tools, and Session metadata in passthrough mode except for the required account credential/identity projection.
 - Reconcile client capability betas with the selected upstream credential instead of blindly replacing or broadly synthesizing the complete beta list.
 - Keep custom-base 5m and direct subscription 1h cache evidence separate; do not hard-code one observed mode as universal Claude Code behavior.
@@ -429,13 +467,13 @@ This would make local/server drift visible without leaking credentials.
 No restricted account is required for most verification. The current worktree includes local coverage for:
 
 1. Explicit, fallback, TTL-expired, Key/pool/account-isolated Sessions and `X-Client-Request-Id` exclusion.
-2. Ordered Headers, ordinary/real system and tool boundaries, billing fixtures, cache policy, and OAuth beta merging.
-3. Configured quota intervals, shortening, jitter, manual/background singleflight, Token refresh, request shape, and failure handling.
-4. Invalid HTTP/SOCKS proxy configurations with zero direct upstream calls in covered OAuth, quota, and inference transports.
-5. Probe and database-identity persistence plus diagnostics redaction across response, SQLite, and safe summaries.
+2. Ordered 2.1.220 Headers, stream/non-stream/count timeout rules, ordinary/real system and tool boundaries, billing fixtures, cache policy, and OAuth beta merging.
+3. Manual/scheduled/disabled quota modes, delayed first collection, jitter, three-minute success and one-minute failure reuse, singleflight, Token refresh, request shape, and passive model-window updates.
+4. Explicit-direct unbound auths, strict bound-proxy login combinations, disabled/malformed proxy rejection, and zero direct upstream calls for invalid routes.
+5. One-request ipify health checks, IP parsing, exit-change events, probe/database identity persistence, and diagnostics redaction.
 6. Downstream streaming, `count_tokens`, explicit cache, and Anthropic error-envelope compatibility through local recording upstreams.
 
-Final local verification completed `gofmt`, full Go tests, the required backend build, frontend type-check/build, diff hygiene, and populated 375/768/1024/1440 browser checks. A valid, authorized account is still required for the final bound-proxy quota refresh, ordinary short request, and real Claude Code passthrough smoke. A separate direct first-party OAuth capture is also needed before native TLS or credential-beta fixtures are changed again.
+Current local verification has passed focused Go tests, full `go test ./...`, and frontend type-check. The required backend build, frontend production build, diff hygiene, and final responsive browser checks are performed before release and recorded separately. A valid, authorized account is still required for the final bound-proxy quota refresh, ordinary short request, and real Claude Code passthrough smoke. A separate direct first-party OAuth capture is also needed before native TLS or credential-beta fixtures are changed again.
 
 ## Questions for Independent Review
 

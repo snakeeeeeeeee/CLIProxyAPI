@@ -1135,6 +1135,7 @@ func (s *Store) hydrateAccountRuntime(ctx context.Context, account *ClaudeCodeAc
 	if s == nil || account == nil {
 		return
 	}
+	account.quotaFreshnessTTL = s.quotaFreshnessTTL
 	if capacity, err := s.GetAccountCapacity(ctx, account.ID); err == nil {
 		account.Capacity = capacity
 		routingScope := AccountRoutingScope(account.PoolID)

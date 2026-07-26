@@ -2,7 +2,7 @@ package helps
 
 import "strings"
 
-// Stable, tool-independent sections from the Claude Code 2.1.207 trace baseline.
+// Stable, tool-independent sections retained for the audited Claude Code 2.1.220 baseline.
 
 // ClaudeCodeIntro is the first system block after billing header and agent identifier.
 // Corresponds to getSimpleIntroSection() in prompts.ts.

@@ -3,10 +3,12 @@ package resourcepool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
@@ -22,20 +24,47 @@ const (
 	quotaRefreshLeeway     = 2 * time.Minute
 	quotaResponseMaxBytes  = 2 << 20
 	quotaOAuthBetaHeader   = "oauth-2025-04-20"
-	quotaDefaultInterval   = 5 * time.Minute
+	quotaDefaultInterval   = 30 * time.Minute
 	quotaDefaultConcurrent = 2
 )
 
 var claudeOAuthUsageURL = defaultQuotaUsageURL
 var accountQuotaRefreshGroup singleflight.Group
 var accountQuotaNow = time.Now
+var accountQuotaRecentResults = struct {
+	sync.Mutex
+	items map[string]accountQuotaRecentResult
+}{items: make(map[string]accountQuotaRecentResult)}
+
+type accountQuotaRecentResult struct {
+	requestedAt   time.Time
+	nextAllowedAt time.Time
+	errMessage    string
+}
+
+type accountQuotaRefreshOutcome struct {
+	account          *ClaudeCodeAccount
+	networkPerformed bool
+	cached           bool
+	requestedAt      time.Time
+	nextAllowedAt    time.Time
+}
 
 // RefreshAccountQuota refreshes and stores one Claude OAuth usage snapshot.
 func RefreshAccountQuota(ctx context.Context, cfg *config.Config, store *Store, accountID string, auth *coreauth.Auth, persistAuth func(*coreauth.Auth) error) (*ClaudeCodeAccount, error) {
+	result, err := RefreshAccountQuotaWithResult(ctx, cfg, store, accountID, auth, persistAuth)
+	if result == nil {
+		return nil, err
+	}
+	return result.Account, err
+}
+
+// RefreshAccountQuotaWithResult refreshes one account and reports recent-result reuse.
+func RefreshAccountQuotaWithResult(ctx context.Context, cfg *config.Config, store *Store, accountID string, auth *coreauth.Auth, persistAuth func(*coreauth.Auth) error) (*AccountQuotaRefreshResult, error) {
 	return refreshAccountQuota(ctx, cfg, store, accountID, auth, persistAuth, false)
 }
 
-func refreshAccountQuota(ctx context.Context, cfg *config.Config, store *Store, accountID string, auth *coreauth.Auth, persistAuth func(*coreauth.Auth) error, allowManualRecovery bool) (*ClaudeCodeAccount, error) {
+func refreshAccountQuota(ctx context.Context, cfg *config.Config, store *Store, accountID string, auth *coreauth.Auth, persistAuth func(*coreauth.Auth) error, allowManualRecovery bool) (*AccountQuotaRefreshResult, error) {
 	if store == nil {
 		return nil, fmt.Errorf("resource pool store is nil")
 	}
@@ -43,19 +72,61 @@ func refreshAccountQuota(ctx context.Context, cfg *config.Config, store *Store, 
 	if err != nil {
 		return nil, err
 	}
-	return refreshAccountQuotaWithInterval(ctx, cfg, store, accountID, auth, persistAuth, allowManualRecovery, interval)
+	return refreshAccountQuotaWithIntervalResult(ctx, cfg, store, accountID, auth, persistAuth, allowManualRecovery, interval)
 }
 
 func refreshAccountQuotaWithInterval(ctx context.Context, cfg *config.Config, store *Store, accountID string, auth *coreauth.Auth, persistAuth func(*coreauth.Auth) error, allowManualRecovery bool, interval time.Duration) (*ClaudeCodeAccount, error) {
+	result, err := refreshAccountQuotaWithIntervalResult(ctx, cfg, store, accountID, auth, persistAuth, allowManualRecovery, interval)
+	if result == nil {
+		return nil, err
+	}
+	return result.Account, err
+}
+
+func refreshAccountQuotaWithIntervalResult(ctx context.Context, cfg *config.Config, store *Store, accountID string, auth *coreauth.Auth, persistAuth func(*coreauth.Auth) error, allowManualRecovery bool, interval time.Duration) (*AccountQuotaRefreshResult, error) {
 	if store == nil {
 		return nil, fmt.Errorf("resource pool store is nil")
 	}
 	accountID = strings.TrimSpace(accountID)
 	key := store.path + "\x00" + accountID
+	if recent, ok := loadAccountQuotaRecentResult(key, accountQuotaNow()); ok {
+		account, errAccount := store.GetAccount(ctx, accountID)
+		if errAccount != nil {
+			return nil, errAccount
+		}
+		result := quotaRefreshResult(account, false, true, recent)
+		return result, recent.err()
+	}
+	networkPerformedByCaller := false
 	value, err, _ := accountQuotaRefreshGroup.Do(key, func() (any, error) {
-		return refreshAccountQuotaOnce(ctx, cfg, store, accountID, auth, persistAuth, allowManualRecovery, interval)
+		if recent, ok := loadAccountQuotaRecentResult(key, accountQuotaNow()); ok {
+			account, errAccount := store.GetAccount(ctx, accountID)
+			if errAccount != nil {
+				return nil, errAccount
+			}
+			return &accountQuotaRefreshOutcome{
+				account:       account,
+				cached:        true,
+				requestedAt:   recent.requestedAt,
+				nextAllowedAt: recent.nextAllowedAt,
+			}, recent.err()
+		}
+		networkPerformedByCaller = true
+		requestedAt := accountQuotaNow()
+		account, errRefresh := refreshAccountQuotaOnce(ctx, cfg, store, accountID, auth, persistAuth, allowManualRecovery, interval)
+		recent := saveAccountQuotaRecentResult(key, requestedAt, errRefresh)
+		return &accountQuotaRefreshOutcome{
+			account:          account,
+			networkPerformed: true,
+			requestedAt:      recent.requestedAt,
+			nextAllowedAt:    recent.nextAllowedAt,
+		}, errRefresh
 	})
-	account, _ := value.(*ClaudeCodeAccount)
+	outcome, _ := value.(*accountQuotaRefreshOutcome)
+	if outcome == nil {
+		return nil, err
+	}
+	account := outcome.account
 	if err == nil && allowManualRecovery && account != nil && account.HealthStatus == AccountHealthManualRecovery {
 		now := accountQuotaNow()
 		account, err = store.UpdateAccountHealth(ctx, account.ID, AccountHealthUpdate{
@@ -66,7 +137,60 @@ func refreshAccountQuotaWithInterval(ctx context.Context, cfg *config.Config, st
 			AllowManualRecovery: true,
 		})
 	}
-	return account, err
+	return &AccountQuotaRefreshResult{
+		Account:          account,
+		NetworkPerformed: outcome.networkPerformed && networkPerformedByCaller,
+		Cached:           outcome.cached || (outcome.networkPerformed && !networkPerformedByCaller),
+		RequestedAt:      outcome.requestedAt,
+		NextAllowedAt:    outcome.nextAllowedAt,
+	}, err
+}
+
+func loadAccountQuotaRecentResult(key string, now time.Time) (accountQuotaRecentResult, bool) {
+	accountQuotaRecentResults.Lock()
+	defer accountQuotaRecentResults.Unlock()
+	recent, ok := accountQuotaRecentResults.items[key]
+	if !ok || !recent.nextAllowedAt.After(now) {
+		delete(accountQuotaRecentResults.items, key)
+		return accountQuotaRecentResult{}, false
+	}
+	return recent, true
+}
+
+func saveAccountQuotaRecentResult(key string, requestedAt time.Time, refreshErr error) accountQuotaRecentResult {
+	ttl := 3 * time.Minute
+	errMessage := ""
+	if refreshErr != nil {
+		ttl = time.Minute
+		errMessage = refreshErr.Error()
+	}
+	now := accountQuotaNow()
+	recent := accountQuotaRecentResult{
+		requestedAt:   requestedAt,
+		nextAllowedAt: now.Add(ttl),
+		errMessage:    errMessage,
+	}
+	accountQuotaRecentResults.Lock()
+	accountQuotaRecentResults.items[key] = recent
+	accountQuotaRecentResults.Unlock()
+	return recent
+}
+
+func (r accountQuotaRecentResult) err() error {
+	if strings.TrimSpace(r.errMessage) == "" {
+		return nil
+	}
+	return errors.New(r.errMessage)
+}
+
+func quotaRefreshResult(account *ClaudeCodeAccount, networkPerformed, cached bool, recent accountQuotaRecentResult) *AccountQuotaRefreshResult {
+	return &AccountQuotaRefreshResult{
+		Account:          account,
+		NetworkPerformed: networkPerformed,
+		Cached:           cached,
+		RequestedAt:      recent.requestedAt,
+		NextAllowedAt:    recent.nextAllowedAt,
+	}
 }
 
 func refreshAccountQuotaOnce(ctx context.Context, cfg *config.Config, store *Store, accountID string, auth *coreauth.Auth, persistAuth func(*coreauth.Auth) error, allowManualRecovery bool, interval time.Duration) (*ClaudeCodeAccount, error) {
@@ -134,29 +258,54 @@ func RefreshStoredAccountQuota(ctx context.Context, configPath string, cfg *conf
 
 // RecheckStoredAccountQuota explicitly allows a successful probe to clear manual recovery.
 func RecheckStoredAccountQuota(ctx context.Context, configPath string, cfg *config.Config, store *Store, accountID string) (*ClaudeCodeAccount, error) {
-	return refreshStoredAccountQuota(ctx, configPath, cfg, store, accountID, true, nil)
+	result, err := RecheckStoredAccountQuotaWithResult(ctx, configPath, cfg, store, accountID)
+	if result == nil {
+		return nil, err
+	}
+	return result.Account, err
+}
+
+// RecheckStoredAccountQuotaWithResult reports whether an explicit recovery probe performed network I/O.
+func RecheckStoredAccountQuotaWithResult(ctx context.Context, configPath string, cfg *config.Config, store *Store, accountID string) (*AccountQuotaRefreshResult, error) {
+	return refreshStoredAccountQuotaResult(ctx, configPath, cfg, store, accountID, true, nil)
 }
 
 type accountQuotaAuthSync func(context.Context, *coreauth.Auth) error
 
 func refreshStoredAccountQuota(ctx context.Context, configPath string, cfg *config.Config, store *Store, accountID string, allowManualRecovery bool, syncAuth accountQuotaAuthSync) (*ClaudeCodeAccount, error) {
+	result, err := refreshStoredAccountQuotaResult(ctx, configPath, cfg, store, accountID, allowManualRecovery, syncAuth)
+	if result == nil {
+		return nil, err
+	}
+	return result.Account, err
+}
+
+func refreshStoredAccountQuotaResult(ctx context.Context, configPath string, cfg *config.Config, store *Store, accountID string, allowManualRecovery bool, syncAuth accountQuotaAuthSync) (*AccountQuotaRefreshResult, error) {
 	interval, err := store.accountQuotaInterval(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return refreshStoredAccountQuotaWithInterval(ctx, configPath, cfg, store, accountID, allowManualRecovery, syncAuth, interval)
+	return refreshStoredAccountQuotaWithIntervalResult(ctx, configPath, cfg, store, accountID, allowManualRecovery, syncAuth, interval)
 }
 
 func refreshStoredAccountQuotaWithInterval(ctx context.Context, configPath string, cfg *config.Config, store *Store, accountID string, allowManualRecovery bool, syncAuth accountQuotaAuthSync, interval time.Duration) (*ClaudeCodeAccount, error) {
+	result, err := refreshStoredAccountQuotaWithIntervalResult(ctx, configPath, cfg, store, accountID, allowManualRecovery, syncAuth, interval)
+	if result == nil {
+		return nil, err
+	}
+	return result.Account, err
+}
+
+func refreshStoredAccountQuotaWithIntervalResult(ctx context.Context, configPath string, cfg *config.Config, store *Store, accountID string, allowManualRecovery bool, syncAuth accountQuotaAuthSync, interval time.Duration) (*AccountQuotaRefreshResult, error) {
 	auth, err := GetStoredAuth(ctx, configPath, cfg, accountID)
 	if err != nil {
 		stored, _ := store.GetAccount(ctx, accountID)
 		if account, saveErr := saveAccountQuotaError(ctx, store, stored, 0, err.Error(), nil); saveErr == nil {
-			return account, err
+			return &AccountQuotaRefreshResult{Account: account}, err
 		}
 		return nil, err
 	}
-	return refreshAccountQuotaWithInterval(ctx, cfg, store, accountID, auth, func(updated *coreauth.Auth) error {
+	return refreshAccountQuotaWithIntervalResult(ctx, cfg, store, accountID, auth, func(updated *coreauth.Auth) error {
 		return persistAndSyncAccountAuth(ctx, store, updated, syncAuth)
 	}, allowManualRecovery, interval)
 }
@@ -181,16 +330,24 @@ func persistAndSyncAccountAuth(ctx context.Context, store *Store, auth *coreauth
 
 // EffectiveAccountQuota returns normalized background quota refresh settings.
 func EffectiveAccountQuota(raw AccountQuotaConfig) AccountQuotaConfig {
-	enabled := true
-	if raw.Enabled != nil {
-		enabled = *raw.Enabled
+	mode := strings.ToLower(strings.TrimSpace(raw.Mode))
+	if mode == "" && raw.Enabled != nil {
+		if *raw.Enabled {
+			mode = AccountQuotaModeManual
+		} else {
+			mode = AccountQuotaModeDisabled
+		}
+	}
+	switch mode {
+	case AccountQuotaModeManual, AccountQuotaModeScheduled, AccountQuotaModeDisabled:
+	default:
+		mode = AccountQuotaModeManual
 	}
 	interval := strings.TrimSpace(raw.Interval)
-	if interval == "" {
-		interval = quotaDefaultInterval.String()
-	}
-	if _, err := time.ParseDuration(interval); err != nil {
-		interval = quotaDefaultInterval.String()
+	switch interval {
+	case "15m", "30m", "1h":
+	default:
+		interval = "30m"
 	}
 	concurrency := raw.Concurrency
 	if concurrency <= 0 {
@@ -199,11 +356,25 @@ func EffectiveAccountQuota(raw AccountQuotaConfig) AccountQuotaConfig {
 	if concurrency > 8 {
 		concurrency = 8
 	}
+	enabled := mode != AccountQuotaModeDisabled
 	return AccountQuotaConfig{
+		Mode:        mode,
 		Enabled:     &enabled,
 		Interval:    interval,
 		Concurrency: concurrency,
 	}
+}
+
+func accountQuotaFreshnessTTL(cfg AccountQuotaConfig) time.Duration {
+	cfg = EffectiveAccountQuota(cfg)
+	if cfg.Mode != AccountQuotaModeScheduled {
+		return quotaFreshnessTTL
+	}
+	ttl := quotaInterval(cfg) * 3 / 2
+	if ttl < quotaFreshnessTTL {
+		return quotaFreshnessTTL
+	}
+	return ttl
 }
 
 // ParseClaudeOAuthUsage converts Anthropic's OAuth usage response into UI windows.
@@ -491,6 +662,7 @@ func fetchClaudeOAuthUsage(ctx context.Context, cfg *config.Config, auth *coreau
 }
 
 func newAccountQuotaProbe(cfg *config.Config, auth *coreauth.Auth, account *ClaudeCodeAccount) *AccountQuotaProbe {
+	_ = cfg
 	probe := &AccountQuotaProbe{
 		RequestedAt:      accountQuotaNow(),
 		ProfileRevision:  DefaultClaudeCodeProfileRevision,
@@ -508,16 +680,10 @@ func newAccountQuotaProbe(cfg *config.Config, auth *coreauth.Auth, account *Clau
 	if account != nil && strings.TrimSpace(account.ProxyResourceID) != "" {
 		probe.ProxyResourceID = strings.TrimSpace(account.ProxyResourceID)
 		if proxyURL != "" {
-			proxySource = "bound"
+			proxySource = "bound_proxy"
 		}
 	} else if proxyURL != "" {
-		proxySource = "auth"
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-		if proxyURL != "" {
-			proxySource = "global"
-		}
+		proxySource = "direct"
 	}
 	setting, err := proxyutil.Parse(proxyURL)
 	if err != nil || setting.Mode == proxyutil.ModeInvalid {

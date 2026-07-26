@@ -55,9 +55,28 @@ var claudeCodeNodeTransports = struct {
 	entries map[claudeCodeNodeTransportKey]cachedClaudeCodeNodeTransport
 }{entries: make(map[claudeCodeNodeTransportKey]cachedClaudeCodeNodeTransport)}
 
+// ClearClaudeCodeNodeTransports closes cached account connections after its network binding changes.
+func ClearClaudeCodeNodeTransports(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	claudeCodeNodeTransports.Lock()
+	defer claudeCodeNodeTransports.Unlock()
+	for key, cached := range claudeCodeNodeTransports.entries {
+		if key.accountID != accountID {
+			continue
+		}
+		if cached.transport != nil {
+			cached.transport.CloseIdleConnections()
+		}
+		delete(claudeCodeNodeTransports.entries, key)
+	}
+}
+
 const (
 	maxClaudeCodeNodeTransports      = 64
-	ClaudeCodeNodeProfileRevision    = "2.1.207-r3"
+	ClaudeCodeNodeProfileRevision    = "2.1.220-r1"
 	ClaudeCodeNodeTLSProfileName     = "node-macos-arm64-http1"
 	ClaudeCodeNodeTLSJA3             = "44f88fca027f27bab4bb08d4af15f23e"
 	ClaudeCodeNodeTLSJA4             = "t13d1714h1_5b57614c22b0_7baf387fc6ff"

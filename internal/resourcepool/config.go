@@ -68,6 +68,7 @@ func LoadConfigFile(path string) (*ConfigFile, error) {
 	if len(strings.TrimSpace(string(data))) == 0 {
 		return doc, nil
 	}
+	doc.AccountQuota = AccountQuotaConfig{}
 	if err := yaml.Unmarshal(data, doc); err != nil {
 		return nil, fmt.Errorf("parse resource pools config: %w", err)
 	}
@@ -77,7 +78,6 @@ func LoadConfigFile(path string) (*ConfigFile, error) {
 
 func defaultConfigFile() *ConfigFile {
 	proxyHealthEnabled := true
-	accountQuotaEnabled := true
 	traceEnabled := false
 	traceRedactUserContent := true
 	claudeCodeEnabled := true
@@ -88,17 +88,16 @@ func defaultConfigFile() *ConfigFile {
 	return &ConfigFile{
 		DatabasePath: DefaultDBFileName,
 		ProxyHealth: ProxyHealthConfig{
-			Enabled:           &proxyHealthEnabled,
-			Interval:          "5m",
-			Timeout:           "10s",
-			Concurrency:       8,
-			FailureThreshold:  3,
-			TestURL:           "https://api.anthropic.com/",
-			OptionalExitIPURL: "https://api.ipify.org?format=json",
+			Enabled:          &proxyHealthEnabled,
+			Interval:         "5m",
+			Timeout:          "10s",
+			Concurrency:      8,
+			FailureThreshold: 3,
+			TestURL:          "https://api.ipify.org?format=json",
 		},
 		AccountQuota: AccountQuotaConfig{
-			Enabled:     &accountQuotaEnabled,
-			Interval:    "5m",
+			Mode:        AccountQuotaModeManual,
+			Interval:    "30m",
 			Concurrency: 2,
 		},
 		Trace: TraceConfig{
@@ -200,14 +199,24 @@ func defaultClaudeCodeProfile() ClaudeCodeProfile {
 		SystemPrompt:        helps.ClaudeCodeOrdinaryStablePrompt(),
 		BillingBlockEnabled: &billingBlockEnabled,
 		MetadataUserIDMode:  "account",
-		UpdatedFrom:         "builtin-trace-baseline:2.1.207",
+		UpdatedFrom:         "builtin-trace-baseline:2.1.220",
 		Locked:              true,
-		SystemPromptMode:    "builtin_ordinary_2.1.207_r3",
+		SystemPromptMode:    "builtin_ordinary_2.1.220_r1",
 		TLSProfile:          helps.ClaudeCodeNodeTLSProfileName,
 		TLSJA3:              helps.ClaudeCodeNodeTLSJA3,
 		TLSJA4:              helps.ClaudeCodeNodeTLSJA4,
 		TLSALPN:             helps.ClaudeCodeNodeTLSALPN,
 	}
+}
+
+func builtinClaudeCodeProfileR3() ClaudeCodeProfile {
+	profile := defaultClaudeCodeProfile()
+	profile.Revision = "2.1.207-r3"
+	profile.Version = "2.1.207"
+	profile.UserAgent = "claude-cli/2.1.207 (external, sdk-cli)"
+	profile.UpdatedFrom = "builtin-trace-baseline:2.1.207"
+	profile.SystemPromptMode = "builtin_ordinary_2.1.207_r3"
+	return profile
 }
 
 func builtinClaudeCodeProfileR2() ClaudeCodeProfile {
@@ -283,24 +292,9 @@ func normalizeConfigFile(doc *ConfigFile) {
 	if doc.ProxyHealth.FailureThreshold <= 0 {
 		doc.ProxyHealth.FailureThreshold = defaults.ProxyHealth.FailureThreshold
 	}
-	doc.ProxyHealth.TestURL = strings.TrimSpace(doc.ProxyHealth.TestURL)
-	if doc.ProxyHealth.TestURL == "" {
-		doc.ProxyHealth.TestURL = defaults.ProxyHealth.TestURL
-	}
-	doc.ProxyHealth.OptionalExitIPURL = strings.TrimSpace(doc.ProxyHealth.OptionalExitIPURL)
-	if doc.AccountQuota.Enabled == nil {
-		doc.AccountQuota.Enabled = defaults.AccountQuota.Enabled
-	}
-	doc.AccountQuota.Interval = strings.TrimSpace(doc.AccountQuota.Interval)
-	if doc.AccountQuota.Interval == "" {
-		doc.AccountQuota.Interval = defaults.AccountQuota.Interval
-	}
-	if _, err := time.ParseDuration(doc.AccountQuota.Interval); err != nil {
-		doc.AccountQuota.Interval = defaults.AccountQuota.Interval
-	}
-	if doc.AccountQuota.Concurrency <= 0 {
-		doc.AccountQuota.Concurrency = defaults.AccountQuota.Concurrency
-	}
+	doc.ProxyHealth.TestURL = defaults.ProxyHealth.TestURL
+	doc.ProxyHealth.OptionalExitIPURL = ""
+	doc.AccountQuota = EffectiveAccountQuota(doc.AccountQuota)
 	if doc.Trace.Enabled == nil {
 		doc.Trace.Enabled = defaults.Trace.Enabled
 	}
@@ -428,10 +422,10 @@ func shouldMigrateBuiltinClaudeCodeProfile(profile ClaudeCodeProfile) bool {
 	if updatedFrom != "" && !strings.HasPrefix(updatedFrom, "builtin") {
 		return false
 	}
-	if version == "2.1.177" || version == "2.1.178" {
+	if version == "2.1.177" || version == "2.1.178" || version == "2.1.207" {
 		return true
 	}
-	return version == DefaultClaudeCodeProfileVersion && strings.TrimSpace(profile.Revision) == "2.1.207-r1"
+	return false
 }
 
 func normalizeCloakConfig(cfg *config.CloakConfig) *config.CloakConfig {
@@ -639,7 +633,10 @@ func EffectiveClaudeCodeUsage(cfg ClaudeCodeUsageConfig, profile ClaudeCodeProfi
 
 // EffectiveClaudeCodeProfile returns normalized Claude Code request-shape settings.
 func EffectiveClaudeCodeProfile(cfg ClaudeCodeProfile) EffectiveClaudeCodeProfileConfig {
-	normalized := normalizeClaudeCodeProfile(cfg)
+	return effectiveClaudeCodeProfileFromNormalized(normalizeClaudeCodeProfile(cfg))
+}
+
+func effectiveClaudeCodeProfileFromNormalized(normalized ClaudeCodeProfile) EffectiveClaudeCodeProfileConfig {
 	enabled := true
 	if normalized.BillingBlockEnabled != nil {
 		enabled = *normalized.BillingBlockEnabled
@@ -718,10 +715,7 @@ func EffectiveProxyHealth(cfg ProxyHealthConfig) EffectiveProxyHealthConfig {
 	if cfg.FailureThreshold <= 0 {
 		cfg.FailureThreshold = defaults.FailureThreshold
 	}
-	cfg.TestURL = strings.TrimSpace(cfg.TestURL)
-	if cfg.TestURL == "" {
-		cfg.TestURL = defaults.TestURL
-	}
+	cfg.TestURL = defaults.TestURL
 	return EffectiveProxyHealthConfig{
 		Enabled:           cfg.Enabled == nil || *cfg.Enabled,
 		Interval:          interval,
@@ -731,7 +725,7 @@ func EffectiveProxyHealth(cfg ProxyHealthConfig) EffectiveProxyHealthConfig {
 		Concurrency:       cfg.Concurrency,
 		FailureThreshold:  cfg.FailureThreshold,
 		TestURL:           cfg.TestURL,
-		OptionalExitIPURL: strings.TrimSpace(cfg.OptionalExitIPURL),
+		OptionalExitIPURL: "",
 	}
 }
 

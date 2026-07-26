@@ -20,11 +20,13 @@ func AccountRoutingScope(poolID string) string {
 }
 
 var (
-	ErrDefaultPoolImmutable = errors.New("default account pool is immutable")
-	ErrAccountPoolNotEmpty  = errors.New("account pool is not empty")
-	ErrAccountPoolArchived  = errors.New("account pool is archived")
-	ErrAccountInOtherPool   = errors.New("account belongs to another pool")
-	ErrAccountMoveInFlight  = errors.New("account has in-flight requests")
+	ErrDefaultPoolImmutable       = errors.New("default account pool is immutable")
+	ErrAccountPoolNotEmpty        = errors.New("account pool is not empty")
+	ErrAccountPoolArchived        = errors.New("account pool is archived")
+	ErrAccountInOtherPool         = errors.New("account belongs to another pool")
+	ErrAccountMoveInFlight        = errors.New("account has in-flight requests")
+	ErrAccountProxyModeConflict   = errors.New("account proxy mode conflicts with existing binding")
+	ErrAccountProxyChangeInFlight = errors.New("account proxy cannot change while requests are in flight")
 )
 
 // ListAccountPools returns active pools and optionally archived history rows.

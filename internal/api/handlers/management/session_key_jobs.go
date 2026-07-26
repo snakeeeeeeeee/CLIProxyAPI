@@ -543,6 +543,8 @@ func (h *Handler) processSessionKeyJobItem(job *sessionKeyJob, index int) {
 			return
 		}
 		proxyURL = proxy.ProxyURL
+	} else {
+		proxyURL = "direct"
 	}
 	h.mu.Lock()
 	cfg := h.cfg
@@ -585,6 +587,10 @@ func (h *Handler) processSessionKeyJobItem(job *sessionKeyJob, index int) {
 	if err != nil {
 		if errors.Is(err, resourcepool.ErrAccountInOtherPool) {
 			h.failSessionKeyItem(job, item, "account_in_other_pool", "账号已属于其他账号池")
+			return
+		}
+		if errors.Is(err, resourcepool.ErrAccountProxyModeConflict) {
+			h.failSessionKeyItem(job, item, "account_proxy_mode_conflict", "账号已绑定代理，请使用绑定模式重新登录")
 			return
 		}
 		log.WithFields(log.Fields{"job_id": job.ID, "item_index": item.Index, "proxy_id": item.ProxyID, "error": err}).Warn("failed to persist SessionKey OAuth account")
@@ -634,10 +640,13 @@ func (h *Handler) persistSessionKeyAccount(ctx context.Context, poolID, jobID, i
 		return nil, false, err
 	}
 	defer closeResourcePoolStore(store)
-	_, errExisting := store.GetAccountByAuthID(ctx, authID)
+	existing, errExisting := store.GetAccountByAuthID(ctx, authID)
 	updated := errExisting == nil
 	if errExisting != nil && !errors.Is(errExisting, sql.ErrNoRows) {
 		return nil, false, errExisting
+	}
+	if updated && strings.TrimSpace(proxyID) == "" && strings.TrimSpace(existing.ProxyResourceID) != "" {
+		return nil, false, resourcepool.ErrAccountProxyModeConflict
 	}
 	account, err := store.RegisterClaudeCodeAccountWithAuthReservationInPool(ctx, poolID, authID, storage.Email, proxyID, record, jobID, itemID)
 	if err != nil {

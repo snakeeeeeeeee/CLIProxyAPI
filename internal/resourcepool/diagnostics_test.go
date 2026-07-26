@@ -107,7 +107,7 @@ func TestDiagnosticsRedactsCredentialsAndRequestIdentity(t *testing.T) {
 			RequestedAt:      now,
 			ProfileRevision:  DefaultClaudeCodeProfileRevision,
 			TransportProfile: "oauth-usage/node-macos-arm64-http1",
-			ProxyMode:        "bound",
+			ProxyMode:        "bound_proxy",
 			ProxyResourceID:  proxy.ID,
 			StatusCode:       200,
 		},
@@ -130,6 +130,9 @@ func TestDiagnosticsRedactsCredentialsAndRequestIdentity(t *testing.T) {
 	}
 	if item.LastObservedExitIP != "203.0.113.44" || item.ProxyResourceID != proxy.ID {
 		t.Fatalf("account diagnostic proxy summary = %+v", item)
+	}
+	if item.NetworkMode != "bound_proxy" {
+		t.Fatalf("account network mode = %q, want bound_proxy", item.NetworkMode)
 	}
 	raw, err := json.Marshal(diagnostics)
 	if err != nil {

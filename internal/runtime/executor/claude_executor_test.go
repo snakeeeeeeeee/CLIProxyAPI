@@ -103,6 +103,50 @@ func TestClaudeCodeAccountPoolUsesBearerAuthAtAnthropic(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeAccountPoolTimeoutPolicy(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":           "sk-ant-oat-test",
+		"auth_kind":         "oauth",
+		"claude_oauth_pool": "true",
+	}}
+	for _, test := range []struct {
+		name   string
+		stream bool
+		want   string
+	}{
+		{name: "non-stream", stream: false, want: "300"},
+		{name: "stream", stream: true, want: "600"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := newClaudeHeaderTestRequest(t, nil)
+			if err := applyClaudeHeaders(req, auth, "sk-ant-oat-test", test.stream, nil, &config.Config{}, "claude-opus-4-8"); err != nil {
+				t.Fatalf("applyClaudeHeaders() error = %v", err)
+			}
+			if got := req.Header.Get("X-Stainless-Timeout"); got != test.want {
+				t.Fatalf("X-Stainless-Timeout = %q, want %q", got, test.want)
+			}
+		})
+	}
+
+	passthrough := newClaudeHeaderTestRequest(t, http.Header{"X-Stainless-Timeout": []string{"42"}})
+	passthrough = passthrough.WithContext(withClaudeAccountPoolRequestMode(passthrough.Context(), claudeAccountPoolModePassthrough))
+	if err := applyClaudeHeaders(passthrough, auth, "sk-ant-oat-test", true, nil, &config.Config{}, "claude-opus-4-8"); err != nil {
+		t.Fatalf("applyClaudeHeaders(passthrough) error = %v", err)
+	}
+	if got := passthrough.Header.Get("X-Stainless-Timeout"); got != "42" {
+		t.Fatalf("passthrough timeout = %q, want inbound 42", got)
+	}
+
+	invalid := newClaudeHeaderTestRequest(t, http.Header{"X-Stainless-Timeout": []string{"invalid"}})
+	invalid = invalid.WithContext(withClaudeAccountPoolRequestMode(invalid.Context(), claudeAccountPoolModePassthrough))
+	if err := applyClaudeHeaders(invalid, auth, "sk-ant-oat-test", false, nil, &config.Config{}, "claude-opus-4-8"); err != nil {
+		t.Fatalf("applyClaudeHeaders(invalid passthrough) error = %v", err)
+	}
+	if got := invalid.Header.Get("X-Stainless-Timeout"); got != "300" {
+		t.Fatalf("invalid passthrough timeout = %q, want non-stream fallback 300", got)
+	}
+}
+
 func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true
@@ -1589,7 +1633,7 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolUsesBuiltinOrdinaryProfile(t *testi
 	if len(seenBody) == 0 {
 		t.Fatal("expected upstream body to be captured")
 	}
-	if seenUA != "claude-cli/2.1.207 (external, sdk-cli)" {
+	if seenUA != "claude-cli/2.1.220 (external, sdk-cli)" {
 		t.Fatalf("User-Agent = %q, want builtin Claude Code UA", seenUA)
 	}
 	if seenBeta != "" {
@@ -1601,8 +1645,8 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolUsesBuiltinOrdinaryProfile(t *testi
 		t.Fatalf("expected 3 builtin system blocks, got %d: %s", len(blocks), string(seenBody))
 	}
 	billingHeader := blocks[0].Get("text").String()
-	if !strings.HasPrefix(billingHeader, "x-anthropic-billing-header: cc_version=2.1.207.") {
-		t.Fatalf("billing header = %q, want builtin 2.1.207 header", billingHeader)
+	if !strings.HasPrefix(billingHeader, "x-anthropic-billing-header: cc_version=2.1.220.") {
+		t.Fatalf("billing header = %q, want builtin 2.1.220 header", billingHeader)
 	}
 	if !strings.Contains(billingHeader, "cc_entrypoint=sdk-cli;") || strings.Contains(billingHeader, "cch=") {
 		t.Fatalf("billing header = %q, want sdk-cli without CCH", billingHeader)
@@ -1671,7 +1715,7 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolRequestShape(t *testing.T) {
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	if seenHeaders.Get("User-Agent") != "claude-cli/2.1.207 (external, sdk-cli)" {
+	if seenHeaders.Get("User-Agent") != "claude-cli/2.1.220 (external, sdk-cli)" {
 		t.Fatalf("User-Agent = %q", seenHeaders.Get("User-Agent"))
 	}
 	if seenHeaders.Get("X-Client-Request-Id") != "" {
@@ -1894,12 +1938,13 @@ func TestClaudeExecutor_ClaudeCodeAccountPoolRequestModeCompatibility(t *testing
 		want    string
 	}{
 		{name: "new no CCH", ua: "claude-cli/2.1.207 (external, sdk-cli)", billing: "x-anthropic-billing-header: cc_version=2.1.207.abc; cc_entrypoint=sdk-cli;", want: claudeAccountPoolModePassthrough},
+		{name: "2.1.220 title helper", ua: "claude-cli/2.1.220 (external, sdk-cli)", billing: "x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=sdk-cli;", want: claudeAccountPoolModePassthrough},
 		{name: "legacy CCH", ua: "claude-cli/2.1.181 (external, sdk-cli)", billing: "x-anthropic-billing-header: cc_version=2.1.181.abc; cc_entrypoint=cli; cch=12345;", want: claudeAccountPoolModePassthrough},
 		{name: "version mismatch", ua: "claude-cli/2.1.207 (external, sdk-cli)", billing: "x-anthropic-billing-header: cc_version=2.1.181.abc; cc_entrypoint=cli; cch=12345;", want: claudeAccountPoolModeAPIMimic},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			body := []byte(`{"system":[{"type":"text","text":` + strconv.Quote(tt.billing) + `},{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."}],"metadata":{"user_id":` + strconv.Quote(metadata) + `},"messages":[{"role":"user","content":"hi"}]}`)
+			body := []byte(`{"system":[{"type":"text","text":` + strconv.Quote(tt.billing) + `},{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."}],"metadata":{"user_id":` + strconv.Quote(metadata) + `},"tools":[],"messages":[{"role":"user","content":"hi"}]}`)
 			req := httptest.NewRequest(http.MethodPost, "http://localhost/claude-acc-pool/v1/messages", nil)
 			req.Header = http.Header{
 				"User-Agent":               []string{tt.ua},
@@ -3057,9 +3102,11 @@ func TestClaudeExecutor_CountTokens_AppliesCacheControlGuards(t *testing.T) {
 
 func TestClaudeExecutor_CountTokens_StripsAccountPoolMetadata(t *testing.T) {
 	var seenBody []byte
+	var seenTimeout string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		seenBody = bytes.Clone(body)
+		seenTimeout = r.Header.Get("X-Stainless-Timeout")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"input_tokens":3819}`))
 	}))
@@ -3084,6 +3131,9 @@ func TestClaudeExecutor_CountTokens_StripsAccountPoolMetadata(t *testing.T) {
 
 	if gjson.GetBytes(seenBody, "metadata").Exists() {
 		t.Fatalf("count_tokens account-pool body must not include metadata: %s", seenBody)
+	}
+	if seenTimeout != "300" {
+		t.Fatalf("count_tokens X-Stainless-Timeout = %q, want 300", seenTimeout)
 	}
 	if got := gjson.GetBytes(seenBody, "system.0.text").String(); !strings.HasPrefix(got, "x-anthropic-billing-header:") {
 		t.Fatalf("count_tokens account-pool body missing billing system block: %s", seenBody)
@@ -3754,6 +3804,7 @@ func TestClaudeExecutor_ClaudeCodeBillingFingerprintFixtures(t *testing.T) {
 		{text: "Deterministic token accounting verification text.", version: "2.1.207", want: "db0"},
 		{text: "different request body for fixture", version: "2.1.207", want: "cc9"},
 		{text: "who are you?", version: "2.1.208", want: "0a5"},
+		{text: "Reply with exactly OK.", version: "2.1.220", want: "032"},
 	} {
 		if got := computeFingerprint(test.text, test.version); got != test.want {
 			t.Fatalf("computeFingerprint(%q, %q) = %q, want %q", test.text, test.version, got, test.want)

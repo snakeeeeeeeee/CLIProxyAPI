@@ -1859,6 +1859,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	applyClaudeCodeAccountPoolProfileHeaders(r, auth, model, extraBetas, clientBetaHeader)
+	applyClaudeCodeAccountPoolTimeout(r, auth, stream)
 	// Re-enforce Accept-Encoding: identity after ApplyCustomHeadersFromAttrs, which
 	// may override it with a user-configured value.  Compressed SSE breaks the line
 	// scanner regardless of user preference, so this is non-negotiable for streams.
@@ -1866,6 +1867,30 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		r.Header.Set("Accept-Encoding", "identity")
 	}
 	return nil
+}
+
+func applyClaudeCodeAccountPoolTimeout(r *http.Request, auth *cliproxyauth.Auth, stream bool) {
+	if r == nil || !isClaudeCodeAccountPoolAuth(auth) {
+		return
+	}
+	fallback := "300"
+	if stream {
+		fallback = "600"
+	}
+	if claudeAccountPoolRequestModeFromContext(r.Context()) == claudeAccountPoolModePassthrough {
+		if inbound := ginRequestHeaders(r.Context()); inbound != nil {
+			if value := strings.TrimSpace(inbound.Get("X-Stainless-Timeout")); validClaudeCodeTimeout(value) {
+				r.Header.Set("X-Stainless-Timeout", value)
+				return
+			}
+		}
+	}
+	r.Header.Set("X-Stainless-Timeout", fallback)
+}
+
+func validClaudeCodeTimeout(value string) bool {
+	seconds, err := strconv.Atoi(strings.TrimSpace(value))
+	return err == nil && seconds > 0 && seconds <= 3600
 }
 
 func applyClaudeCodeAccountPoolProfileHeaders(r *http.Request, auth *cliproxyauth.Auth, model string, extraBetas []string, clientBetaHeader string) {

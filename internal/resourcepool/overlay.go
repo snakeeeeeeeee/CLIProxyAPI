@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudeapipool"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 )
 
 // ApplyAuthOverlay marks Claude OAuth auths that belong to the Claude Code account pool
@@ -75,9 +76,21 @@ func ApplyAuthOverlay(ctx context.Context, configPath string, cfg *config.Config
 	auth.Attributes["account_schedulable"] = strconv.FormatBool(overlay.Account.Schedulable)
 	auth.Attributes["account_health_status"] = overlay.Account.HealthStatus
 	auth.Attributes["account_effective_schedulable"] = strconv.FormatBool(overlay.Account.EffectiveSchedulable)
-	if overlay.Proxy != nil && strings.TrimSpace(overlay.Proxy.ProxyURL) != "" {
-		auth.ProxyURL = strings.TrimSpace(overlay.Proxy.ProxyURL)
+	proxyBound := strings.TrimSpace(overlay.Account.ProxyResourceID) != ""
+	auth.Attributes["proxy_resource_bound"] = strconv.FormatBool(proxyBound)
+	proxyPresent := overlay.Proxy != nil
+	proxyEnabled := proxyPresent && overlay.Proxy.Enabled
+	proxyHealth := ""
+	proxyURL := ""
+	if proxyPresent {
+		proxyHealth = overlay.Proxy.HealthStatus
+		proxyURL = overlay.Proxy.ProxyURL
 	}
+	if proxyBound {
+		auth.Attributes["proxy_resource_enabled"] = strconv.FormatBool(proxyEnabled)
+		auth.Attributes["proxy_resource_health_status"] = strings.TrimSpace(proxyHealth)
+	}
+	auth.ProxyURL = strictAccountProxyURL(proxyBound, proxyPresent, proxyEnabled, proxyHealth, proxyURL)
 	if capacity, err := store.GetAccountCapacity(ctx, overlay.Account.ID); err == nil {
 		overlay.Account.Capacity = capacity
 	}
@@ -326,6 +339,9 @@ func scanStoredAuth(rows interface {
 	if strings.TrimSpace(note) != "" {
 		attrs["note"] = strings.TrimSpace(note)
 	}
+	proxyBound := strings.TrimSpace(proxyResourceID) != ""
+	proxyPresent := proxyID.Valid
+	proxyIsEnabled := proxyEnabled.Valid && proxyEnabled.Int64 != 0
 	auth := &coreauth.Auth{
 		ID:         strings.TrimSpace(authID),
 		Provider:   "claude",
@@ -338,9 +354,13 @@ func scanStoredAuth(rows interface {
 		Metadata:   metadata,
 		CreatedAt:  parseDBTime(accountCreatedRaw),
 		UpdatedAt:  parseDBTime(accountUpdatedRaw),
-	}
-	if proxyID.Valid && strings.TrimSpace(proxyURL.String) != "" {
-		auth.ProxyURL = strings.TrimSpace(proxyURL.String)
+		ProxyURL: strictAccountProxyURL(
+			proxyBound,
+			proxyPresent,
+			proxyIsEnabled,
+			proxyHealth.String,
+			proxyURL.String,
+		),
 	}
 	poolCfg := globalPoolCfg
 	if scoped, ok := poolConfigs[normalizeAccountPoolID(poolID)]; ok {
@@ -370,6 +390,21 @@ func scanStoredAuth(rows interface {
 	}
 	ApplyAccountLifecycleRouting(account)
 	return auth, nil
+}
+
+func strictAccountProxyURL(bound, present, enabled bool, health, rawURL string) string {
+	if !bound {
+		return "direct"
+	}
+	rawURL = strings.TrimSpace(rawURL)
+	if !present || !enabled || strings.EqualFold(strings.TrimSpace(health), HealthUnhealthy) {
+		return "invalid://bound-proxy"
+	}
+	setting, err := proxyutil.Parse(rawURL)
+	if err != nil || setting.Mode != proxyutil.ModeProxy {
+		return "invalid://bound-proxy"
+	}
+	return rawURL
 }
 
 func applyClaudeCodePoolAttributes(auth *coreauth.Auth, poolCfg EffectiveClaudeCodePoolConfig, profile EffectiveClaudeCodeProfileConfig, cloakUserID string) {

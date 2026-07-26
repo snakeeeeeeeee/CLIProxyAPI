@@ -51,7 +51,7 @@ func runAccountQuotaRefresher(ctx context.Context, configFilePath string, cfgPro
 			continue
 		}
 		quotaCfg := EffectiveAccountQuota(doc.AccountQuota)
-		if quotaCfg.Enabled != nil && !*quotaCfg.Enabled {
+		if quotaCfg.Mode != AccountQuotaModeScheduled {
 			if !sleepOrDone(ctx, schedulerTick) {
 				return
 			}
@@ -130,8 +130,11 @@ func accountQuotaRefreshDue(account ClaudeCodeAccount, now time.Time, interval t
 	if account.HealthStatus == AccountHealthTemporarilyBlocked && account.BlockedUntil != nil && account.BlockedUntil.After(now) {
 		return false
 	}
-	reference := account.LastHealthCheckAt
-	if account.Quota != nil && account.Quota.CheckedAt != nil && (reference == nil || account.Quota.CheckedAt.After(*reference)) {
+	var reference *time.Time
+	if account.Quota != nil && account.Quota.Probe != nil && !account.Quota.Probe.RequestedAt.IsZero() {
+		requestedAt := account.Quota.Probe.RequestedAt
+		reference = &requestedAt
+	} else if account.Quota != nil && account.Quota.CheckedAt != nil && strings.EqualFold(strings.TrimSpace(account.Quota.Source), "oauth_usage") {
 		reference = account.Quota.CheckedAt
 	}
 	if reference != nil {
